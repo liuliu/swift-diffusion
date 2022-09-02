@@ -1,0 +1,23 @@
+common:cuda --crosstool_top=@local_config_cuda//crosstool:toolchain
+common:cuda --define=using_cuda=true --define=using_cuda_nvcc=true
+
+common:cuda_clang --crosstool_top=@local_config_cuda//crosstool:toolchain
+common:cuda_clang --define=using_cuda=true --define=using_cuda_clang=true
+
+common:win-cuda --define=using_cuda=true --define=using_cuda_nvcc=true
+
+common --disk_cache=.cache
+
+build --cxxopt='--std=c++17'
+build:asan --strip=never
+build:asan --copt -fsanitize=address
+build:asan --copt -DADDRESS_SANITIZER
+build:asan --copt -O0
+build:asan --copt -g
+build:asan --copt -fno-omit-frame-pointer
+build:asan --linkopt -fsanitize=address
+build:asan --swiftcopt -g
+build:asan --swiftcopt -sanitize=address
+
+try-import %workspace%/clang.bazelrc
+try-import %workspace%/.bazelrc.local
