@@ -1,0 +1,11 @@
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_binary")
+
+swift_binary(
+    name = "clip",
+    srcs = ["clip/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+    ],
+)
