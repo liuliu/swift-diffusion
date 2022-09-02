@@ -7,5 +7,6 @@ swift_binary(
         "@PythonKit",
         "@SwiftNumerics//:Numerics",
         "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
     ],
 )
