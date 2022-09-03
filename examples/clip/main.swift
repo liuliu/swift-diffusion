@@ -214,6 +214,7 @@ for i in 0..<6 {
     print("\(x) \(y) \(c[x, y])")
   }
 }
+
 graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
   $0.write("text_model", model: textModel)
 }

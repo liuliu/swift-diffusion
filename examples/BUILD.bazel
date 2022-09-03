@@ -10,3 +10,14 @@ swift_binary(
         "@s4nnc//nnc:nnc_python",
     ],
 )
+
+swift_binary(
+    name = "stableDiffusion",
+    srcs = ["stableDiffusion/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
