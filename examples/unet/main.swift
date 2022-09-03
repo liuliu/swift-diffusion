@@ -21,6 +21,15 @@ func timeEmbedding(timesteps: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor
   return embedding
 }
 
+func TimeEmbed(modelChannels: Int) -> (Model, Model, Model) {
+  let x = Input()
+  let fc0 = Dense(count: modelChannels * 4)
+  var out = fc0(x).swish()
+  let fc2 = Dense(count: modelChannels * 4)
+  out = fc2(out)
+  return (fc0, fc2, Model([x], [out]))
+}
+
 random.seed(42)
 numpy.random.seed(42)
 torch.manual_seed(42)
@@ -40,3 +49,19 @@ let x = torch.randn([1, 4, 64, 64])
 let t = torch.full([1], 981)
 let c = torch.randn([1, 77, 768])
 let ret = model.model.diffusion_model(x, t, c)
+
+let graph = DynamicGraph()
+
+let time_embed_0_weight = state_dict["diffusion_model.time_embed.0.weight"].numpy()
+let time_embed_0_bias = state_dict["diffusion_model.time_embed.0.bias"].numpy()
+let time_embed_2_weight = state_dict["diffusion_model.time_embed.2.weight"].numpy()
+let time_embed_2_bias = state_dict["diffusion_model.time_embed.2.bias"].numpy()
+
+let t_emb = graph.variable(timeEmbedding(timesteps: 981, embeddingSize: 320, maxPeriod: 10_000))
+let (fc0, fc2, timeEmbed) = TimeEmbed(modelChannels: 320)
+let _ = timeEmbed(inputs: t_emb)
+fc0.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_0_weight))
+fc0.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_0_bias))
+fc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_2_weight))
+fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_2_bias))
+let emb = timeEmbed(inputs: t_emb)[0].as(of: Float.self)
