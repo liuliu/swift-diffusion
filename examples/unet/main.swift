@@ -65,3 +65,23 @@ fc0.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_0_bia
 fc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_2_weight))
 fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_2_bias))
 let emb = timeEmbed(inputs: t_emb)[0].as(of: Float.self)
+let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
+let input_blocks_0_0_weight = state_dict["diffusion_model.input_blocks.0.0.weight"].numpy()
+let input_blocks_0_0_bias = state_dict["diffusion_model.input_blocks.0.0.bias"].numpy()
+let conv2d = Convolution(
+  groups: 1, filters: 320, filterSize: [3, 3],
+  hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+let _ = conv2d(xTensor)
+conv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_weight))
+conv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_bias))
+let yTensor = conv2d(xTensor).toCPU()
+for i in 0..<6 {
+  let x = i < 3 ? i : 314 + i
+  for j in 0..<6 {
+    let y = j < 3 ? j : 58 + j
+    for k in 0..<6 {
+      let z = k < 3 ? k : 58 + k
+      print("\(x) \(y) \(z) \(yTensor[0, x, y, z])")
+    }
+  }
+}
