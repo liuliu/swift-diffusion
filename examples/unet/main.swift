@@ -175,7 +175,8 @@ func SpatialTransformer(
   )
 }
 
-func InputLayer(
+func BlockLayer(
+  prefix: String,
   layerStart: Int, skipConnection: Bool, attentionBlock: Bool, channels: Int, numHeads: Int,
   batchSize: Int, height: Int, width: Int, embeddingSize: Int, intermediateSize: Int
 ) -> ((PythonObject) -> Void, Model) {
@@ -216,52 +217,52 @@ func InputLayer(
   }
   let reader: (PythonObject) -> Void = { state_dict in
     let in_layers_0_weight = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.in_layers.0.weight"
+      "diffusion_model.\(prefix).\(layerStart).0.in_layers.0.weight"
     ].numpy()
     let in_layers_0_bias = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.in_layers.0.bias"
+      "diffusion_model.\(prefix).\(layerStart).0.in_layers.0.bias"
     ].numpy()
     inLayerNorm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: in_layers_0_weight))
     inLayerNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_0_bias))
     let in_layers_2_weight = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.in_layers.2.weight"
+      "diffusion_model.\(prefix).\(layerStart).0.in_layers.2.weight"
     ].numpy()
     let in_layers_2_bias = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.in_layers.2.bias"
+      "diffusion_model.\(prefix).\(layerStart).0.in_layers.2.bias"
     ].numpy()
     inLayerConv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: in_layers_2_weight))
     inLayerConv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_2_bias))
     let emb_layers_1_weight = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.emb_layers.1.weight"
+      "diffusion_model.\(prefix).\(layerStart).0.emb_layers.1.weight"
     ].numpy()
     let emb_layers_1_bias = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.emb_layers.1.bias"
+      "diffusion_model.\(prefix).\(layerStart).0.emb_layers.1.bias"
     ].numpy()
     embLayer.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: emb_layers_1_weight))
     embLayer.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: emb_layers_1_bias))
     let out_layers_0_weight = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.out_layers.0.weight"
+      "diffusion_model.\(prefix).\(layerStart).0.out_layers.0.weight"
     ].numpy()
     let out_layers_0_bias = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.out_layers.0.bias"
+      "diffusion_model.\(prefix).\(layerStart).0.out_layers.0.bias"
     ].numpy()
     outLayerNorm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_layers_0_weight))
     outLayerNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_layers_0_bias))
     let out_layers_3_weight = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.out_layers.3.weight"
+      "diffusion_model.\(prefix).\(layerStart).0.out_layers.3.weight"
     ].numpy()
     let out_layers_3_bias = state_dict[
-      "diffusion_model.input_blocks.\(layerStart).0.out_layers.3.bias"
+      "diffusion_model.\(prefix).\(layerStart).0.out_layers.3.bias"
     ].numpy()
     outLayerConv2d.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: out_layers_3_weight))
     outLayerConv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_layers_3_bias))
     if let skipModel = skipModel {
       let skip_connection_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).0.skip_connection.weight"
+        "diffusion_model.\(prefix).\(layerStart).0.skip_connection.weight"
       ].numpy()
       let skip_connection_bias = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).0.skip_connection.bias"
+        "diffusion_model.\(prefix).\(layerStart).0.skip_connection.bias"
       ].numpy()
       skipModel.parameters(for: .weight).copy(
         from: try! Tensor<Float>(numpy: skip_connection_weight))
@@ -273,43 +274,43 @@ func InputLayer(
       let tovalues2 = tovalues2, let unifyheads2 = unifyheads2, let layerNorm3 = layerNorm3,
       let fc10 = fc10, let fc11 = fc11, let tfc2 = tfc2, let projOut = projOut
     {
-      let norm_weight = state_dict["diffusion_model.input_blocks.\(layerStart).1.norm.weight"]
+      let norm_weight = state_dict["diffusion_model.\(prefix).\(layerStart).1.norm.weight"]
         .numpy()
-      let norm_bias = state_dict["diffusion_model.input_blocks.\(layerStart).1.norm.bias"].numpy()
+      let norm_bias = state_dict["diffusion_model.\(prefix).\(layerStart).1.norm.bias"].numpy()
       norm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm_weight))
       norm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm_bias))
-      let proj_in_weight = state_dict["diffusion_model.input_blocks.\(layerStart).1.proj_in.weight"]
+      let proj_in_weight = state_dict["diffusion_model.\(prefix).\(layerStart).1.proj_in.weight"]
         .numpy()
-      let proj_in_bias = state_dict["diffusion_model.input_blocks.\(layerStart).1.proj_in.bias"]
+      let proj_in_bias = state_dict["diffusion_model.\(prefix).\(layerStart).1.proj_in.bias"]
         .numpy()
       projIn.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: proj_in_weight))
       projIn.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: proj_in_bias))
       let attn1_to_k_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn1.to_k.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_k.weight"
       ].numpy()
       tokeys1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn1_to_k_weight))
       let attn1_to_q_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn1.to_q.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_q.weight"
       ].numpy()
       toqueries1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn1_to_q_weight))
       let attn1_to_v_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn1.to_v.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_v.weight"
       ].numpy()
       tovalues1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn1_to_v_weight))
       let attn1_to_out_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn1.to_out.0.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_out.0.weight"
       ].numpy()
       let attn1_to_out_bias = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn1.to_out.0.bias"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_out.0.bias"
       ].numpy()
       unifyheads1.parameters(for: .weight).copy(
         from: try! Tensor<Float>(numpy: attn1_to_out_weight))
       unifyheads1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn1_to_out_bias))
       let ff_net_0_proj_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.ff.net.0.proj.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.ff.net.0.proj.weight"
       ].numpy()
       let ff_net_0_proj_bias = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.ff.net.0.proj.bias"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.ff.net.0.proj.bias"
       ].numpy()
       fc10.parameters(for: .weight).copy(
         from: try! Tensor<Float>(numpy: ff_net_0_proj_weight[..<intermediateSize, ...]))
@@ -320,68 +321,68 @@ func InputLayer(
       fc11.parameters(for: .bias).copy(
         from: try! Tensor<Float>(numpy: ff_net_0_proj_bias[intermediateSize...]))
       let ff_net_2_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.ff.net.2.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.ff.net.2.weight"
       ].numpy()
       let ff_net_2_bias = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.ff.net.2.bias"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.ff.net.2.bias"
       ].numpy()
       tfc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: ff_net_2_weight))
       tfc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ff_net_2_bias))
       let attn2_to_k_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn2.to_k.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_k.weight"
       ].numpy()
       tokeys2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_k_weight))
       let attn2_to_q_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn2.to_q.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_q.weight"
       ].numpy()
       toqueries2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_q_weight))
       let attn2_to_v_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn2.to_v.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_v.weight"
       ].numpy()
       tovalues2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
       let attn2_to_out_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn2.to_out.0.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_out.0.weight"
       ].numpy()
       let attn2_to_out_bias = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.attn2.to_out.0.bias"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_out.0.bias"
       ].numpy()
       unifyheads2.parameters(for: .weight).copy(
         from: try! Tensor<Float>(numpy: attn2_to_out_weight))
       unifyheads2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn2_to_out_bias))
       let norm1_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.norm1.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm1.weight"
       ]
       .numpy()
       let norm1_bias = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.norm1.bias"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm1.bias"
       ]
       .numpy()
       layerNorm1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm1_weight))
       layerNorm1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm1_bias))
       let norm2_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.norm2.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm2.weight"
       ]
       .numpy()
       let norm2_bias = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.norm2.bias"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm2.bias"
       ]
       .numpy()
       layerNorm2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm2_weight))
       layerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm2_bias))
       let norm3_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.norm3.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm3.weight"
       ]
       .numpy()
       let norm3_bias = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.transformer_blocks.0.norm3.bias"
+        "diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm3.bias"
       ]
       .numpy()
       layerNorm3.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm3_weight))
       layerNorm3.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm3_bias))
       let proj_out_weight = state_dict[
-        "diffusion_model.input_blocks.\(layerStart).1.proj_out.weight"
+        "diffusion_model.\(prefix).\(layerStart).1.proj_out.weight"
       ].numpy()
-      let proj_out_bias = state_dict["diffusion_model.input_blocks.\(layerStart).1.proj_out.bias"]
+      let proj_out_bias = state_dict["diffusion_model.\(prefix).\(layerStart).1.proj_out.bias"]
         .numpy()
       projOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: proj_out_weight))
       projOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: proj_out_bias))
@@ -597,8 +598,8 @@ func MiddleBlock(
 
 func InputBlocks(
   channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
-  embeddingSize: Int, x: Model.IO, emb: Model.IO, c: Model.IO
-) -> ((PythonObject) -> Void, Model.IO) {
+  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO
+) -> ((PythonObject) -> Void, [Model.IO], Model.IO) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
@@ -609,11 +610,12 @@ func InputBlocks(
   var readers = [(PythonObject) -> Void]()
   var previousChannel = channels[0]
   var ds = 1
-  let attentionRes = Set([4, 2, 1])
+  var passLayers = [out]
   for (i, channel) in channels.enumerated() {
+    let attentionBlock = attentionRes.contains(ds)
     for _ in 0..<numRepeat {
-      let attentionBlock = attentionRes.contains(ds)
-      let (reader, inputLayer) = InputLayer(
+      let (reader, inputLayer) = BlockLayer(
+        prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
         attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
@@ -623,6 +625,7 @@ func InputBlocks(
       } else {
         out = inputLayer(out, emb)
       }
+      passLayers.append(out)
       readers.append(reader)
       layerStart += 1
     }
@@ -631,6 +634,7 @@ func InputBlocks(
         groups: 1, filters: channel, filterSize: [3, 3],
         hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [0, 0])))
       out = downsample(out)
+      passLayers.append(out)
       let downLayer = layerStart
       let reader: (PythonObject) -> Void = { state_dict in
         let op_weight = state_dict["diffusion_model.input_blocks.\(downLayer).0.op.weight"].numpy()
@@ -654,6 +658,78 @@ func InputBlocks(
       reader(state_dict)
     }
   }
+  return (reader, passLayers, out)
+}
+
+func OutputBlocks(
+  channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO,
+  inputs: [Model.IO]
+) -> ((PythonObject) -> Void, Model.IO) {
+  var layerStart = 0
+  var height = startHeight
+  var width = startWidth
+  var readers = [(PythonObject) -> Void]()
+  var ds = 1
+  var heights = [height]
+  var widths = [width]
+  var dss = [ds]
+  for _ in 0..<channels.count - 1 {
+    height = height / 2
+    width = width / 2
+    ds *= 2
+    heights.append(height)
+    widths.append(width)
+    dss.append(ds)
+  }
+  var out = x
+  var inputIdx = inputs.count - 1
+  for (i, channel) in channels.enumerated().reversed() {
+    let height = heights[i]
+    let width = widths[i]
+    let ds = dss[i]
+    let attentionBlock = attentionRes.contains(ds)
+    for j in 0..<(numRepeat + 1) {
+      out = Concat(axis: 1)(out, inputs[inputIdx])
+      inputIdx -= 1
+      let (reader, outputLayer) = BlockLayer(
+        prefix: "output_blocks",
+        layerStart: layerStart, skipConnection: true,
+        attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
+        height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
+      if attentionBlock {
+        out = outputLayer(out, emb, c)
+      } else {
+        out = outputLayer(out, emb)
+      }
+      readers.append(reader)
+      if i > 0 && j == numRepeat {
+        out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
+        let conv2d = Convolution(
+          groups: 1, filters: channel, filterSize: [3, 3],
+          hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+        out = conv2d(out)
+        let upLayer = layerStart
+        let convIdx = attentionBlock ? 2 : 1
+        let reader: (PythonObject) -> Void = { state_dict in
+          let op_weight = state_dict[
+            "diffusion_model.output_blocks.\(upLayer).\(convIdx).conv.weight"
+          ].numpy()
+          let op_bias = state_dict["diffusion_model.output_blocks.\(upLayer).\(convIdx).conv.bias"]
+            .numpy()
+          conv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: op_weight))
+          conv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: op_bias))
+        }
+        readers.append(reader)
+      }
+      layerStart += 1
+    }
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
   return (reader, out)
 }
 
@@ -661,17 +737,24 @@ func UNet() -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let emb = Input()
   let c = Input()
-  let (inputReader, inputBlocks) = InputBlocks(
+  let attentionRes = Set([4, 2, 1])
+  let (inputReader, inputs, inputBlocks) = InputBlocks(
     channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: 1, startHeight: 64,
-    startWidth: 64, embeddingSize: 77, x: x, emb: emb, c: c)
+    startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
   var out = inputBlocks
   let (middleReader, middleBlock) = MiddleBlock(
     channels: 1280, numHeads: 8, batchSize: 1, height: 8, width: 8, embeddingSize: 77, x: out,
     emb: emb, c: c)
   out = middleBlock
+  let (outputReader, outputBlocks) = OutputBlocks(
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: 1, startHeight: 64,
+    startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
+    inputs: inputs)
+  out = outputBlocks
   let reader: (PythonObject) -> Void = {
     inputReader($0)
     middleReader($0)
+    outputReader($0)
   }
   return (reader, Model([x, emb, c], [out]))
 }
@@ -722,11 +805,10 @@ print(attnOutCPU)
 for i in 0..<6 {
   let x = i < 3 ? i : 1274 + i
   for j in 0..<6 {
-    let y = j < 3 ? j : 2 + j
+    let y = j < 3 ? j : 10 + j
     for k in 0..<6 {
-      let z = k < 3 ? k : 2 + k
+      let z = k < 3 ? k : 10 + k
       print("\(x) \(y) \(z) \(attnOutCPU[0, x, y, z])")
     }
   }
 }
-// print(state_dict.keys())
