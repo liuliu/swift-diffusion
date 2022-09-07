@@ -9,14 +9,20 @@ let omegaconf = Python.import("omegaconf")
 let random = Python.import("random")
 let numpy = Python.import("numpy")
 
-func timeEmbedding(timesteps: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<Float> {
+func timeEmbedding(timesteps: Int, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
+  Float
+> {
   precondition(embeddingSize % 2 == 0)
-  var embedding = Tensor<Float>(.CPU, .C(embeddingSize))
+  var embedding = Tensor<Float>(.CPU, .NC(batchSize, embeddingSize))
   let half = embeddingSize / 2
   for i in 0..<half {
     let freq: Float = exp(-log(Float(maxPeriod)) * Float(i) / Float(half)) * Float(timesteps)
-    embedding[i] = cos(freq)
-    embedding[i + half] = sin(freq)
+    let cosFreq = cos(freq)
+    let sinFreq = sin(freq)
+    for j in 0..<batchSize {
+      embedding[j, i] = cosFreq
+      embedding[j, i + half] = sinFreq
+    }
   }
   return embedding
 }
@@ -733,36 +739,68 @@ func OutputBlocks(
   return (reader, out)
 }
 
-func UNet() -> ((PythonObject) -> Void, Model) {
+func UNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
-  let emb = Input()
+  let t_emb = Input()
   let c = Input()
+  let (fc0, fc2, timeEmbed) = TimeEmbed(modelChannels: 320)
+  let emb = timeEmbed(t_emb)
   let attentionRes = Set([4, 2, 1])
   let (inputReader, inputs, inputBlocks) = InputBlocks(
-    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: 1, startHeight: 64,
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    startHeight: 64,
     startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
   var out = inputBlocks
   let (middleReader, middleBlock) = MiddleBlock(
-    channels: 1280, numHeads: 8, batchSize: 1, height: 8, width: 8, embeddingSize: 77, x: out,
+    channels: 1280, numHeads: 8, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
+    x: out,
     emb: emb, c: c)
   out = middleBlock
   let (outputReader, outputBlocks) = OutputBlocks(
-    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: 1, startHeight: 64,
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    startHeight: 64,
     startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
     inputs: inputs)
   out = outputBlocks
-  let reader: (PythonObject) -> Void = {
-    inputReader($0)
-    middleReader($0)
-    outputReader($0)
+  let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  out = outNorm(out)
+  out = Swish()(out)
+  let outConv2d = Convolution(
+    groups: 1, filters: 4, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = outConv2d(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let time_embed_0_weight = state_dict["diffusion_model.time_embed.0.weight"].numpy()
+    let time_embed_0_bias = state_dict["diffusion_model.time_embed.0.bias"].numpy()
+    let time_embed_2_weight = state_dict["diffusion_model.time_embed.2.weight"].numpy()
+    let time_embed_2_bias = state_dict["diffusion_model.time_embed.2.bias"].numpy()
+    fc0.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_0_weight))
+    fc0.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_0_bias))
+    fc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_2_weight))
+    fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_2_bias))
+    inputReader(state_dict)
+    middleReader(state_dict)
+    outputReader(state_dict)
+    let out_0_weight = state_dict["diffusion_model.out.0.weight"].numpy()
+    let out_0_bias = state_dict["diffusion_model.out.0.bias"].numpy()
+    outNorm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_0_weight))
+    outNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_0_bias))
+    let out_2_weight = state_dict["diffusion_model.out.2.weight"].numpy()
+    let out_2_bias = state_dict["diffusion_model.out.2.bias"].numpy()
+    outConv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_2_weight))
+    outConv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_2_bias))
   }
-  return (reader, Model([x, emb, c], [out]))
+  return (reader, Model([x, t_emb, c], [out]))
 }
 
 random.seed(42)
 numpy.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
+
+let x = torch.randn([2, 4, 64, 64])
+let t = torch.full([1], 981)
+let c = torch.randn([2, 77, 768])
 
 let config = omegaconf.OmegaConf.load(
   "/home/liu/workspace/stable-diffusion/configs/stable-diffusion/v1-inference.yaml")
@@ -774,43 +812,43 @@ let model = ldm_util.instantiate_from_config(config.model)
 model.load_state_dict(sd, strict: false)
 model.eval()
 let state_dict = model.model.state_dict()
-let x = torch.randn([1, 4, 64, 64])
-let t = torch.full([1], 981)
-let c = torch.randn([1, 77, 768])
 let ret = model.model.diffusion_model(x, t, c)
 
 let graph = DynamicGraph()
 
-let time_embed_0_weight = state_dict["diffusion_model.time_embed.0.weight"].numpy()
-let time_embed_0_bias = state_dict["diffusion_model.time_embed.0.bias"].numpy()
-let time_embed_2_weight = state_dict["diffusion_model.time_embed.2.weight"].numpy()
-let time_embed_2_bias = state_dict["diffusion_model.time_embed.2.bias"].numpy()
-
-let t_emb = graph.variable(timeEmbedding(timesteps: 981, embeddingSize: 320, maxPeriod: 10_000))
-let (fc0, fc2, timeEmbed) = TimeEmbed(modelChannels: 320)
-let _ = timeEmbed(inputs: t_emb)
-fc0.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_0_weight))
-fc0.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_0_bias))
-fc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_2_weight))
-fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_2_bias))
-let emb = timeEmbed(inputs: t_emb)[0].as(of: Float.self).toGPU(0)
+let t_emb = graph.variable(
+  timeEmbedding(timesteps: 981, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
+).toGPU(0)
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
-let (reader, unet) = UNet()
+let (reader, unet) = UNet(batchSize: 2)
 graph.withNoGrad {
-  let _ = unet(inputs: xTensor, emb, cTensor)
+  let _ = unet(inputs: xTensor, t_emb, cTensor)
   reader(state_dict)
-  let attnOut = unet(inputs: xTensor, emb, cTensor)[0].as(of: Float.self)
+  let attnOut = unet(inputs: xTensor, t_emb, cTensor)[0].as(of: Float.self)
   let attnOutCPU = attnOut.toCPU()
   print(attnOutCPU)
-  for i in 0..<6 {
-    let x = i < 3 ? i : 314 + i
+  for i in 0..<4 {
+    let x = i
     for j in 0..<6 {
       let y = j < 3 ? j : 58 + j
       for k in 0..<6 {
         let z = k < 3 ? k : 58 + k
-        print("\(x) \(y) \(z) \(attnOutCPU[0, x, y, z])")
+        print("0 \(x) \(y) \(z) \(attnOutCPU[0, x, y, z])")
       }
     }
+  }
+  for i in 0..<4 {
+    let x = i
+    for j in 0..<6 {
+      let y = j < 3 ? j : 58 + j
+      for k in 0..<6 {
+        let z = k < 3 ? k : 58 + k
+        print("1 \(x) \(y) \(z) \(attnOutCPU[1, x, y, z])")
+      }
+    }
+  }
+  graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
+    $0.write("unet", model: unet)
   }
 }
