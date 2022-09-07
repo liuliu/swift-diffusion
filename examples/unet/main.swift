@@ -395,11 +395,9 @@ func InputLayer(
 }
 
 func MiddleBlock(
-  channels: Int, numHeads: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int
-) -> ((PythonObject) -> Void, Model) {
-  let x = Input()
-  let emb = Input()
-  let c = Input()
+  channels: Int, numHeads: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
+  x: Model.IO, emb: Model.IO, c: Model.IO
+) -> ((PythonObject) -> Void, Model.IO) {
   precondition(channels % numHeads == 0)
   let k = channels / numHeads
   let (inLayerNorm1, inLayerConv2d1, embLayer1, outLayerNorm1, outLayerConv2d1, _, resBlock1) =
@@ -594,16 +592,13 @@ func MiddleBlock(
     outLayerConv2d2.parameters(for: .bias).copy(
       from: try! Tensor<Float>(numpy: out_layers_2_3_bias))
   }
-  return (reader, Model([x, emb, c], [out]))
+  return (reader, out)
 }
 
 func InputBlocks(
   channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
-  embeddingSize: Int
-) -> ((PythonObject) -> Void, Model) {
-  let x = Input()
-  let emb = Input()
-  let c = Input()
+  embeddingSize: Int, x: Model.IO, emb: Model.IO, c: Model.IO
+) -> ((PythonObject) -> Void, Model.IO) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
@@ -659,6 +654,25 @@ func InputBlocks(
       reader(state_dict)
     }
   }
+  return (reader, out)
+}
+
+func UNet() -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  let emb = Input()
+  let c = Input()
+  let (inputReader, inputBlocks) = InputBlocks(
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: 1, startHeight: 64,
+    startWidth: 64, embeddingSize: 77, x: x, emb: emb, c: c)
+  var out = inputBlocks
+  let (middleReader, middleBlock) = MiddleBlock(
+    channels: 1280, numHeads: 8, batchSize: 1, height: 8, width: 8, embeddingSize: 77, x: out,
+    emb: emb, c: c)
+  out = middleBlock
+  let reader: (PythonObject) -> Void = {
+    inputReader($0)
+    middleReader($0)
+  }
   return (reader, Model([x, emb, c], [out]))
 }
 
@@ -699,19 +713,11 @@ fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_2_bia
 let emb = timeEmbed(inputs: t_emb)[0].as(of: Float.self).toGPU(0)
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
-let (reader, inputBlocks) = InputBlocks(
-  channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: 1, startHeight: 64,
-  startWidth: 64, embeddingSize: 77)
-let _ = inputBlocks(inputs: xTensor, emb, cTensor)
+let (reader, unet) = UNet()
+let _ = unet(inputs: xTensor, emb, cTensor)
 reader(state_dict)
-let attnOut = inputBlocks(inputs: xTensor, emb, cTensor)[0].as(of: Float.self)
-let (middleReader, middleBlock) = MiddleBlock(
-  channels: 1280, numHeads: 8, batchSize: 1, height: 8, width: 8, embeddingSize: 77)
-let _ = middleBlock(inputs: attnOut, emb, cTensor)
-middleReader(state_dict)
-let attnOut2 = middleBlock(inputs: attnOut, emb, cTensor)[0].as(of: Float.self)
-
-let attnOutCPU = attnOut2.toCPU()
+let attnOut = unet(inputs: xTensor, emb, cTensor)[0].as(of: Float.self)
+let attnOutCPU = attnOut.toCPU()
 print(attnOutCPU)
 for i in 0..<6 {
   let x = i < 3 ? i : 1274 + i
