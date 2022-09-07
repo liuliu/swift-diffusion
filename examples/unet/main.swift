@@ -604,10 +604,13 @@ func InputBlocks(
   let x = Input()
   let emb = Input()
   let c = Input()
+  let conv2d = Convolution(
+    groups: 1, filters: 320, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  var out = conv2d(x)
   var layerStart = 1
   var height = startHeight
   var width = startWidth
-  var out: Model.IO = x
   var readers = [(PythonObject) -> Void]()
   var previousChannel = channels[0]
   var ds = 1
@@ -647,9 +650,13 @@ func InputBlocks(
       ds *= 2
     }
   }
-  let reader: (PythonObject) -> Void = {
+  let reader: (PythonObject) -> Void = { state_dict in
+    let input_blocks_0_0_weight = state_dict["diffusion_model.input_blocks.0.0.weight"].numpy()
+    let input_blocks_0_0_bias = state_dict["diffusion_model.input_blocks.0.0.bias"].numpy()
+    conv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_weight))
+    conv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_bias))
     for reader in readers {
-      reader($0)
+      reader(state_dict)
     }
   }
   return (reader, Model([x, emb, c], [out]))
@@ -691,22 +698,13 @@ fc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_2_w
 fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_2_bias))
 let emb = timeEmbed(inputs: t_emb)[0].as(of: Float.self).toGPU(0)
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
-let input_blocks_0_0_weight = state_dict["diffusion_model.input_blocks.0.0.weight"].numpy()
-let input_blocks_0_0_bias = state_dict["diffusion_model.input_blocks.0.0.bias"].numpy()
-let conv2d = Convolution(
-  groups: 1, filters: 320, filterSize: [3, 3],
-  hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
-let _ = conv2d(xTensor)
-conv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_weight))
-conv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_bias))
-let yTensor = conv2d(xTensor)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
 let (reader, inputBlocks) = InputBlocks(
   channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: 1, startHeight: 64,
   startWidth: 64, embeddingSize: 77)
-let _ = inputBlocks(inputs: yTensor, emb, cTensor)
+let _ = inputBlocks(inputs: xTensor, emb, cTensor)
 reader(state_dict)
-let attnOut = inputBlocks(inputs: yTensor, emb, cTensor)[0].as(of: Float.self)
+let attnOut = inputBlocks(inputs: xTensor, emb, cTensor)[0].as(of: Float.self)
 let (middleReader, middleBlock) = MiddleBlock(
   channels: 1280, numHeads: 8, batchSize: 1, height: 8, width: 8, embeddingSize: 77)
 let _ = middleBlock(inputs: attnOut, emb, cTensor)
@@ -725,3 +723,4 @@ for i in 0..<6 {
     }
   }
 }
+// print(state_dict.keys())
