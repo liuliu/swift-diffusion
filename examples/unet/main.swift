@@ -797,18 +797,20 @@ let emb = timeEmbed(inputs: t_emb)[0].as(of: Float.self).toGPU(0)
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
 let (reader, unet) = UNet()
-let _ = unet(inputs: xTensor, emb, cTensor)
-reader(state_dict)
-let attnOut = unet(inputs: xTensor, emb, cTensor)[0].as(of: Float.self)
-let attnOutCPU = attnOut.toCPU()
-print(attnOutCPU)
-for i in 0..<6 {
-  let x = i < 3 ? i : 1274 + i
-  for j in 0..<6 {
-    let y = j < 3 ? j : 10 + j
-    for k in 0..<6 {
-      let z = k < 3 ? k : 10 + k
-      print("\(x) \(y) \(z) \(attnOutCPU[0, x, y, z])")
+graph.withNoGrad {
+  let _ = unet(inputs: xTensor, emb, cTensor)
+  reader(state_dict)
+  let attnOut = unet(inputs: xTensor, emb, cTensor)[0].as(of: Float.self)
+  let attnOutCPU = attnOut.toCPU()
+  print(attnOutCPU)
+  for i in 0..<6 {
+    let x = i < 3 ? i : 314 + i
+    for j in 0..<6 {
+      let y = j < 3 ? j : 58 + j
+      for k in 0..<6 {
+        let z = k < 3 ? k : 58 + k
+        print("\(x) \(y) \(z) \(attnOutCPU[0, x, y, z])")
+      }
     }
   }
 }
