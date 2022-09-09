@@ -137,6 +137,9 @@ func Decoder(batchSize: Int, startWidth: Int, startHeight: Int) -> ((PythonObjec
     prefix: "mid.attn_1", inChannels: 512, batchSize: batchSize, width: startWidth,
     height: startHeight)
   out = midAttn1(out)
+  let (midBlockReader2, midBlock2) = ResnetBlock(
+    prefix: "mid.block_2", outChannels: 512, shortcut: false)
+  out = midBlock2(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let post_quant_conv_weight = state_dict["post_quant_conv.weight"].numpy()
     let post_quant_conv_bias = state_dict["post_quant_conv.bias"].numpy()
@@ -150,6 +153,7 @@ func Decoder(batchSize: Int, startWidth: Int, startHeight: Int) -> ((PythonObjec
     convIn.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_in_bias))
     midBlockReader1(state_dict)
     midAttnReader1(state_dict)
+    midBlockReader2(state_dict)
   }
   return (reader, Model([x], [out]))
 }
