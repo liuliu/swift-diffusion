@@ -168,6 +168,13 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
       readers.append(reader)
     }
   }
+  let normOut = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  out = normOut(out)
+  out = Swish()(out)
+  let convOut = Convolution(
+    groups: 1, filters: 3, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = convOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let post_quant_conv_weight = state_dict["post_quant_conv.weight"].numpy()
     let post_quant_conv_bias = state_dict["post_quant_conv.bias"].numpy()
@@ -185,6 +192,14 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
     for reader in readers {
       reader(state_dict)
     }
+    let norm_out_weight = state_dict["decoder.norm_out.weight"].numpy()
+    let norm_out_bias = state_dict["decoder.norm_out.bias"].numpy()
+    normOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm_out_weight))
+    normOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm_out_bias))
+    let conv_out_weight = state_dict["decoder.conv_out.weight"].numpy()
+    let conv_out_bias = state_dict["decoder.conv_out.bias"].numpy()
+    convOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_out_weight))
+    convOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_out_bias))
   }
   return (reader, Model([x], [out]))
 }
@@ -218,7 +233,7 @@ graph.withNoGrad {
   let quant = decoder(inputs: zTensor)[0].as(of: Float.self)
   let quantCPU = quant.toCPU()
   print(quantCPU)
-  for i in 0..<6 {
+  for i in 0..<3 {
     let x = i < 3 ? i : 122 + i
     for j in 0..<6 {
       let y = j < 3 ? j : 506 + j
