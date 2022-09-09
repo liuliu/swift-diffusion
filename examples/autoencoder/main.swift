@@ -121,25 +121,53 @@ func AttnBlock(prefix: String, inChannels: Int, batchSize: Int, width: Int, heig
   return (reader, Model([x], [out]))
 }
 
-func Decoder(batchSize: Int, startWidth: Int, startHeight: Int) -> ((PythonObject) -> Void, Model) {
+func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, startHeight: Int)
+  -> ((PythonObject) -> Void, Model)
+{
   let x = Input()
   let postQuantConv2d = Convolution(
     groups: 1, filters: 4, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   var out = postQuantConv2d(x)
+  var previousChannel = channels[channels.count - 1]
   let convIn = Convolution(
-    groups: 1, filters: 512, filterSize: [3, 3],
+    groups: 1, filters: previousChannel, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = convIn(out)
   let (midBlockReader1, midBlock1) = ResnetBlock(
-    prefix: "mid.block_1", outChannels: 512, shortcut: false)
+    prefix: "mid.block_1", outChannels: previousChannel, shortcut: false)
   out = midBlock1(out)
   let (midAttnReader1, midAttn1) = AttnBlock(
-    prefix: "mid.attn_1", inChannels: 512, batchSize: batchSize, width: startWidth,
+    prefix: "mid.attn_1", inChannels: previousChannel, batchSize: batchSize, width: startWidth,
     height: startHeight)
   out = midAttn1(out)
   let (midBlockReader2, midBlock2) = ResnetBlock(
-    prefix: "mid.block_2", outChannels: 512, shortcut: false)
+    prefix: "mid.block_2", outChannels: previousChannel, shortcut: false)
   out = midBlock2(out)
+  var readers = [(PythonObject) -> Void]()
+  for (i, channel) in channels.enumerated().reversed() {
+    for j in 0..<numRepeat + 1 {
+      let (reader, block) = ResnetBlock(
+        prefix: "up.\(i).block.\(j)", outChannels: channel, shortcut: previousChannel != channel)
+      readers.append(reader)
+      out = block(out)
+      previousChannel = channel
+    }
+    if i > 0 {
+      out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
+      let conv2d = Convolution(
+        groups: 1, filters: channel, filterSize: [3, 3],
+        hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+      out = conv2d(out)
+      let upLayer = i
+      let reader: (PythonObject) -> Void = { state_dict in
+        let conv_weight = state_dict["decoder.up.\(upLayer).upsample.conv.weight"].numpy()
+        let conv_bias = state_dict["decoder.up.\(upLayer).upsample.conv.bias"].numpy()
+        conv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_weight))
+        conv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_bias))
+      }
+      readers.append(reader)
+    }
+  }
   let reader: (PythonObject) -> Void = { state_dict in
     let post_quant_conv_weight = state_dict["post_quant_conv.weight"].numpy()
     let post_quant_conv_bias = state_dict["post_quant_conv.bias"].numpy()
@@ -154,6 +182,9 @@ func Decoder(batchSize: Int, startWidth: Int, startHeight: Int) -> ((PythonObjec
     midBlockReader1(state_dict)
     midAttnReader1(state_dict)
     midBlockReader2(state_dict)
+    for reader in readers {
+      reader(state_dict)
+    }
   }
   return (reader, Model([x], [out]))
 }
@@ -178,7 +209,8 @@ print(state_dict.keys())
 
 let graph = DynamicGraph()
 let zTensor = graph.variable(try! Tensor<Float>(numpy: z.numpy())).toGPU(0)
-let (reader, decoder) = Decoder(batchSize: 1, startWidth: 64, startHeight: 64)
+let (reader, decoder) = Decoder(
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64, startHeight: 64)
 
 graph.withNoGrad {
   let _ = decoder(inputs: zTensor)
@@ -187,11 +219,11 @@ graph.withNoGrad {
   let quantCPU = quant.toCPU()
   print(quantCPU)
   for i in 0..<6 {
-    let x = i < 3 ? i : 506 + i
+    let x = i < 3 ? i : 122 + i
     for j in 0..<6 {
-      let y = j < 3 ? j : 58 + j
+      let y = j < 3 ? j : 506 + j
       for k in 0..<6 {
-        let z = k < 3 ? k : 58 + k
+        let z = k < 3 ? k : 506 + k
         print("0 \(x) \(y) \(z) \(quantCPU[0, x, y, z])")
       }
     }
