@@ -70,7 +70,58 @@ func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (
   return (reader, Model([x], [out]))
 }
 
-func Decoder() -> ((PythonObject) -> Void, Model) {
+func AttnBlock(prefix: String, inChannels: Int, batchSize: Int, width: Int, height: Int) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  var out = norm(x)
+  let hw = width * height
+  let tokeys = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let k = tokeys(out).reshaped([batchSize, inChannels, hw])
+  let toqueries = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
+    batchSize, inChannels, hw,
+  ])
+  var dot = Matmul(transposeA: (1, 2))(q, k)
+  dot = dot.reshaped([batchSize * hw, hw])
+  dot = dot.softmax()
+  dot = dot.reshaped([batchSize, hw, hw])
+  let tovalues = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let v = tovalues(out).reshaped([batchSize, inChannels, hw])
+  out = Matmul(transposeB: (1, 2))(v, dot)
+  let projOut = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  out = x + projOut(out.reshaped([batchSize, inChannels, height, width]))
+  let reader: (PythonObject) -> Void = { state_dict in
+    let norm_weight = state_dict["decoder.\(prefix).norm.weight"].numpy()
+    let norm_bias = state_dict["decoder.\(prefix).norm.bias"].numpy()
+    norm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm_weight))
+    norm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm_bias))
+    let k_weight = state_dict["decoder.\(prefix).k.weight"].numpy()
+    let k_bias = state_dict["decoder.\(prefix).k.bias"].numpy()
+    tokeys.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: k_weight))
+    tokeys.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: k_bias))
+    let q_weight = state_dict["decoder.\(prefix).q.weight"].numpy()
+    let q_bias = state_dict["decoder.\(prefix).q.bias"].numpy()
+    toqueries.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: q_weight))
+    toqueries.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: q_bias))
+    let v_weight = state_dict["decoder.\(prefix).v.weight"].numpy()
+    let v_bias = state_dict["decoder.\(prefix).v.bias"].numpy()
+    tovalues.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: v_weight))
+    tovalues.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: v_bias))
+    let proj_out_weight = state_dict["decoder.\(prefix).proj_out.weight"].numpy()
+    let proj_out_bias = state_dict["decoder.\(prefix).proj_out.bias"].numpy()
+    projOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: proj_out_weight))
+    projOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: proj_out_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+func Decoder(batchSize: Int, startWidth: Int, startHeight: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let postQuantConv2d = Convolution(
     groups: 1, filters: 4, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
@@ -79,9 +130,13 @@ func Decoder() -> ((PythonObject) -> Void, Model) {
     groups: 1, filters: 512, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = convIn(out)
-  let (midReader1, midBlock1) = ResnetBlock(
+  let (midBlockReader1, midBlock1) = ResnetBlock(
     prefix: "mid.block_1", outChannels: 512, shortcut: false)
   out = midBlock1(out)
+  let (midAttnReader1, midAttn1) = AttnBlock(
+    prefix: "mid.attn_1", inChannels: 512, batchSize: batchSize, width: startWidth,
+    height: startHeight)
+  out = midAttn1(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let post_quant_conv_weight = state_dict["post_quant_conv.weight"].numpy()
     let post_quant_conv_bias = state_dict["post_quant_conv.bias"].numpy()
@@ -93,7 +148,8 @@ func Decoder() -> ((PythonObject) -> Void, Model) {
     let conv_in_bias = state_dict["decoder.conv_in.bias"].numpy()
     convIn.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_in_weight))
     convIn.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_in_bias))
-    midReader1(state_dict)
+    midBlockReader1(state_dict)
+    midAttnReader1(state_dict)
   }
   return (reader, Model([x], [out]))
 }
@@ -118,7 +174,7 @@ print(state_dict.keys())
 
 let graph = DynamicGraph()
 let zTensor = graph.variable(try! Tensor<Float>(numpy: z.numpy())).toGPU(0)
-let (reader, decoder) = Decoder()
+let (reader, decoder) = Decoder(batchSize: 1, startWidth: 64, startHeight: 64)
 
 graph.withNoGrad {
   let _ = decoder(inputs: zTensor)
