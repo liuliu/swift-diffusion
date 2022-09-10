@@ -415,6 +415,111 @@ func UNet(batchSize: Int) -> Model {
   return Model([x, t_emb, c], [out])
 }
 
+/// Autoencoder
+
+func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> Model {
+  let x = Input()
+  let norm1 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  var out = norm1(x)
+  out = Swish()(out)
+  let conv1 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = conv1(out)
+  let norm2 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  out = norm2(out)
+  out = Swish()(out)
+  let conv2 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = conv2(out)
+  let ninShortcut: Model?
+  if shortcut {
+    let nin = Convolution(
+      groups: 1, filters: outChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+    out = nin(x) + out
+    ninShortcut = nin
+  } else {
+    ninShortcut = nil
+    out = x + out
+  }
+  return Model([x], [out])
+}
+
+func AttnBlock(prefix: String, inChannels: Int, batchSize: Int, width: Int, height: Int) -> Model {
+  let x = Input()
+  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  var out = norm(x)
+  let hw = width * height
+  let tokeys = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let k = tokeys(out).reshaped([batchSize, inChannels, hw])
+  let toqueries = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
+    batchSize, inChannels, hw,
+  ])
+  var dot = Matmul(transposeA: (1, 2))(q, k)
+  dot = dot.reshaped([batchSize * hw, hw])
+  dot = dot.softmax()
+  dot = dot.reshaped([batchSize, hw, hw])
+  let tovalues = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let v = tovalues(out).reshaped([batchSize, inChannels, hw])
+  out = Matmul(transposeB: (1, 2))(v, dot)
+  let projOut = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  out = x + projOut(out.reshaped([batchSize, inChannels, height, width]))
+  return Model([x], [out])
+}
+
+func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, startHeight: Int)
+  -> Model
+{
+  let x = Input()
+  let postQuantConv2d = Convolution(
+    groups: 1, filters: 4, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  var out = postQuantConv2d(x)
+  var previousChannel = channels[channels.count - 1]
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = convIn(out)
+  let midBlock1 = ResnetBlock(
+    prefix: "mid.block_1", outChannels: previousChannel, shortcut: false)
+  out = midBlock1(out)
+  let midAttn1 = AttnBlock(
+    prefix: "mid.attn_1", inChannels: previousChannel, batchSize: batchSize, width: startWidth,
+    height: startHeight)
+  out = midAttn1(out)
+  let midBlock2 = ResnetBlock(
+    prefix: "mid.block_2", outChannels: previousChannel, shortcut: false)
+  out = midBlock2(out)
+  for (i, channel) in channels.enumerated().reversed() {
+    for j in 0..<numRepeat + 1 {
+      let block = ResnetBlock(
+        prefix: "up.\(i).block.\(j)", outChannels: channel, shortcut: previousChannel != channel)
+      out = block(out)
+      previousChannel = channel
+    }
+    if i > 0 {
+      out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
+      let conv2d = Convolution(
+        groups: 1, filters: channel, filterSize: [3, 3],
+        hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+      out = conv2d(out)
+    }
+  }
+  let normOut = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  out = normOut(out)
+  out = Swish()(out)
+  let convOut = Convolution(
+    groups: 1, filters: 3, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = convOut(out)
+  return Model([x], [out])
+}
+
 let transformers = Python.import("transformers")
 let torch = Python.import("torch")
 let random = Python.import("random")
@@ -425,7 +530,31 @@ numpy.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-let x = torch.randn([2, 4, 64, 64])
+let x = torch.randn([1, 4, 64, 64])
+let graph = DynamicGraph()
+let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy()).toGPU(0))
+let decoder = Decoder(
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64, startHeight: 64)
+graph.withNoGrad {
+  let _ = decoder(inputs: xTensor)[0].as(of: Float.self)
+  graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
+    $0.read("decoder", model: decoder)
+  }
+  let quant = decoder(inputs: xTensor)[0].as(of: Float.self)
+  let quantCPU = quant.toCPU()
+  print(quantCPU)
+  for i in 0..<3 {
+    let x = i < 3 ? i : 122 + i
+    for j in 0..<6 {
+      let y = j < 3 ? j : 506 + j
+      for k in 0..<6 {
+        let z = k < 3 ? k : 506 + k
+        print("0 \(x) \(y) \(z) \(quantCPU[0, x, y, z])")
+      }
+    }
+  }
+}
+/*
 let t = torch.full([1], 981)
 let c = torch.randn([2, 77, 768])
 
@@ -478,6 +607,7 @@ graph.withNoGrad {
     }
   }
 }
+*/
 /*
 let tokensTensor = graph.variable(.CPU, .C(77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(77), of: Int32.self)
