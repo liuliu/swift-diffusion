@@ -433,14 +433,11 @@ func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> Model {
     groups: 1, filters: outChannels, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = conv2(out)
-  let ninShortcut: Model?
   if shortcut {
     let nin = Convolution(
       groups: 1, filters: outChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
     out = nin(x) + out
-    ninShortcut = nin
   } else {
-    ninShortcut = nil
     out = x + out
   }
   return Model([x], [out])
@@ -530,31 +527,7 @@ numpy.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-let x = torch.randn([1, 4, 64, 64])
-let graph = DynamicGraph()
-let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy()).toGPU(0))
-let decoder = Decoder(
-  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64, startHeight: 64)
-graph.withNoGrad {
-  let _ = decoder(inputs: xTensor)[0].as(of: Float.self)
-  graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
-    $0.read("decoder", model: decoder)
-  }
-  let quant = decoder(inputs: xTensor)[0].as(of: Float.self)
-  let quantCPU = quant.toCPU()
-  print(quantCPU)
-  for i in 0..<3 {
-    let x = i < 3 ? i : 122 + i
-    for j in 0..<6 {
-      let y = j < 3 ? j : 506 + j
-      for k in 0..<6 {
-        let z = k < 3 ? k : 506 + k
-        print("0 \(x) \(y) \(z) \(quantCPU[0, x, y, z])")
-      }
-    }
-  }
-}
-/*
+let x = torch.randn([2, 4, 64, 64])
 let t = torch.full([1], 981)
 let c = torch.randn([2, 77, 768])
 
@@ -578,36 +551,33 @@ let t_emb = graph.variable(
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
 let unet = UNet(batchSize: 2)
+let decoder = Decoder(
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64, startHeight: 64)
 graph.withNoGrad {
   let _ = unet(inputs: xTensor, t_emb, cTensor)
+  let _ = decoder(inputs: xTensor)
   graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
     $0.read("unet", model: unet)
   }
-  let attnOut = unet(inputs: xTensor, t_emb, cTensor)[0].as(of: Float.self)
-  let attnOutCPU = attnOut.toCPU()
-  print(attnOutCPU)
-  for i in 0..<4 {
-    let x = i
-    for j in 0..<6 {
-      let y = j < 3 ? j : 58 + j
-      for k in 0..<6 {
-        let z = k < 3 ? k : 58 + k
-        print("0 \(x) \(y) \(z) \(attnOutCPU[0, x, y, z])")
-      }
-    }
+  graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
+    $0.read("decoder", model: decoder)
   }
-  for i in 0..<4 {
+  let attnOut = unet(inputs: xTensor, t_emb, cTensor)[0].as(of: Float.self)
+  let zTensor = 1.0 / 0.18215 * attnOut
+  let quant = decoder(inputs: zTensor)[0].as(of: Float.self)
+  let quantCPU = quant.toCPU()
+  print(quantCPU)
+  for i in 0..<3 {
     let x = i
     for j in 0..<6 {
-      let y = j < 3 ? j : 58 + j
+      let y = j < 3 ? j : 506 + j
       for k in 0..<6 {
-        let z = k < 3 ? k : 58 + k
-        print("1 \(x) \(y) \(z) \(attnOutCPU[1, x, y, z])")
+        let z = k < 3 ? k : 506 + k
+        print("0 \(x) \(y) \(z) \(quantCPU[0, x, y, z])")
       }
     }
   }
 }
-*/
 /*
 let tokensTensor = graph.variable(.CPU, .C(77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(77), of: Int32.self)

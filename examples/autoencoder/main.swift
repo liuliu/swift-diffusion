@@ -234,7 +234,7 @@ graph.withNoGrad {
   let quantCPU = quant.toCPU()
   print(quantCPU)
   for i in 0..<3 {
-    let x = i < 3 ? i : 122 + i
+    let x = i
     for j in 0..<6 {
       let y = j < 3 ? j : 506 + j
       for k in 0..<6 {

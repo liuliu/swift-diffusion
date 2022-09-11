@@ -34,6 +34,17 @@ swift_binary(
 )
 
 swift_binary(
+    name = "diffusion",
+    srcs = ["diffusion/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "stableDiffusion",
     srcs = ["stableDiffusion/main.swift"],
     deps = [
