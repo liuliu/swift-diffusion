@@ -527,9 +527,9 @@ numpy.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-let x = torch.randn([2, 4, 64, 64])
+let x = torch.randn([4, 4, 64, 64])
 let t = torch.full([1], 981)
-let c = torch.randn([2, 77, 768])
+let c = torch.randn([4, 77, 768])
 
 let tokenizer = transformers.CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
 
@@ -546,13 +546,13 @@ let textModel = CLIPTextModel(
 let graph = DynamicGraph()
 
 let t_emb = graph.variable(
-  timeEmbedding(timesteps: 981, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
+  timeEmbedding(timesteps: 981, batchSize: 4, embeddingSize: 320, maxPeriod: 10_000)
 ).toGPU(0)
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
-let unet = UNet(batchSize: 2)
+let unet = UNet(batchSize: 4)
 let decoder = Decoder(
-  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64, startHeight: 64)
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 4, startWidth: 64, startHeight: 64)
 graph.withNoGrad {
   let _ = unet(inputs: xTensor, t_emb, cTensor)
   let _ = decoder(inputs: xTensor)
