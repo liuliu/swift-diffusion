@@ -45,6 +45,17 @@ swift_binary(
 )
 
 swift_binary(
+    name = "txt2img",
+    srcs = ["txt2img/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "stableDiffusion",
     srcs = ["stableDiffusion/main.swift"],
     deps = [

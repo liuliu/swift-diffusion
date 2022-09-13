@@ -5,7 +5,9 @@ import PythonKit
 
 /// Text Model
 
-func CLIPTextEmbedding(vocabularySize: Int, maxLength: Int, embeddingSize: Int) -> Model {
+func CLIPTextEmbedding(batchSize: Int, vocabularySize: Int, maxLength: Int, embeddingSize: Int)
+  -> Model
+{
   let tokens = Input()
   let positions = Input()
   let tokenEmbed = Embedding(
@@ -21,16 +23,16 @@ func CLIPAttention(k: Int, h: Int, b: Int, t: Int) -> Model {
   let tokeys = Dense(count: k * h)
   let toqueries = Dense(count: k * h)
   let tovalues = Dense(count: k * h)
-  let keys = tokeys(x).reshaped([t, b, h, k]).transposed(0, 2).reshaped([b * h, t, k])
-  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([t, b, h, k])
-    .transposed(0, 2).reshaped([b * h, t, k])
-  let values = tovalues(x).reshaped([t, b, h, k]).transposed(0, 2).reshaped([b * h, t, k])
+  let keys = tokeys(x).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
+  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t, h, k])
+    .transposed(1, 2).reshaped([b * h, t, k])
+  let values = tovalues(x).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
   var dot = Matmul(transposeB: (1, 2))(queries, keys) + casualAttentionMask
   dot = dot.reshaped([b * h * t, t])
   dot = dot.softmax()
   dot = dot.reshaped([b * h, t, t])
   var out = dot * values
-  out = out.reshaped([h, b, t, k]).transposed(0, 2).reshaped([b * t, h * k])
+  out = out.reshaped([b, h, t, k]).transposed(1, 2).reshaped([b * t, h * k])
   let unifyheads = Dense(count: k * h)
   out = unifyheads(out)
   return Model([x, casualAttentionMask], [out])
@@ -75,6 +77,7 @@ func CLIPTextModel(
   let positions = Input()
   let casualAttentionMask = Input()
   let embedding = CLIPTextEmbedding(
+    batchSize: batchSize,
     vocabularySize: vocabularySize, maxLength: maxLength, embeddingSize: embeddingSize)
   var out = embedding(tokens, positions)
   let k = embeddingSize / numHeads
@@ -518,43 +521,70 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
 }
 
 let transformers = Python.import("transformers")
-let torch = Python.import("torch")
-let random = Python.import("random")
-let numpy = Python.import("numpy")
 
-random.seed(42)
-numpy.random.seed(42)
-torch.manual_seed(42)
-torch.cuda.manual_seed_all(42)
+DynamicGraph.seed = 42
 
-let x = torch.randn([4, 4, 64, 64])
-let t = torch.full([1], 981)
-// let c = torch.randn([4, 77, 768])
+let x = torch.randn([2, 4, 64, 64])
 
 let tokenizer = transformers.CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+
+let unconditional_batch_encoding = tokenizer(
+  [""], truncation: true, max_length: 77,
+  return_length: true, return_overflowing_tokens: false, padding: "max_length", return_tensors: "pt"
+)
 
 let batch_encoding = tokenizer(
   ["a photograph of an astronaut riding a horse"], truncation: true, max_length: 77,
   return_length: true, return_overflowing_tokens: false, padding: "max_length", return_tensors: "pt"
 )
+
+let unconditional_tokens = unconditional_batch_encoding["input_ids"]
 let tokens = batch_encoding["input_ids"]
+
+let graph = DynamicGraph()
 
 let textModel = CLIPTextModel(
   vocabularySize: 49408, maxLength: 77, embeddingSize: 768, numLayers: 12, numHeads: 12,
-  batchSize: 1, intermediateSize: 3072)
+  batchSize: 2, intermediateSize: 3072)
 
-let graph = DynamicGraph()
-/*
+let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
+let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
+let tokensNumpy = tokens.numpy()
+let unconditionalTokensNumpy = unconditional_tokens.numpy()
+for i in 0..<77 {
+  tokensTensor[i] = Int32(tokensNumpy[0, i])!
+  tokensTensor[i + 77] = Int32(unconditionalTokensNumpy[0, i])!
+  positionTensor[i] = Int32(i)
+  positionTensor[i + 77] = Int32(i)
+}
+
+let casualAttentionMask = graph.variable(Tensor<Float>(.CPU, .HWC(1, 77, 77)))
+casualAttentionMask.full(0)
+for i in 0..<76 {
+  for j in (i + 1)..<77 {
+    casualAttentionMask[0, i, j] = -Float.greatestFiniteMagnitude
+  }
+}
+
 let t_emb = graph.variable(
-  timeEmbedding(timesteps: 981, batchSize: 4, embeddingSize: 320, maxPeriod: 10_000)
+  timeEmbedding(timesteps: 981, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
 ).toGPU(0)
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
-let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
-let unet = UNet(batchSize: 4)
+let unet = UNet(batchSize: 2)
 let decoder = Decoder(
-  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 4, startWidth: 64, startHeight: 64)
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 2, startWidth: 64, startHeight: 64)
 graph.withNoGrad {
-  let _ = unet(inputs: xTensor, t_emb, cTensor)
+  let tokensTensorGPU = tokensTensor.toGPU(0)
+  let positionTensorGPU = positionTensor.toGPU(0)
+  let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
+  let _ = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
+  graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
+    $0.read("text_model", model: textModel)
+  }
+  let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
+    of: Float.self
+  ).reshaped(.CHW(2, 77, 768))
+  let _ = unet(inputs: xTensor, t_emb, c)
   let _ = decoder(inputs: xTensor)
   graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
     $0.read("unet", model: unet)
@@ -562,7 +592,7 @@ graph.withNoGrad {
   graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
     $0.read("decoder", model: decoder)
   }
-  let attnOut = unet(inputs: xTensor, t_emb, cTensor)[0].as(of: Float.self)
+  let attnOut = unet(inputs: xTensor, t_emb, c)[0].as(of: Float.self)
   let zTensor = 1.0 / 0.18215 * attnOut
   let quant = decoder(inputs: zTensor)[0].as(of: Float.self)
   let quantCPU = quant.toCPU()
@@ -576,35 +606,5 @@ graph.withNoGrad {
         print("0 \(x) \(y) \(z) \(quantCPU[0, x, y, z])")
       }
     }
-  }
-}
-*/
-let tokensTensor = graph.variable(.CPU, .C(77), of: Int32.self)
-let positionTensor = graph.variable(.CPU, .C(77), of: Int32.self)
-let tokensNumpy = tokens.numpy()
-for i in 0..<77 {
-  tokensTensor[i] = Int32(tokensNumpy[0, i])!
-  positionTensor[i] = Int32(i)
-}
-let casualAttentionMask = graph.variable(Tensor<Float>(.CPU, .HWC(1, 77, 77)))
-casualAttentionMask.full(0)
-for i in 0..<76 {
-  for j in (i + 1)..<77 {
-    casualAttentionMask[0, i, j] = -Float.greatestFiniteMagnitude
-  }
-}
-
-let _ = textModel(inputs: tokensTensor, positionTensor, casualAttentionMask)
-
-graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
-  $0.read("text_model", model: textModel)
-}
-
-let c = textModel(inputs: tokensTensor, positionTensor, casualAttentionMask)[0].as(of: Float.self)
-for i in 0..<6 {
-  let x = i < 3 ? i : 71 + i
-  for j in 0..<6 {
-    let y = j < 3 ? j : 762 + j
-    print("\(x) \(y) \(c[x, y])")
   }
 }
