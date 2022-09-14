@@ -126,18 +126,18 @@ func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> Model {
   let emb = Input()
   let inLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
   var out = inLayerNorm(x)
-  out = Swish()(out)
+  out = out.swish()
   let inLayerConv2d = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = inLayerConv2d(out)
   let embLayer = Dense(count: outChannels)
-  var embOut = Swish()(emb)
+  var embOut = emb.swish()
   embOut = embLayer(embOut).reshaped([b, outChannels, 1, 1])
   out = out + embOut
   let outLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
   out = outLayerNorm(out)
-  out = Swish()(out)
+  out = out.swish()
   // Dropout if needed in the future (for training).
   let outLayerConv2d = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
@@ -411,7 +411,7 @@ func UNet(batchSize: Int) -> Model {
   out = outputBlocks
   let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
   out = outNorm(out)
-  out = Swish()(out)
+  out = out.swish()
   let outConv2d = Convolution(
     groups: 1, filters: 4, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
@@ -425,14 +425,14 @@ func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> Model {
   let x = Input()
   let norm1 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
   var out = norm1(x)
-  out = Swish()(out)
+  out = out.swish()
   let conv1 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = conv1(out)
   let norm2 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
   out = norm2(out)
-  out = Swish()(out)
+  out = out.swish()
   let conv2 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
@@ -513,7 +513,7 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
   }
   let normOut = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
   out = normOut(out)
-  out = Swish()(out)
+  out = out.swish()
   let convOut = Convolution(
     groups: 1, filters: 3, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
@@ -640,6 +640,7 @@ graph.withNoGrad {
   }
   let alphasCumprod = model.alphasCumprod
   var oldEps = [DynamicGraph.Tensor<Float>]()
+  let startTime = Date()
   // Now do PLMS sampling.
   for i in 0..<model.steps {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
@@ -690,6 +691,7 @@ graph.withNoGrad {
   }
   let z = 1.0 / scaleFactor * x
   let img = decoder(inputs: z)[0].as(of: Float.self).toCPU()
+  print("Total time \(Date().timeIntervalSince(startTime))")
   let image = ccv_dense_matrix_new(512, 512, Int32(CCV_8U | CCV_C3), nil, 0)
   // I have better way to copy this out (basically, transpose and then ccv_shift). Doing this just for fun.
   for y in 0..<512 {
