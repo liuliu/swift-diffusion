@@ -550,9 +550,10 @@ extension DiffusionModel {
 
 let transformers = Python.import("transformers")
 
-DynamicGraph.setSeed(42)
+DynamicGraph.setSeed(40)
 
 let unconditionalGuidanceScale: Float = 7.5
+let scaleFactor: Float = 0.18215
 let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 50)
 
 let tokenizer = transformers.CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
@@ -643,17 +644,15 @@ graph.withNoGrad {
   for i in 0..<model.steps {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
     let t = graph.variable(ts[i])
-    let tNext = ts[max(i - 1, 0)]
+    let tNext = ts[min(i + 1, ts.count - 1)]
     xIn[0..<1, 0..<4, 0..<64, 0..<64] = x
     xIn[1..<2, 0..<4, 0..<64, 0..<64] = x
     var et = unet(inputs: xIn, t, c)[0].as(of: Float.self)
-    DynamicGraph.logLevel = .verbose
     var etUncond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
     var etCond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
     etUncond[0..<1, 0..<4, 0..<64, 0..<64] = et[0..<1, 0..<4, 0..<64, 0..<64]
     etCond[0..<1, 0..<4, 0..<64, 0..<64] = et[1..<2, 0..<4, 0..<64, 0..<64]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
-    DynamicGraph.logLevel = .none
     let alpha = alphasCumprod[timestep]
     let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
     let etPrime: DynamicGraph.Tensor<Float>
@@ -673,10 +672,11 @@ graph.withNoGrad {
     case 1:
       etPrime = 0.5 * (3 * et - oldEps[0])
     case 2:
-      etPrime = Float(1 / 12) * (Float(23) * et - Float(16) * oldEps[1] + Float(5) * oldEps[0])
+      etPrime =
+        Float(1) / Float(12) * (Float(23) * et - Float(16) * oldEps[1] + Float(5) * oldEps[0])
     case 3:
       etPrime =
-        Float(1 / 24)
+        Float(1) / Float(24)
         * (Float(55) * et - Float(59) * oldEps[2] + Float(37) * oldEps[1] - Float(9) * oldEps[0])
     default:
       fatalError()
@@ -688,7 +688,7 @@ graph.withNoGrad {
       oldEps.removeFirst()
     }
   }
-  let z = 1.0 / 0.18215 * x
+  let z = 1.0 / scaleFactor * x
   let img = decoder(inputs: z)[0].as(of: Float.self).toCPU()
   let image = ccv_dense_matrix_new(512, 512, Int32(CCV_8U | CCV_C3), nil, 0)
   // I have better way to copy this out (basically, transpose and then ccv_shift). Doing this just for fun.
