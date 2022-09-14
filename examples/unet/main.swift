@@ -812,7 +812,8 @@ let model = ldm_util.instantiate_from_config(config.model)
 model.load_state_dict(sd, strict: false)
 model.eval()
 let state_dict = model.model.state_dict()
-let ret = model.model.diffusion_model(x, t, c)
+let ret = model.apply_model(x, t, c)
+print(ret)
 
 let graph = DynamicGraph()
 
@@ -848,7 +849,9 @@ graph.withNoGrad {
       }
     }
   }
+  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
     $0.write("unet", model: unet)
   }
+  */
 }

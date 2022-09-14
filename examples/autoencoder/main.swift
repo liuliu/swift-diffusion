@@ -217,10 +217,9 @@ model.load_state_dict(sd, strict: false)
 model.eval()
 let z = 1.0 / model.scale_factor * x
 print(model.scale_factor)
-let quant = model.first_stage_model.post_quant_conv(z)
 let state_dict = model.first_stage_model.state_dict()
-let ret = model.first_stage_model.decoder(quant)
-print(state_dict.keys())
+let ret = model.decode_first_stage(x)
+print(ret)
 
 let graph = DynamicGraph()
 let zTensor = graph.variable(try! Tensor<Float>(numpy: z.numpy())).toGPU(0)
@@ -243,7 +242,9 @@ graph.withNoGrad {
       }
     }
   }
+  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
     $0.write("decoder", model: decoder)
   }
+  */
 }

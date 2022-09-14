@@ -1,3 +1,4 @@
+import C_ccv
 import Foundation
 import NNC
 import NNCPythonConversion
@@ -93,14 +94,14 @@ func CLIPTextModel(
 
 /// UNet
 
-func timeEmbedding(timesteps: Int, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
+func timeEmbedding(timestep: Int, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
 > {
   precondition(embeddingSize % 2 == 0)
   var embedding = Tensor<Float>(.CPU, .NC(batchSize, embeddingSize))
   let half = embeddingSize / 2
   for i in 0..<half {
-    let freq: Float = exp(-log(Float(maxPeriod)) * Float(i) / Float(half)) * Float(timesteps)
+    let freq: Float = exp(-log(Float(maxPeriod)) * Float(i) / Float(half)) * Float(timestep)
     let cosFreq = cos(freq)
     let sinFreq = sin(freq)
     for j in 0..<batchSize {
@@ -520,11 +521,39 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
   return Model([x], [out])
 }
 
+struct DiffusionModel {
+  var linearStart: Float
+  var linearEnd: Float
+  var timesteps: Int
+  var steps: Int
+}
+
+extension DiffusionModel {
+  var betas: [Float] {  // Linear for now.
+    var betas = [Float]()
+    let start = linearStart.squareRoot()
+    let length = linearEnd.squareRoot() - start
+    for i in 0..<timesteps {
+      let beta = start + Float(i) * length / Float(timesteps - 1)
+      betas.append(beta * beta)
+    }
+    return betas
+  }
+  var alphasCumprod: [Float] {
+    var cumprod: Float = 1
+    return betas.map {
+      cumprod *= 1 - $0
+      return cumprod
+    }
+  }
+}
+
 let transformers = Python.import("transformers")
 
-DynamicGraph.seed = 42
+DynamicGraph.setSeed(42)
 
-let x = torch.randn([2, 4, 64, 64])
+let unconditionalGuidanceScale: Float = 7.5
+let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 50)
 
 let tokenizer = transformers.CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
 
@@ -552,8 +581,8 @@ let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let tokensNumpy = tokens.numpy()
 let unconditionalTokensNumpy = unconditional_tokens.numpy()
 for i in 0..<77 {
-  tokensTensor[i] = Int32(tokensNumpy[0, i])!
-  tokensTensor[i + 77] = Int32(unconditionalTokensNumpy[0, i])!
+  tokensTensor[i] = Int32(unconditionalTokensNumpy[0, i])!
+  tokensTensor[i + 77] = Int32(tokensNumpy[0, i])!
   positionTensor[i] = Int32(i)
   positionTensor[i + 77] = Int32(i)
 }
@@ -566,13 +595,25 @@ for i in 0..<76 {
   }
 }
 
-let t_emb = graph.variable(
-  timeEmbedding(timesteps: 981, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
-).toGPU(0)
-let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
+var ts = [Tensor<Float>]()
+for i in 0..<model.steps {
+  let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
+  ts.append(
+    timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0))
+}
 let unet = UNet(batchSize: 2)
 let decoder = Decoder(
-  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 2, startWidth: 64, startHeight: 64)
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64, startHeight: 64)
+
+func xPrevAndPredX0(
+  x: DynamicGraph.Tensor<Float>, et: DynamicGraph.Tensor<Float>, alpha: Float, alphaPrev: Float
+) -> (DynamicGraph.Tensor<Float>, DynamicGraph.Tensor<Float>) {
+  let predX0 = (1 / alpha.squareRoot()) * (x - (1 - alpha).squareRoot() * et)
+  let dirXt = (1 - alphaPrev).squareRoot() * et
+  let xPrev = alphaPrev.squareRoot() * predX0 + dirXt
+  return (xPrev, predX0)
+}
+
 graph.withNoGrad {
   let tokensTensorGPU = tokensTensor.toGPU(0)
   let positionTensorGPU = positionTensor.toGPU(0)
@@ -584,27 +625,85 @@ graph.withNoGrad {
   let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
     of: Float.self
   ).reshaped(.CHW(2, 77, 768))
-  let _ = unet(inputs: xTensor, t_emb, c)
-  let _ = decoder(inputs: xTensor)
+  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
+  x_T.randn(std: 1, mean: 0)
+  var x = x_T
+  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, 64, 64), of: Float.self)
+  let _ = unet(inputs: xIn, graph.variable(ts[0]), c)
   graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
     $0.read("unet", model: unet)
   }
+  let _ = decoder(inputs: x)
   graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
     $0.read("decoder", model: decoder)
   }
-  let attnOut = unet(inputs: xTensor, t_emb, c)[0].as(of: Float.self)
-  let zTensor = 1.0 / 0.18215 * attnOut
-  let quant = decoder(inputs: zTensor)[0].as(of: Float.self)
-  let quantCPU = quant.toCPU()
-  print(quantCPU)
-  for i in 0..<3 {
-    let x = i
-    for j in 0..<6 {
-      let y = j < 3 ? j : 506 + j
-      for k in 0..<6 {
-        let z = k < 3 ? k : 506 + k
-        print("0 \(x) \(y) \(z) \(quantCPU[0, x, y, z])")
-      }
+  let alphasCumprod = model.alphasCumprod
+  var oldEps = [DynamicGraph.Tensor<Float>]()
+  // Now do PLMS sampling.
+  for i in 0..<model.steps {
+    let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
+    let t = graph.variable(ts[i])
+    let tNext = ts[max(i - 1, 0)]
+    xIn[0..<1, 0..<4, 0..<64, 0..<64] = x
+    xIn[1..<2, 0..<4, 0..<64, 0..<64] = x
+    var et = unet(inputs: xIn, t, c)[0].as(of: Float.self)
+    DynamicGraph.logLevel = .verbose
+    var etUncond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
+    var etCond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
+    etUncond[0..<1, 0..<4, 0..<64, 0..<64] = et[0..<1, 0..<4, 0..<64, 0..<64]
+    etCond[0..<1, 0..<4, 0..<64, 0..<64] = et[1..<2, 0..<4, 0..<64, 0..<64]
+    et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
+    DynamicGraph.logLevel = .none
+    let alpha = alphasCumprod[timestep]
+    let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
+    let etPrime: DynamicGraph.Tensor<Float>
+    switch oldEps.count {
+    case 0:
+      let (xPrev, _) = xPrevAndPredX0(x: x, et: et, alpha: alpha, alphaPrev: alphaPrev)
+      // Compute etNext.
+      xIn[0..<1, 0..<4, 0..<64, 0..<64] = xPrev
+      xIn[1..<2, 0..<4, 0..<64, 0..<64] = xPrev
+      var etNext = unet(inputs: xIn, graph.variable(tNext), c)[0].as(of: Float.self)
+      var etNextUncond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
+      var etNextCond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
+      etNextUncond[0..<1, 0..<4, 0..<64, 0..<64] = etNext[0..<1, 0..<4, 0..<64, 0..<64]
+      etNextCond[0..<1, 0..<4, 0..<64, 0..<64] = etNext[1..<2, 0..<4, 0..<64, 0..<64]
+      etNext = etNextUncond + unconditionalGuidanceScale * (etNextCond - etNextUncond)
+      etPrime = 0.5 * (et + etNext)
+    case 1:
+      etPrime = 0.5 * (3 * et - oldEps[0])
+    case 2:
+      etPrime = Float(1 / 12) * (Float(23) * et - Float(16) * oldEps[1] + Float(5) * oldEps[0])
+    case 3:
+      etPrime =
+        Float(1 / 24)
+        * (Float(55) * et - Float(59) * oldEps[2] + Float(37) * oldEps[1] - Float(9) * oldEps[0])
+    default:
+      fatalError()
     }
+    let (xPrev, _) = xPrevAndPredX0(x: x, et: etPrime, alpha: alpha, alphaPrev: alphaPrev)
+    x = xPrev
+    oldEps.append(et)
+    if oldEps.count > 3 {
+      oldEps.removeFirst()
+    }
+  }
+  let z = 1.0 / 0.18215 * x
+  let img = decoder(inputs: z)[0].as(of: Float.self).toCPU()
+  let image = ccv_dense_matrix_new(512, 512, Int32(CCV_8U | CCV_C3), nil, 0)
+  // I have better way to copy this out (basically, transpose and then ccv_shift). Doing this just for fun.
+  for y in 0..<512 {
+    for x in 0..<512 {
+      let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
+      image!.pointee.data.u8[y * 512 * 3 + x * 3] = UInt8(
+        min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
+      image!.pointee.data.u8[y * 512 * 3 + x * 3 + 1] = UInt8(
+        min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
+      image!.pointee.data.u8[y * 512 * 3 + x * 3 + 2] = UInt8(
+        min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
+    }
+  }
+  let _ = "/home/liu/workspace/swift-diffusion/txt2img.png".withCString {
+    ccv_write(image, UnsafeMutablePointer(mutating: $0), nil, Int32(CCV_IO_PNG_FILE), nil)
   }
 }
