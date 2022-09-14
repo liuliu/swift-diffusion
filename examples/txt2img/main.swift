@@ -615,6 +615,8 @@ func xPrevAndPredX0(
   return (xPrev, predX0)
 }
 
+graph.workspaceSize = 1_024 * 1_024 * 1_024
+
 graph.withNoGrad {
   let tokensTensorGPU = tokensTensor.toGPU(0)
   let positionTensorGPU = positionTensor.toGPU(0)
