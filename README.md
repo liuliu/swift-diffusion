@@ -1,6 +1,6 @@
 # Swift Diffusion
 
-This is a single-file re-implementation of [Stable Diffusion](https://github.com/CompVis/stable-diffusion) model. It includes the models for CLIP text encoder, UNet diffusion model and the decoder model. It also includes PLMS inference implementation. The implementation tries to match the Stable Diffusion outputs layer-by-layer, thus, given the same start point `x_T`, this implementation and Stable Diffusion will output the same image.
+This is a single-file re-implementation of [Stable Diffusion](https://github.com/CompVis/stable-diffusion) model. It includes CLIP text tokenizer, the models for CLIP text encoder, UNet diffusion model and the decoder model. It also includes PLMS inference implementation. The implementation tries to match the Stable Diffusion outputs layer-by-layer, thus, given the same start point `x_T`, this implementation and Stable Diffusion will output the same image.
 
 ## Rationale
 
@@ -8,13 +8,13 @@ This re-implementation serves as an education for me to understand diffusion mod
 
 ## Where We Are
 
-CLIP text model, UNet diffusion model and the decoder has been ported. The `examples:txt2img` target is useful. Need to port the encoder over to enable `img2img`. Other targets, such as `examples:unet`, `examples:clip`, `examples:autoencoder` are the example programs to convert PyTorch weights to the one s4nnc uses.
+CLIP text tokenizer, text model, UNet diffusion model and the decoder has been ported. The `examples:txt2img` target is useful. Need to port the encoder over to enable `img2img`. Other targets, such as `examples:unet`, `examples:clip`, `examples:autoencoder` are the example programs to convert PyTorch weights to the one s4nnc uses.
 
 ## What's Next
 
-The next on my list is to implement the tokenizer. Thanks to PythonKit, right now, I am using the tokenizer from Hugging Face. After the tokenizer is implemented, the whole thing should be able to run without Python dependencies.
+The next on my list is to enable img2img (a.k.a. the encoder network). After that, I should do some work to make sure the performance on FP32 and FP16 is on par with PyTorch. That will give a good baseline for follow-up memory and performance optimizations.
 
-After that, I should change the convolution layout from NCHW to NHWC. That will enable bunch of optimizations in attention layer, mostly to avoid some of the transpose traffic. I can enable CPU mode either by converting convolution layout to NHWC, or implement NCHW convolution in s4nnc. The latter is long overdue, but doing former would be helpful for performance on CPU.
+When these are in order, I should change the convolution layout from NCHW to NHWC. That will enable bunch of optimizations in attention layer, mostly to avoid some of the transpose traffic. I can enable CPU mode either by converting convolution layout to NHWC, or implement NCHW convolution in s4nnc. The latter is long overdue, but doing former would be helpful for performance on CPU.
 
 Right now, at run time, UNet model uses ~1.5GiB memory in additional to its 3.3GiB weights. A big chunk of that 1.5GiB is due to the dot product in attention layer. I already optimized away about 1GiB because previously, softmax doesn't run in-place properly (due to complex reasons relating to aliases and reshapes). I believe this is still a case for PyTorch code because there is no in-place softmax method. That dot product can be split further into smaller batches to save peak memory usage (along the token dimension of k). If these are done correctly, we should be able to reduce UNet memory usage to somewhere around 3.8GiB full floating-point. Another idea I have to further reduce the memory usage is to compress shortcut activations in UNet (these shortcut activations will be saved along downsample path and used in upsample path, thus, occupying for long time). But I am less sure how much memory that can save.
 
@@ -22,7 +22,7 @@ Converting the model to FP16 would save memory footprint instantly, but this wil
 
 ## Is It Comparable
 
-Right now, I didn't run any specific optimizations. Further, the model loading as of today for s4nnc requires executing the model once, and we have some optimization runs (find the most efficient kernels etc.) that are not saved. That has been said, we can compare the execution time of txt2img from Swift v.s. the one from CompVis (there are more optimized forks available, but going through them to find the best would take time) of the diffusion process + decoding process. The Swift txt2img on GPU took about 17s while the CompVis took about 11s (both with one 2080 Ti). Cursory look at `nvprof` output shows that transpose and not using cublasLt the leading cause for the extra 6s spent.
+Right now, I didn't do any specific optimizations. Further, the model loading as of today for s4nnc requires executing the model once, and we have some optimization runs (find the most efficient kernels etc.) that are not saved. That has been said, we can compare the execution time of txt2img from Swift v.s. the one from CompVis (there are more optimized forks available, but going through them to find the best would take time) of the diffusion process + decoding process. The Swift txt2img on GPU took about 17s while the CompVis took about 11s (both with one 2080 Ti). Cursory look at `nvprof` output shows that transpose and not using cublasLt optimally are two leading causes for the extra 6s spent.
 
 ## How to Run This
 
@@ -34,14 +34,6 @@ Other dependencies include Swift compiler, CUDA (10.2 and above) and clang. For 
 
 ```
 sudo apt install clang llvm libicu-dev libpng-dev libjpeg-dev libatlas-base-dev libblas-dev libgsl-dev libdispatch-dev libomp-dev libfftw3-dev
-```
-
-For now, you need to install `transformers` for the tokenizer.
-
-```
-virtualenv -p python3 _env
-source _env/bin/activate
-pip install transformers
 ```
 
 You also need to download the model. I put the Stable Diffusion v1.4 model in http://static.libccv.org/sd-v1.4.ckpt. Note that this is a s4nnc-compatible file, not PyTorch one you download elsewhere. You can check related examples for how this file is generated.
