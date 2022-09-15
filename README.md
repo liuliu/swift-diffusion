@@ -46,6 +46,12 @@ pip install transformers
 
 You also need to download the model. I put the Stable Diffusion v1.4 model in http://static.libccv.org/sd-v1.4.ckpt. Note that this is a s4nnc-compatible file, not PyTorch one you download elsewhere. You can check related examples for how this file is generated.
 
+Finally, setup Bazel properly on Linux:
+
+```
+./bazel/setup_clang.sh /usr/local
+```
+
 With these, you can run:
 
 ```
