@@ -563,8 +563,11 @@ let unconditional_batch_encoding = tokenizer(
   return_length: true, return_overflowing_tokens: false, padding: "max_length", return_tensors: "pt"
 )
 
+let workDir = CommandLine.arguments[1]
+let text = CommandLine.arguments.suffix(2).joined(separator: " ")
+
 let batch_encoding = tokenizer(
-  ["a photograph of an astronaut riding a horse"], truncation: true, max_length: 77,
+  [text], truncation: true, max_length: 77,
   return_length: true, return_overflowing_tokens: false, padding: "max_length", return_tensors: "pt"
 )
 
@@ -622,7 +625,7 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
   let _ = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
+  graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("text_model", model: textModel)
   }
   let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
@@ -633,11 +636,9 @@ graph.withNoGrad {
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, 64, 64), of: Float.self)
   let _ = unet(inputs: xIn, graph.variable(ts[0]), c)
-  graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
-    $0.read("unet", model: unet)
-  }
   let _ = decoder(inputs: x)
-  graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
+  graph.openStore(workDir + "/sd-v1.4.ckpt") {
+    $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
   }
   let alphasCumprod = model.alphasCumprod
@@ -707,7 +708,7 @@ graph.withNoGrad {
         min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
     }
   }
-  let _ = "/home/liu/workspace/swift-diffusion/txt2img.png".withCString {
+  let _ = (workDir + "/txt2img.png").withCString {
     ccv_write(image, UnsafeMutablePointer(mutating: $0), nil, Int32(CCV_IO_PNG_FILE), nil)
   }
 }
