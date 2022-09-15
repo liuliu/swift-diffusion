@@ -4,15 +4,15 @@ This is a single-file re-implementation of [Stable Diffusion](https://github.com
 
 ## Rationale
 
-This re-implementation serves and an education for me to understand diffusion models. It is also necessary for my follow-up work to enable Stable Diffusion on mobile devices such as iPad / iPhone. Without a Swift re-implementation, doing mobile-focused optimization with Python would be difficult and impossible to ship in App Store. It is possible to do this differently, such as exporting to ONNX runtime and use that as the driver on mobile devices. That does limit what kind of optimizations you can apply though. As you can tell, running models that totals about 8GiB in-memory and 4GiB at-rest with full floating-point precision is not trivial on mobile devices. It might requires some non-conventional optimizations that may not be available through existing frameworks. Using something I am familiar with (a framework I built) would be a good starting point.
+This re-implementation serves as an education for me to understand diffusion models. It is also necessary for my follow-up work to enable Stable Diffusion on mobile devices such as iPad / iPhone. Without a Swift re-implementation, doing mobile-focused optimization with Python would be difficult and impossible to ship in App Store. It is possible to do this differently, such as exporting to ONNX runtime and use that as the driver on mobile devices. That does limit what kind of optimizations you can apply though. As you can tell, running models that totals about 8GiB in-memory and 4GiB at-rest with full floating-point precision is not trivial on mobile devices. It might requires some non-conventional optimizations that may not be available through existing frameworks. Using something I am familiar with (a framework I built) would be a good starting point.
 
 ## Where We Are
 
-CLIP text model, UNet diffusion model and the decoder has been ported. The `examples:txt2img` target is useful with some path changesinside `examples/txt2img/main.swift`. Need to port the encoder over to enable `img2img`. Other targets, such as `examples:unet`, `examples:clip`, `examples:autoencoder` are the example programs to convert PyTorch weights to the one s4nnc uses.
+CLIP text model, UNet diffusion model and the decoder has been ported. The `examples:txt2img` target is useful. Need to port the encoder over to enable `img2img`. Other targets, such as `examples:unet`, `examples:clip`, `examples:autoencoder` are the example programs to convert PyTorch weights to the one s4nnc uses.
 
 ## What's Next
 
-The next on my list is to implement the tokenizer. Thanks to PythonKit, right now, I am using the tokenizer from Hugging Face. After tokenizer implemented, the whole thing should be able to run without Python dependencies.
+The next on my list is to implement the tokenizer. Thanks to PythonKit, right now, I am using the tokenizer from Hugging Face. After the tokenizer is implemented, the whole thing should be able to run without Python dependencies.
 
 After that, I should change the convolution layout from NCHW to NHWC. That will enable bunch of optimizations in attention layer, mostly to avoid some of the transpose traffic. I can enable CPU mode either by converting convolution layout to NHWC, or implement NCHW convolution in s4nnc. The latter is long overdue, but doing former would be helpful for performance on CPU.
 

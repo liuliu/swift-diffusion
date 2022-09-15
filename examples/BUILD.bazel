@@ -47,8 +47,11 @@ swift_binary(
 swift_binary(
     name = "txt2img",
     srcs = ["txt2img/main.swift"],
+    data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+    ],
     deps = [
-        "@PythonKit",
         "@SwiftNumerics//:Numerics",
         "@ccv//lib:ccv",
         "@s4nnc//nnc",
