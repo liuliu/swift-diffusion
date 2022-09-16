@@ -154,9 +154,9 @@ func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> Model {
 
 func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> Model {
   let x = Input()
-  let tokeys = Dense(count: k * h)
-  let toqueries = Dense(count: k * h)
-  let tovalues = Dense(count: k * h)
+  let tokeys = Dense(count: k * h, noBias: true)
+  let toqueries = Dense(count: k * h, noBias: true)
+  let tovalues = Dense(count: k * h, noBias: true)
   let keys = tokeys(x).reshaped([b, hw, h, k]).transposed(1, 2).reshaped([b * h, hw, k])
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
     .transposed(1, 2).reshaped([b * h, hw, k])
@@ -385,7 +385,7 @@ func OutputBlocks(
   return out
 }
 
-func UNet(batchSize: Int) -> Model {
+func UNet(batchSize: Int, startWidth: Int, startHeight: Int) -> Model {
   let x = Input()
   let t_emb = Input()
   let c = Input()
@@ -394,8 +394,8 @@ func UNet(batchSize: Int) -> Model {
   let attentionRes = Set([4, 2, 1])
   let (inputs, inputBlocks) = InputBlocks(
     channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
-    startHeight: 64,
-    startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
+    startHeight: startHeight,
+    startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
   var out = inputBlocks
   let middleBlock = MiddleBlock(
     channels: 1280, numHeads: 8, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
@@ -404,8 +404,8 @@ func UNet(batchSize: Int) -> Model {
   out = middleBlock
   let outputBlocks = OutputBlocks(
     channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
-    startHeight: 64,
-    startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
+    startHeight: startHeight,
+    startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
     inputs: inputs)
   out = outputBlocks
   let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
@@ -776,6 +776,8 @@ DynamicGraph.setSeed(40)
 
 let unconditionalGuidanceScale: Float = 7.5
 let scaleFactor: Float = 0.18215
+let startWidth: Int = 64
+let startHeight: Int = 64
 let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 50)
 let tokenizer = CLIPTokenizer(
   vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
@@ -815,9 +817,10 @@ for i in 0..<model.steps {
   ts.append(
     timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0))
 }
-let unet = UNet(batchSize: 2)
+let unet = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
 let decoder = Decoder(
-  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64, startHeight: 64)
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
+  startHeight: startHeight)
 
 func xPrevAndPredX0(
   x: DynamicGraph.Tensor<Float>, et: DynamicGraph.Tensor<Float>, alpha: Float, alphaPrev: Float
@@ -841,10 +844,10 @@ graph.withNoGrad {
   let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
     of: Float.self
   ).reshaped(.CHW(2, 77, 768))
-  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
+  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
   x_T.randn(std: 1, mean: 0)
   var x = x_T
-  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, 64, 64), of: Float.self)
+  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: Float.self)
   let _ = unet(inputs: xIn, graph.variable(ts[0]), c)
   let _ = decoder(inputs: x)
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
@@ -859,13 +862,15 @@ graph.withNoGrad {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
     let t = graph.variable(ts[i])
     let tNext = ts[min(i + 1, ts.count - 1)]
-    xIn[0..<1, 0..<4, 0..<64, 0..<64] = x
-    xIn[1..<2, 0..<4, 0..<64, 0..<64] = x
+    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
+    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
     var et = unet(inputs: xIn, t, c)[0].as(of: Float.self)
-    var etUncond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
-    var etCond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
-    etUncond[0..<1, 0..<4, 0..<64, 0..<64] = et[0..<1, 0..<4, 0..<64, 0..<64]
-    etCond[0..<1, 0..<4, 0..<64, 0..<64] = et[1..<2, 0..<4, 0..<64, 0..<64]
+    var etUncond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
+    var etCond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
+    etUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
+      et[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
+    etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
+      et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
     let alpha = alphasCumprod[timestep]
     let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
@@ -874,13 +879,16 @@ graph.withNoGrad {
     case 0:
       let (xPrev, _) = xPrevAndPredX0(x: x, et: et, alpha: alpha, alphaPrev: alphaPrev)
       // Compute etNext.
-      xIn[0..<1, 0..<4, 0..<64, 0..<64] = xPrev
-      xIn[1..<2, 0..<4, 0..<64, 0..<64] = xPrev
+      xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
+      xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
       var etNext = unet(inputs: xIn, graph.variable(tNext), c)[0].as(of: Float.self)
-      var etNextUncond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
-      var etNextCond = graph.variable(.GPU(0), .NCHW(1, 4, 64, 64), of: Float.self)
-      etNextUncond[0..<1, 0..<4, 0..<64, 0..<64] = etNext[0..<1, 0..<4, 0..<64, 0..<64]
-      etNextCond[0..<1, 0..<4, 0..<64, 0..<64] = etNext[1..<2, 0..<4, 0..<64, 0..<64]
+      var etNextUncond = graph.variable(
+        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
+      var etNextCond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
+      etNextUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
+        etNext[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
+      etNextCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
+        etNext[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
       etNext = etNextUncond + unconditionalGuidanceScale * (etNextCond - etNextUncond)
       etPrime = 0.5 * (et + etNext)
     case 1:
@@ -905,16 +913,17 @@ graph.withNoGrad {
   let z = 1.0 / scaleFactor * x
   let img = decoder(inputs: z)[0].as(of: Float.self).toCPU()
   print("Total time \(Date().timeIntervalSince(startTime))")
-  let image = ccv_dense_matrix_new(512, 512, Int32(CCV_8U | CCV_C3), nil, 0)
+  let image = ccv_dense_matrix_new(
+    Int32(startHeight * 8), Int32(startWidth * 8), Int32(CCV_8U | CCV_C3), nil, 0)
   // I have better way to copy this out (basically, transpose and then ccv_shift). Doing this just for fun.
-  for y in 0..<512 {
-    for x in 0..<512 {
+  for y in 0..<startHeight * 8 {
+    for x in 0..<startWidth * 8 {
       let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
-      image!.pointee.data.u8[y * 512 * 3 + x * 3] = UInt8(
+      image!.pointee.data.u8[y * startWidth * 8 * 3 + x * 3] = UInt8(
         min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
-      image!.pointee.data.u8[y * 512 * 3 + x * 3 + 1] = UInt8(
+      image!.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 1] = UInt8(
         min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
-      image!.pointee.data.u8[y * 512 * 3 + x * 3 + 2] = UInt8(
+      image!.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 2] = UInt8(
         min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
     }
   }

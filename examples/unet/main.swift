@@ -77,9 +77,9 @@ func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> (
 
 func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> (Model, Model, Model, Model, Model) {
   let x = Input()
-  let tokeys = Dense(count: k * h)
-  let toqueries = Dense(count: k * h)
-  let tovalues = Dense(count: k * h)
+  let tokeys = Dense(count: k * h, noBias: true)
+  let toqueries = Dense(count: k * h, noBias: true)
+  let tovalues = Dense(count: k * h, noBias: true)
   let keys = tokeys(x).reshaped([b, hw, h, k]).transposed(1, 2).reshaped([b * h, hw, k])
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
     .transposed(1, 2).reshaped([b * h, hw, k])
