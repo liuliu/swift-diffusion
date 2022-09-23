@@ -23,14 +23,14 @@ func CLIPAttention(k: Int, h: Int, b: Int, t: Int) -> Model {
   let tokeys = Dense(count: k * h)
   let toqueries = Dense(count: k * h)
   let tovalues = Dense(count: k * h)
-  let keys = tokeys(x).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
+  let keys = tokeys(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t, h, k])
-    .transposed(1, 2).reshaped([b * h, t, k])
-  let values = tovalues(x).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
-  var dot = Matmul(transposeB: (1, 2))(queries, keys) + casualAttentionMask
+    .transposed(1, 2)
+  let values = tovalues(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys) + casualAttentionMask
   dot = dot.reshaped([b * h * t, t])
   dot = dot.softmax()
-  dot = dot.reshaped([b * h, t, t])
+  dot = dot.reshaped([b, h, t, t])
   var out = dot * values
   out = out.reshaped([b, h, t, k]).transposed(1, 2).reshaped([b * t, h * k])
   let unifyheads = Dense(count: k * h)
@@ -157,14 +157,14 @@ func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> Model {
   let tokeys = Dense(count: k * h, noBias: true)
   let toqueries = Dense(count: k * h, noBias: true)
   let tovalues = Dense(count: k * h, noBias: true)
-  let keys = tokeys(x).reshaped([b, hw, h, k]).transposed(1, 2).reshaped([b * h, hw, k])
+  let keys = tokeys(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
-    .transposed(1, 2).reshaped([b * h, hw, k])
-  let values = tovalues(x).reshaped([b, hw, h, k]).transposed(1, 2).reshaped([b * h, hw, k])
-  var dot = Matmul(transposeB: (1, 2))(queries, keys)
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * hw, hw])
   dot = dot.softmax()
-  dot = dot.reshaped([b * h, hw, hw])
+  dot = dot.reshaped([b, h, hw, hw])
   var out = dot * values
   out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, hw, h * k])
   let unifyheads = Dense(count: k * h)
@@ -178,14 +178,14 @@ func CrossAttention(k: Int, h: Int, b: Int, hw: Int, t: Int) -> Model {
   let tokeys = Dense(count: k * h, noBias: true)
   let toqueries = Dense(count: k * h, noBias: true)
   let tovalues = Dense(count: k * h, noBias: true)
-  let keys = tokeys(c).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
+  let keys = tokeys(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
-    .transposed(1, 2).reshaped([b * h, hw, k])
-  let values = tovalues(c).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
-  var dot = Matmul(transposeB: (1, 2))(queries, keys)
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * hw, t])
   dot = dot.softmax()
-  dot = dot.reshaped([b * h, hw, t])
+  dot = dot.reshaped([b, h, hw, t])
   var out = dot * values
   out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, hw, h * k])
   let unifyheads = Dense(count: k * h)
@@ -235,10 +235,10 @@ func SpatialTransformer(
   var out = norm(x)
   let projIn = Convolution(groups: 1, filters: k * h, filterSize: [1, 1])
   let hw = height * width
-  out = projIn(out).reshaped([b, k * h, hw]).transposed(1, 2)
+  out = projIn(out).reshaped([b, k * h, hw]).permuted(0, 2, 1)
   let block = BasicTransformerBlock(
     k: k, h: h, b: b, hw: hw, t: t, intermediateSize: intermediateSize)
-  out = block(out, c).reshaped([b, hw, k * h]).transposed(1, 2).reshaped([b, k * h, height, width])
+  out = block(out, c).reshaped([b, height, width, k * h]).permuted(0, 3, 1, 2)
   let projOut = Convolution(groups: 1, filters: ch, filterSize: [1, 1])
   out = projOut(out) + x
   return Model([x, c], [out])
@@ -803,11 +803,11 @@ for i in 0..<77 {
   positionTensor[i + 77] = Int32(i)
 }
 
-let casualAttentionMask = graph.variable(Tensor<Float>(.CPU, .HWC(1, 77, 77)))
+let casualAttentionMask = graph.variable(Tensor<Float>(.CPU, .NHWC(1, 1, 77, 77)))
 casualAttentionMask.full(0)
 for i in 0..<76 {
   for j in (i + 1)..<77 {
-    casualAttentionMask[0, i, j] = -Float.greatestFiniteMagnitude
+    casualAttentionMask[0, 0, i, j] = -Float.greatestFiniteMagnitude
   }
 }
 
@@ -857,6 +857,7 @@ graph.withNoGrad {
   let alphasCumprod = model.alphasCumprod
   var oldEps = [DynamicGraph.Tensor<Float>]()
   let startTime = Date()
+  DynamicGraph.setProfiler(true)
   // Now do PLMS sampling.
   for i in 0..<model.steps {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1

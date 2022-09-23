@@ -20,14 +20,14 @@ func CLIPAttention(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model, Mode
   let tokeys = Dense(count: k * h)
   let toqueries = Dense(count: k * h)
   let tovalues = Dense(count: k * h)
-  let keys = tokeys(x).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
+  let keys = tokeys(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t, h, k])
-    .transposed(1, 2).reshaped([b * h, t, k])
-  let values = tovalues(x).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
-  var dot = Matmul(transposeB: (1, 2))(queries, keys) + casualAttentionMask
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys) + casualAttentionMask
   dot = dot.reshaped([b * h * t, t])
   dot = dot.softmax()
-  dot = dot.reshaped([b * h, t, t])
+  dot = dot.reshaped([b, h, t, t])
   var out = dot * values
   out = out.reshaped([b, h, t, k]).transposed(1, 2).reshaped([b * t, h * k])
   let unifyheads = Dense(count: k * h)
@@ -142,11 +142,11 @@ for i in 0..<77 {
   tokensTensor[i] = Int32(tokensNumpy[0, i])!
   positionTensor[i] = Int32(i)
 }
-let casualAttentionMask = graph.variable(Tensor<Float>(.CPU, .HWC(1, 77, 77)))
+let casualAttentionMask = graph.variable(Tensor<Float>(.CPU, .NHWC(1, 1, 77, 77)))
 casualAttentionMask.full(0)
 for i in 0..<76 {
   for j in (i + 1)..<77 {
-    casualAttentionMask[0, i, j] = -Float.greatestFiniteMagnitude
+    casualAttentionMask[0, 0, i, j] = -Float.greatestFiniteMagnitude
   }
 }
 

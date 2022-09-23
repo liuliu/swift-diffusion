@@ -242,9 +242,7 @@ graph.withNoGrad {
       }
     }
   }
-  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
     $0.write("decoder", model: decoder)
   }
-  */
 }

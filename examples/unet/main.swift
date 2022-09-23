@@ -80,14 +80,14 @@ func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> (Model, Model, Model, Mod
   let tokeys = Dense(count: k * h, noBias: true)
   let toqueries = Dense(count: k * h, noBias: true)
   let tovalues = Dense(count: k * h, noBias: true)
-  let keys = tokeys(x).reshaped([b, hw, h, k]).transposed(1, 2).reshaped([b * h, hw, k])
+  let keys = tokeys(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
-    .transposed(1, 2).reshaped([b * h, hw, k])
-  let values = tovalues(x).reshaped([b, hw, h, k]).transposed(1, 2).reshaped([b * h, hw, k])
-  var dot = Matmul(transposeB: (1, 2))(queries, keys)
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * hw, hw])
   dot = dot.softmax()
-  dot = dot.reshaped([b * h, hw, hw])
+  dot = dot.reshaped([b, h, hw, hw])
   var out = dot * values
   out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, hw, h * k])
   let unifyheads = Dense(count: k * h)
@@ -102,14 +102,14 @@ func CrossAttention(k: Int, h: Int, b: Int, hw: Int, t: Int) -> (Model, Model, M
   let tokeys = Dense(count: k * h, noBias: true)
   let toqueries = Dense(count: k * h, noBias: true)
   let tovalues = Dense(count: k * h, noBias: true)
-  let keys = tokeys(c).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
+  let keys = tokeys(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
-    .transposed(1, 2).reshaped([b * h, hw, k])
-  let values = tovalues(c).reshaped([b, t, h, k]).transposed(1, 2).reshaped([b * h, t, k])
-  var dot = Matmul(transposeB: (1, 2))(queries, keys)
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * hw, t])
   dot = dot.softmax()
-  dot = dot.reshaped([b * h, hw, t])
+  dot = dot.reshaped([b, h, hw, t])
   var out = dot * values
   out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, hw, h * k])
   let unifyheads = Dense(count: k * h)
@@ -167,12 +167,12 @@ func SpatialTransformer(
   var out = norm(x)
   let projIn = Convolution(groups: 1, filters: k * h, filterSize: [1, 1])
   let hw = height * width
-  out = projIn(out).reshaped([b, k * h, hw]).transposed(1, 2)
+  out = projIn(out).reshaped([b, k * h, hw]).permuted(0, 2, 1)
   let (
     layerNorm1, tokeys1, toqueries1, tovalues1, unifyheads1, layerNorm2, tokeys2, toqueries2,
     tovalues2, unifyheads2, layerNorm3, fc10, fc11, fc2, block
   ) = BasicTransformerBlock(k: k, h: h, b: b, hw: hw, t: t, intermediateSize: intermediateSize)
-  out = block(out, c).reshaped([b, hw, k * h]).transposed(1, 2).reshaped([b, k * h, height, width])
+  out = block(out, c).reshaped([b, height, width, k * h]).permuted(0, 3, 1, 2)
   let projOut = Convolution(groups: 1, filters: ch, filterSize: [1, 1])
   out = projOut(out) + x
   return (
@@ -823,6 +823,7 @@ let t_emb = graph.variable(
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
 let (reader, unet) = UNet(batchSize: 2)
+graph.workspaceSize = 1_024 * 1_024 * 1_024
 graph.withNoGrad {
   let _ = unet(inputs: xTensor, t_emb, cTensor)
   reader(state_dict)
@@ -849,9 +850,7 @@ graph.withNoGrad {
       }
     }
   }
-  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
     $0.write("unet", model: unet)
   }
-  */
 }
