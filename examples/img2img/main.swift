@@ -76,6 +76,9 @@ for i in 0..<model.steps {
     timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0))
 }
 let unet = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
+let encoder = Encoder(
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
+  startHeight: startHeight)
 let decoder = Decoder(
   channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
   startHeight: startHeight)

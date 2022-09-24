@@ -63,10 +63,25 @@ swift_binary(
         "clip/vocab.json",
     ],
     deps = [
+        "//:diffusion",
         "@SwiftNumerics//:Numerics",
         "@ccv//lib:ccv",
         "@s4nnc//nnc",
-        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
+    name = "img2img",
+    srcs = ["img2img/main.swift"],
+    data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+    ],
+    deps = [
+        "//:diffusion",
+        "@SwiftNumerics//:Numerics",
+        "@ccv//lib:ccv",
+        "@s4nnc//nnc",
     ],
 )
 

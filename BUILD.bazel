@@ -1,0 +1,12 @@
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+
+swift_library(
+    name = "diffusion",
+    srcs = glob(["src/*.swift"]),
+    module_name = "Diffusion",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+    ],
+)
