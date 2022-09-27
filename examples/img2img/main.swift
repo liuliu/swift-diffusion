@@ -121,13 +121,11 @@ graph.withNoGrad {
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: Float.self)
   let _ = unet(inputs: xIn, graph.variable(ts[0]), c)
   let _ = decoder(inputs: x)
+  let initImg = graph.variable(initImg.toGPU(0))
+  let _ = encoder(inputs: initImg)
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
-  }
-  let initImg = graph.variable(initImg.toGPU(0))
-  let _ = encoder(inputs: initImg)
-  graph.openStore(workDir + "/autoencoder.ckpt") {
     $0.read("encoder", model: encoder)
   }
   let parameters = encoder(inputs: initImg)[0].as(of: Float.self)
