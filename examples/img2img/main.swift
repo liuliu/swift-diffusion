@@ -43,6 +43,24 @@ let tokenizer = CLIPTokenizer(
 let workDir = CommandLine.arguments[1]
 let text = CommandLine.arguments.suffix(2).joined(separator: " ")
 
+var initImage: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
+let _ = (workDir + "/init_img.png").withCString {
+  ccv_read_impl($0, &initImage, Int32(CCV_IO_ANY_FILE), 0, 0, 0)
+}
+var initImg = Tensor<Float>(.CPU, .NCHW(1, 3, startHeight * 8, startWidth * 8))
+if let initImage = initImage {
+  for y in 0..<startHeight * 8 {
+    for x in 0..<startWidth * 8 {
+      let r = initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3]
+      let g = initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 1]
+      let b = initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 2]
+      initImg[0, 0, y, x] = Float(r) / 255 * 2 - 1
+      initImg[0, 1, y, x] = Float(g) / 255 * 2 - 1
+      initImg[0, 2, y, x] = Float(b) / 255 * 2 - 1
+    }
+  }
+}
+
 let unconditionalTokens = tokenizer.tokenize(text: "", truncation: true, maxLength: 77)
 let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
 
@@ -115,11 +133,28 @@ graph.withNoGrad {
     $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
   }
+  let initImg = graph.variable(initImg.toGPU(0))
+  let _ = encoder(inputs: initImg)
+  graph.openStore(workDir + "/autoencoder.ckpt") {
+    $0.read("encoder", model: encoder)
+  }
+  let parameters = encoder(inputs: initImg)[0].as(of: Float.self).toCPU()
+  for i in 0..<6 {
+    let x = i < 3 ? i : 2 + i
+    for j in 0..<6 {
+      let y = j < 3 ? j : 58 + j
+      for k in 0..<6 {
+        let z = k < 3 ? k : 58 + k
+        print("0 \(x) \(y) \(z) \(parameters[0, x, y, z])")
+      }
+    }
+  }
+  fatalError()
   let alphasCumprod = model.alphasCumprod
   var oldEps = [DynamicGraph.Tensor<Float>]()
   let startTime = Date()
   DynamicGraph.setProfiler(true)
-  // Now do PLMS sampling.
+  // Now do DDIM sampling.
   for i in 0..<model.steps {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
     let t = graph.variable(ts[i])
