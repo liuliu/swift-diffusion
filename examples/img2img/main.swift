@@ -30,10 +30,11 @@ extension DiffusionModel {
   }
 }
 
-DynamicGraph.setSeed(40)
+DynamicGraph.setSeed(42)
 
-let unconditionalGuidanceScale: Float = 7.5
+let unconditionalGuidanceScale: Float = 5
 let scaleFactor: Float = 0.18215
+let strength: Float = 0.75
 let startWidth: Int = 64
 let startHeight: Int = 64
 let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 50)
@@ -101,15 +102,6 @@ let decoder = Decoder(
   channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
   startHeight: startHeight)
 
-func xPrevAndPredX0(
-  x: DynamicGraph.Tensor<Float>, et: DynamicGraph.Tensor<Float>, alpha: Float, alphaPrev: Float
-) -> (DynamicGraph.Tensor<Float>, DynamicGraph.Tensor<Float>) {
-  let predX0 = (1 / alpha.squareRoot()) * (x - (1 - alpha).squareRoot() * et)
-  let dirXt = (1 - alphaPrev).squareRoot() * et
-  let xPrev = alphaPrev.squareRoot() * predX0 + dirXt
-  return (xPrev, predX0)
-}
-
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 
 graph.withNoGrad {
@@ -123,9 +115,9 @@ graph.withNoGrad {
   let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
     of: Float.self
   ).reshaped(.CHW(2, 77, 768))
-  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
-  x_T.randn(std: 1, mean: 0)
-  var x = x_T
+  let noise = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
+  noise.randn(std: 1, mean: 0)
+  var x = noise
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: Float.self)
   let _ = unet(inputs: xIn, graph.variable(ts[0]), c)
   let _ = decoder(inputs: x)
@@ -138,27 +130,26 @@ graph.withNoGrad {
   graph.openStore(workDir + "/autoencoder.ckpt") {
     $0.read("encoder", model: encoder)
   }
-  let parameters = encoder(inputs: initImg)[0].as(of: Float.self).toCPU()
-  for i in 0..<6 {
-    let x = i < 3 ? i : 2 + i
-    for j in 0..<6 {
-      let y = j < 3 ? j : 58 + j
-      for k in 0..<6 {
-        let z = k < 3 ? k : 58 + k
-        print("0 \(x) \(y) \(z) \(parameters[0, x, y, z])")
-      }
-    }
-  }
-  fatalError()
+  let parameters = encoder(inputs: initImg)[0].as(of: Float.self)
+  let mean = parameters[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
+  let logvar = parameters[0..<1, 4..<8, 0..<startHeight, 0..<startWidth].clamped(-30...20)
+  let std = Functional.exp(0.5 * logvar)
+  let n = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
+  n.randn(std: 1, mean: 0)
+  let sample = scaleFactor * (mean + std .* n)
   let alphasCumprod = model.alphasCumprod
-  var oldEps = [DynamicGraph.Tensor<Float>]()
   let startTime = Date()
   DynamicGraph.setProfiler(true)
+  let tEnc = Int(strength * Float(model.steps))
+  let initTimestep = model.timesteps - model.timesteps / model.steps * (model.steps - tEnc) + 1
+  let sqrtAlphasCumprod = alphasCumprod[initTimestep].squareRoot()
+  let sqrtOneMinusAlphasCumprod = (1 - alphasCumprod[initTimestep]).squareRoot()
+  let zEnc = sqrtAlphasCumprod * sample + sqrtOneMinusAlphasCumprod * noise
+  x = zEnc
   // Now do DDIM sampling.
-  for i in 0..<model.steps {
+  for i in (model.steps - tEnc)..<model.steps {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
     let t = graph.variable(ts[i])
-    let tNext = ts[min(i + 1, ts.count - 1)]
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
     var et = unet(inputs: xIn, t, c)[0].as(of: Float.self)
@@ -171,41 +162,10 @@ graph.withNoGrad {
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
     let alpha = alphasCumprod[timestep]
     let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
-    let etPrime: DynamicGraph.Tensor<Float>
-    switch oldEps.count {
-    case 0:
-      let (xPrev, _) = xPrevAndPredX0(x: x, et: et, alpha: alpha, alphaPrev: alphaPrev)
-      // Compute etNext.
-      xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
-      xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
-      var etNext = unet(inputs: xIn, graph.variable(tNext), c)[0].as(of: Float.self)
-      var etNextUncond = graph.variable(
-        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
-      var etNextCond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
-      etNextUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-        etNext[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
-      etNextCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-        etNext[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
-      etNext = etNextUncond + unconditionalGuidanceScale * (etNextCond - etNextUncond)
-      etPrime = 0.5 * (et + etNext)
-    case 1:
-      etPrime = 0.5 * (3 * et - oldEps[0])
-    case 2:
-      etPrime =
-        Float(1) / Float(12) * (Float(23) * et - Float(16) * oldEps[1] + Float(5) * oldEps[0])
-    case 3:
-      etPrime =
-        Float(1) / Float(24)
-        * (Float(55) * et - Float(59) * oldEps[2] + Float(37) * oldEps[1] - Float(9) * oldEps[0])
-    default:
-      fatalError()
-    }
-    let (xPrev, _) = xPrevAndPredX0(x: x, et: etPrime, alpha: alpha, alphaPrev: alphaPrev)
+    let predX0 = (1 / alpha.squareRoot()) * (x - (1 - alpha).squareRoot() * et)
+    let dirXt = (1 - alphaPrev).squareRoot() * et
+    let xPrev = alphaPrev.squareRoot() * predX0 + dirXt
     x = xPrev
-    oldEps.append(et)
-    if oldEps.count > 3 {
-      oldEps.removeFirst()
-    }
   }
   let z = 1.0 / scaleFactor * x
   let img = decoder(inputs: z)[0].as(of: Float.self).toCPU()
@@ -224,7 +184,7 @@ graph.withNoGrad {
         min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
     }
   }
-  let _ = (workDir + "/txt2img.png").withCString {
+  let _ = (workDir + "/img2img.png").withCString {
     ccv_write(image, UnsafeMutablePointer(mutating: $0), nil, Int32(CCV_IO_PNG_FILE), nil)
   }
 }
