@@ -3,6 +3,12 @@ import Diffusion
 import Foundation
 import NNC
 
+// Unlike img2img and txt2img, CompVis repo's inpaint is not what most people use. This inpaint
+// implementation is in spirit with outpainting implemented in AUTOMATIC1111's repo:
+// https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/master/scripts/outpainting_mk_2.py
+// i.e. we simply mask out noise with the masks for input latent and run img2img pipeline.
+// Note that this is partially implemented in ddim_sampling (as shown with the mask parameter).
+
 public struct DiffusionModel {
   public var linearStart: Float
   public var linearEnd: Float
@@ -45,19 +51,32 @@ let workDir = CommandLine.arguments[1]
 let text = CommandLine.arguments.suffix(2).joined(separator: " ")
 
 var initImage: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
-let _ = (workDir + "/init_img.png").withCString {
+let _ = (workDir + "/init_inpainting.png").withCString {
   ccv_read_impl($0, &initImage, Int32(CCV_IO_ANY_FILE), 0, 0, 0)
 }
 var initImg = Tensor<Float>(.CPU, .NCHW(1, 3, startHeight * 8, startWidth * 8))
+var initMask = Tensor<Float>(.CPU, .NCHW(1, 1, startHeight, startWidth))
 if let initImage = initImage {
+  for y in 0..<startHeight {
+    for x in 0..<startWidth {
+      initMask[0, 0, y, x] = 0
+    }
+  }
   for y in 0..<startHeight * 8 {
     for x in 0..<startWidth * 8 {
       let r = initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3]
       let g = initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 1]
       let b = initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 2]
-      initImg[0, 0, y, x] = Float(r) / 255 * 2 - 1
-      initImg[0, 1, y, x] = Float(g) / 255 * 2 - 1
-      initImg[0, 2, y, x] = Float(b) / 255 * 2 - 1
+      if g == 255 && r == 0 && b == 0 {
+        initMask[0, 0, y / 8, x / 8] = 1
+        initImg[0, 0, y, x] = 0
+        initImg[0, 1, y, x] = 0
+        initImg[0, 2, y, x] = 0
+      } else {
+        initImg[0, 0, y, x] = Float(r) / 255 * 2 - 1
+        initImg[0, 1, y, x] = Float(g) / 255 * 2 - 1
+        initImg[0, 2, y, x] = Float(b) / 255 * 2 - 1
+      }
     }
   }
 }
@@ -131,7 +150,8 @@ graph.withNoGrad {
   let parameters = encoder(inputs: initImg)[0].as(of: Float.self)
   let mean = parameters[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
   let logvar = parameters[0..<1, 4..<8, 0..<startHeight, 0..<startWidth].clamped(-30...20)
-  let std = Functional.exp(0.5 * logvar)
+  let initMask = graph.variable(initMask.toGPU(0))
+  let std = Functional.exp(0.5 * logvar) .* initMask
   let n = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
   n.randn(std: 1, mean: 0)
   let sample = scaleFactor * (mean + std .* n)
@@ -141,8 +161,11 @@ graph.withNoGrad {
   let initTimestep = model.timesteps - model.timesteps / model.steps * (model.steps - tEnc) + 1
   let sqrtAlphasCumprod = alphasCumprod[initTimestep].squareRoot()
   let sqrtOneMinusAlphasCumprod = (1 - alphasCumprod[initTimestep]).squareRoot()
+  var initNegMask = graph.variable(.GPU(0), .NCHW(1, 1, startHeight, startWidth), of: Float.self)
+  initNegMask.full(1)
+  initNegMask = initNegMask - initMask
   let zEnc = sqrtAlphasCumprod * sample + sqrtOneMinusAlphasCumprod * noise
-  x = zEnc
+  x = zEnc .* initNegMask + noise .* initMask
   DynamicGraph.setProfiler(true)
   // Now do DDIM sampling.
   for i in (model.steps - tEnc)..<model.steps {
@@ -164,6 +187,13 @@ graph.withNoGrad {
     let dirXt = (1 - alphaPrev).squareRoot() * et
     let xPrev = alphaPrev.squareRoot() * predX0 + dirXt
     x = xPrev
+    if i < model.steps - 1 {
+      // Apply mask repeatedly during the diffusion process. Do it or not in the last step doesn't
+      // practically matter since the alpha is so small. Don't do it to match CompVis repo.
+      noise.randn(std: 1, mean: 0)
+      let qSample = alpha.squareRoot() * sample + (1 - alpha).squareRoot() * noise
+      x = qSample .* initNegMask + x .* initMask
+    }
   }
   let z = 1.0 / scaleFactor * x
   let img = decoder(inputs: z)[0].as(of: Float.self).toCPU()
@@ -182,7 +212,7 @@ graph.withNoGrad {
         min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
     }
   }
-  let _ = (workDir + "/img2img.png").withCString {
+  let _ = (workDir + "/inpainting.png").withCString {
     ccv_write(image, UnsafeMutablePointer(mutating: $0), nil, Int32(CCV_IO_PNG_FILE), nil)
   }
 }
