@@ -36,7 +36,7 @@ extension DiffusionModel {
   }
 }
 
-DynamicGraph.setSeed(42)
+DynamicGraph.setSeed(38)
 
 let unconditionalGuidanceScale: Float = 5
 let scaleFactor: Float = 0.18215
@@ -74,6 +74,9 @@ if let initImage = initImage {
         initImg[0, 0, y, x] = 0
         initImg[0, 1, y, x] = 0
         initImg[0, 2, y, x] = 0
+        initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3] = 128
+        initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 1] = 128
+        initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 2] = 128
       } else {
         initImg[0, 0, y, x] = Float(r) / 255 * 2 - 1
         initImg[0, 1, y, x] = Float(g) / 255 * 2 - 1
@@ -89,22 +92,16 @@ if text == "" {
   vit = VisionTransformer(
     grid: 16, width: 1024, outputDim: 768, layers: 24, heads: 16, batchSize: 1)
   var vitImage: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
-  ccv_resample(initImage, &vitImage, 0, 224, 244, Int32(CCV_INTER_AREA))
+  ccv_resample(initImage, &vitImage, 0, 224, 224, Int32(CCV_INTER_AREA))
   if let vitImage = vitImage {
     for y in 0..<224 {
       for x in 0..<224 {
-        let r = vitImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3]
-        let g = vitImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 1]
-        let b = vitImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 2]
-        if g == 255 && r == 0 && b == 0 {
-          vitImg[0, 0, y, x] = 0
-          vitImg[0, 1, y, x] = 0
-          vitImg[0, 2, y, x] = 0
-        } else {
-          vitImg[0, 0, y, x] = (Float(r) / 255 * 2 - 1 - 0.48145466) / 0.26862954
-          vitImg[0, 1, y, x] = (Float(g) / 255 * 2 - 1 - 0.4578275) / 0.26130258
-          vitImg[0, 2, y, x] = (Float(b) / 255 * 2 - 1 - 0.40821073) / 0.27577711
-        }
+        let r = vitImage.pointee.data.u8[y * 224 * 3 + x * 3]
+        let g = vitImage.pointee.data.u8[y * 224 * 3 + x * 3 + 1]
+        let b = vitImage.pointee.data.u8[y * 224 * 3 + x * 3 + 2]
+        vitImg[0, 0, y, x] = (Float(r) / 255 * 2 - 1 - 0.48145466) / 0.26862954
+        vitImg[0, 1, y, x] = (Float(g) / 255 * 2 - 1 - 0.4578275) / 0.26130258
+        vitImg[0, 2, y, x] = (Float(b) / 255 * 2 - 1 - 0.40821073) / 0.27577711
       }
     }
   }
@@ -189,7 +186,9 @@ graph.withNoGrad {
       $0.read("positional_embedding", variable: positionalEmbedding)
     }
     let out = vit(inputs: vitImg, classEmbedding, positionalEmbedding)[0].as(of: Float.self)
-    c[1..<2, 1..<2, 0..<768] = out.reshaped(.CHW(1, 1, 768))
+    for i in 1..<10 {
+      c[1..<2, i..<(i + 1), 0..<768] = out.reshaped(.CHW(1, 1, 768))
+    }
   }
   let parameters = encoder(inputs: initImg)[0].as(of: Float.self)
   let mean = parameters[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]

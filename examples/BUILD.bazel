@@ -108,5 +108,6 @@ swift_binary(
         "@SwiftNumerics//:Numerics",
         "@ccv//lib:ccv",
         "@s4nnc//nnc",
+        "@s4nnc//tensorboard",
     ],
 )
