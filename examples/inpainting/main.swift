@@ -48,7 +48,9 @@ let tokenizer = CLIPTokenizer(
   vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
 
 let workDir = CommandLine.arguments[1]
-let text = CommandLine.arguments.suffix(2).joined(separator: " ")
+let text =
+  CommandLine.arguments.count > 2
+  ? CommandLine.arguments.suffix(from: 2).joined(separator: " ") : ""
 
 var initImage: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
 let _ = (workDir + "/init_inpainting.png").withCString {
@@ -81,6 +83,35 @@ if let initImage = initImage {
   }
 }
 
+let vit: Model?
+var vitImg = Tensor<Float>(.CPU, .NCHW(1, 3, 224, 224))
+if text == "" {
+  vit = VisionTransformer(
+    grid: 16, width: 1024, outputDim: 768, layers: 24, heads: 16, batchSize: 1)
+  var vitImage: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
+  ccv_resample(initImage, &vitImage, 0, 224, 244, Int32(CCV_INTER_AREA))
+  if let vitImage = vitImage {
+    for y in 0..<224 {
+      for x in 0..<224 {
+        let r = vitImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3]
+        let g = vitImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 1]
+        let b = vitImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 2]
+        if g == 255 && r == 0 && b == 0 {
+          vitImg[0, 0, y, x] = 0
+          vitImg[0, 1, y, x] = 0
+          vitImg[0, 2, y, x] = 0
+        } else {
+          vitImg[0, 0, y, x] = (Float(r) / 255 * 2 - 1 - 0.48145466) / 0.26862954
+          vitImg[0, 1, y, x] = (Float(g) / 255 * 2 - 1 - 0.4578275) / 0.26130258
+          vitImg[0, 2, y, x] = (Float(b) / 255 * 2 - 1 - 0.40821073) / 0.27577711
+        }
+      }
+    }
+  }
+} else {
+  vit = nil
+}
+
 let unconditionalTokens = tokenizer.tokenize(text: "", truncation: true, maxLength: 77)
 let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
 
@@ -94,7 +125,7 @@ let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 for i in 0..<77 {
   tokensTensor[i] = unconditionalTokens[i]
-  tokensTensor[i + 77] = tokens[i]
+  tokensTensor[i + 77] = text == "" && i == 0 ? 49406 : tokens[i]
   positionTensor[i] = Int32(i)
   positionTensor[i + 77] = Int32(i)
 }
@@ -131,7 +162,7 @@ graph.withNoGrad {
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("text_model", model: textModel)
   }
-  let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
+  var c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
     of: Float.self
   ).reshaped(.CHW(2, 77, 768))
   let noise = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
@@ -146,6 +177,19 @@ graph.withNoGrad {
     $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
     $0.read("encoder", model: encoder)
+  }
+  if let vit = vit {
+    let vitImg = graph.variable(vitImg.toGPU(0))
+    let classEmbedding = graph.variable(.GPU(0), .CHW(1, 1, 1024), of: Float.self)
+    let positionalEmbedding = graph.variable(.GPU(0), .CHW(1, 16 * 16 + 1, 1024), of: Float.self)
+    let _ = vit(inputs: vitImg, classEmbedding, positionalEmbedding)
+    graph.openStore(workDir + "/image_model.ckpt") {
+      $0.read("vit", model: vit)
+      $0.read("class_embedding", variable: classEmbedding)
+      $0.read("positional_embedding", variable: positionalEmbedding)
+    }
+    let out = vit(inputs: vitImg, classEmbedding, positionalEmbedding)[0].as(of: Float.self)
+    c[1..<2, 1..<2, 0..<768] = out.reshaped(.CHW(1, 1, 768))
   }
   let parameters = encoder(inputs: initImg)[0].as(of: Float.self)
   let mean = parameters[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]

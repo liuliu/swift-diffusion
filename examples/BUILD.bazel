@@ -12,6 +12,17 @@ swift_binary(
 )
 
 swift_binary(
+    name = "vit",
+    srcs = ["vit/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "unet",
     srcs = ["unet/main.swift"],
     deps = [

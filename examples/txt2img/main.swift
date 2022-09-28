@@ -41,7 +41,9 @@ let tokenizer = CLIPTokenizer(
   vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
 
 let workDir = CommandLine.arguments[1]
-let text = CommandLine.arguments.suffix(2).joined(separator: " ")
+let text =
+  CommandLine.arguments.count > 2
+  ? CommandLine.arguments.suffix(from: 2).joined(separator: " ") : ""
 
 let unconditionalTokens = tokenizer.tokenize(text: "", truncation: true, maxLength: 77)
 let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
