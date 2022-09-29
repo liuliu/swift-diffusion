@@ -139,7 +139,7 @@ let random = Python.import("random")
 let numpy = Python.import("numpy")
 let transformers = Python.import("transformers")
 
-// let transformer = transformers.CLIPVisionModel.from_pretrained("openai/clip-vit-large-patch14")
+let transformer = transformers.CLIPModel.from_pretrained("openai/clip-vit-large-patch14")
 
 random.seed(42)
 numpy.random.seed(42)
@@ -154,6 +154,17 @@ print(state_dict.keys())
 let x = torch.randn([1, 3, 224, 224])
 let y = model.visual(x.cuda().type(model.dtype))
 print(y)
+let text_proj = model.text_projection.type(torch.float)
+let inverse_proj = torch.inverse(text_proj)
+print(inverse_proj)
+var textProj = Tensor<Float>(.CPU, .NC(768, 768))
+var inverseProj = Tensor<Float>(.CPU, .NC(768, 768))
+for i in 0..<768 {
+  for j in 0..<768 {
+    inverseProj[i, j] = Float(inverse_proj[i, j])!
+    textProj[i, j] = Float(text_proj[i, j])!
+  }
+}
 
 let graph = DynamicGraph()
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
@@ -175,10 +186,14 @@ graph.withNoGrad {
   for j in 0..<768 {
     print("\(j) \(out[0, j])")
   }
+  let inverseProj = graph.variable(inverseProj)
+  let textProj = graph.variable(textProj)
 
   graph.openStore("/home/liu/workspace/swift-diffusion/image_model.ckpt") {
     $0.write("vit", model: vit)
     $0.write("class_embedding", variable: classEmbedding)
     $0.write("positional_embedding", variable: positionalEmbedding)
+    $0.write("inverse_proj", variable: inverseProj)
+    $0.write("text_proj", variable: textProj)
   }
 }

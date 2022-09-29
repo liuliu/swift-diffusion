@@ -179,14 +179,19 @@ graph.withNoGrad {
     let vitImg = graph.variable(vitImg.toGPU(0))
     let classEmbedding = graph.variable(.GPU(0), .CHW(1, 1, 1024), of: Float.self)
     let positionalEmbedding = graph.variable(.GPU(0), .CHW(1, 16 * 16 + 1, 1024), of: Float.self)
+    let inverseProj = graph.variable(.GPU(0), .NC(768, 768), of: Float.self)
     let _ = vit(inputs: vitImg, classEmbedding, positionalEmbedding)
     graph.openStore(workDir + "/image_model.ckpt") {
       $0.read("vit", model: vit)
       $0.read("class_embedding", variable: classEmbedding)
       $0.read("positional_embedding", variable: positionalEmbedding)
+      $0.read("inverse_proj", variable: inverseProj)
     }
     let out = vit(inputs: vitImg, classEmbedding, positionalEmbedding)[0].as(of: Float.self)
-    c[1..<2, 1..<2, 0..<768] = out.reshaped(.CHW(1, 1, 768))
+    let inversed = 0.0001 * (out.reshaped(.NC(1, 768)) * inverseProj)
+    for i in 1..<76 {
+      c[1..<2, i..<(i + 1), 0..<768] = inversed.reshaped(.CHW(1, 1, 768))
+    }
   }
   let parameters = encoder(inputs: initImg)[0].as(of: Float.self)
   let mean = parameters[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
