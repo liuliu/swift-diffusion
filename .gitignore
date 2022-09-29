@@ -106,3 +106,7 @@ clang.bazelrc
 .index/
 _env/
 compile_commands.json
+*.ckpt
+*.dot
+*.png
+*.svg
