@@ -8,13 +8,11 @@ This re-implementation serves as an education for me to understand diffusion mod
 
 ## Where We Are
 
-CLIP text tokenizer, text model, UNet diffusion model and the decoder has been ported. The `examples:txt2img` target is useful. Need to port the encoder over to enable `img2img`. Other targets, such as `examples:unet`, `examples:clip`, `examples:autoencoder` are the example programs to convert PyTorch weights to the one s4nnc uses.
+CLIP text tokenizer, image model, text model, UNet diffusion model and the autoencoders has been ported. The `examples:txt2img`, `examples:img2img` and `examples:inpainting` target is useful. Other targets, such as `examples:unet`, `examples:clip`, `examples:decoder`, `examples:encoder` and `examples:vit` are the example programs to convert PyTorch weights to the one s4nnc uses.
 
 ## What's Next
 
-The next on my list is to enable img2img (a.k.a. the encoder network). After that, I should do some work to make sure the performance on FP32 and FP16 is on par with PyTorch. That will give a good baseline for follow-up memory and performance optimizations.
-
-When these are in order, I should change the convolution layout from NCHW to NHWC. That will enable bunch of optimizations in attention layer, mostly to avoid some of the transpose traffic. I can enable CPU mode either by converting convolution layout to NHWC, or implement NCHW convolution in s4nnc. The latter is long overdue, but doing former would be helpful for performance on CPU.
+The immediate work is to measure the CPU performance and start to work on MPS kernels. There are some s4nnc bugs that I should fix along the way, but not high priority.
 
 Right now, at run time, UNet model uses ~1.5GiB memory in additional to its 3.3GiB weights. A big chunk of that 1.5GiB is due to the dot product in attention layer. I already optimized away about 1GiB because previously, softmax doesn't run in-place properly (due to complex reasons relating to aliases and reshapes). I believe this is still a case for PyTorch code because there is no in-place softmax method. That dot product can be split further into smaller batches to save peak memory usage (along the token dimension of k). If these are done correctly, we should be able to reduce UNet memory usage to somewhere around 3.8GiB full floating-point. Another idea I have to further reduce the memory usage is to compress shortcut activations in UNet (these shortcut activations will be saved along downsample path and used in upsample path, thus, occupying for long time). But I am less sure how much memory that can save.
 
@@ -22,7 +20,7 @@ Converting the model to FP16 would save memory footprint instantly, but this wil
 
 ## Is It Comparable
 
-Right now, I didn't do any specific optimizations. Further, the model loading as of today for s4nnc requires executing the model once, and we have some optimization runs (find the most efficient kernels etc.) that are not saved. That has been said, we can compare the execution time of txt2img from Swift v.s. the one from CompVis (there are more optimized forks available, but going through them to find the best would take time) of the diffusion process + decoding process. The Swift txt2img on GPU took about 17s while the CompVis took about 11s (both with one 2080 Ti). Cursory look at `nvprof` output shows that transpose and not using cublasLt optimally are two leading causes for the extra 6s spent.
+I've reduced the transpose traffic by implementing permute operator in s4nnc. When we compare the execution time of txt2img from Swift v.s. the one from CompVis (there are more optimized forks available, but going through them to find the best would take time) of the diffusion process + decoding process. The Swift txt2img on GPU took about 15s while the CompVis took about 11s (both with one 2080 Ti). There are some inefficiencies in the LayerNorm / GroupNorm kernels I use, as well as some mysteries on why certain low-performance GEMM kernels are selected. I am going to switch to MPS implementation though. Optimizing further on CUDA end won't translate to gains on MPS end.
 
 ## How to Run This
 
@@ -51,3 +49,9 @@ bazel run examples:txt2img --compilation_mode=opt -- /home/the-absolute-work-dir
 ```
 
 The image will be generated under the given directory with name `txt2img.png`.
+
+For `img2img`, it looks for `init_img.png` under the work directory you provided. For `inpainting`, it looks for `init_inpainting.png` under the work directory. As of now, it expects the inpainting parts to be green. You also need to provide prompt guidance for `inpainting` otherwise it won't work.
+
+## Existing Issues
+
+I cannot seem to have inpainting without prompt guidance to work. I tried to use CLIP image model for guidance. However, because Stable Diffusion model uses the text embedding prior to text projection, making the image model's embedding not comparable to the text embedding one.
