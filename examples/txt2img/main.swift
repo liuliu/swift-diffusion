@@ -83,8 +83,8 @@ let decoder = Decoder(
   startHeight: startHeight)
 
 func xPrevAndPredX0(
-  x: DynamicGraph.Tensor<Float>, et: DynamicGraph.Tensor<Float>, alpha: Float, alphaPrev: Float
-) -> (DynamicGraph.Tensor<Float>, DynamicGraph.Tensor<Float>) {
+  x: DynamicGraph.Tensor<Float16>, et: DynamicGraph.Tensor<Float16>, alpha: Float, alphaPrev: Float
+) -> (DynamicGraph.Tensor<Float16>, DynamicGraph.Tensor<Float16>) {
   let predX0 = (1 / alpha.squareRoot()) * (x - (1 - alpha).squareRoot() * et)
   let dirXt = (1 - alphaPrev).squareRoot() * et
   let xPrev = alphaPrev.squareRoot() * predX0 + dirXt
@@ -101,33 +101,35 @@ graph.withNoGrad {
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("text_model", model: textModel)
   }
-  let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
-    of: Float.self
-  ).reshaped(.CHW(2, 77, 768))
-  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
+  var c: DynamicGraph.AnyTensor = textModel(
+    inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
+      of: Float.self
+    ).reshaped(.CHW(2, 77, 768))
+  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
   x_T.randn(std: 1, mean: 0)
   var x = x_T
-  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: Float.self)
-  let _ = unet(inputs: xIn, graph.variable(ts[0]), c)
-  let _ = decoder(inputs: x)
+  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: Float16.self)
+  c = DynamicGraph.Tensor<Float16>(from: c)
+  let _ = unet(inputs: xIn, graph.variable(Tensor<Float16>(from: ts[0])), c)
+  let _ = decoder(inputs: DynamicGraph.Tensor<Float>(x))
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
   }
   let alphasCumprod = model.alphasCumprod
-  var oldEps = [DynamicGraph.Tensor<Float>]()
+  var oldEps = [DynamicGraph.Tensor<Float16>]()
   let startTime = Date()
   DynamicGraph.setProfiler(true)
   // Now do PLMS sampling.
   for i in 0..<model.steps {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
-    let t = graph.variable(ts[i])
-    let tNext = ts[min(i + 1, ts.count - 1)]
+    let t = graph.variable(Tensor<Float16>(from: ts[i]))
+    let tNext = Tensor<Float16>(from: ts[min(i + 1, ts.count - 1)])
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
-    var et = unet(inputs: xIn, t, c)[0].as(of: Float.self)
-    var etUncond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
-    var etCond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
+    var et = unet(inputs: xIn, t, c)[0].as(of: Float16.self)
+    var etUncond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
+    var etCond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
     etUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
       et[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
     etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
@@ -135,17 +137,18 @@ graph.withNoGrad {
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
     let alpha = alphasCumprod[timestep]
     let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
-    let etPrime: DynamicGraph.Tensor<Float>
+    let etPrime: DynamicGraph.Tensor<Float16>
     switch oldEps.count {
     case 0:
       let (xPrev, _) = xPrevAndPredX0(x: x, et: et, alpha: alpha, alphaPrev: alphaPrev)
       // Compute etNext.
       xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
       xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
-      var etNext = unet(inputs: xIn, graph.variable(tNext), c)[0].as(of: Float.self)
+      var etNext = unet(inputs: xIn, graph.variable(tNext), c)[0].as(of: Float16.self)
       var etNextUncond = graph.variable(
-        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
-      var etNextCond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float.self)
+        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
+      var etNextCond = graph.variable(
+        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
       etNextUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
         etNext[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
       etNextCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
@@ -172,7 +175,7 @@ graph.withNoGrad {
     }
   }
   let z = 1.0 / scaleFactor * x
-  let img = decoder(inputs: z)[0].as(of: Float.self).toCPU()
+  let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: Float16.self)).toCPU()
   print("Total time \(Date().timeIntervalSince(startTime))")
   let image = ccv_dense_matrix_new(
     Int32(startHeight * 8), Int32(startWidth * 8), Int32(CCV_8U | CCV_C3), nil, 0)
