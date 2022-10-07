@@ -38,7 +38,7 @@ new_git_repository(
     build_file = "swift-png.BUILD",
     commit = "075dfb248ae327822635370e9d4f94a5d3fe93b2",
     remote = "https://github.com/kelvin13/swift-png",
-    #shallow_since = "",
+    shallow_since = "1645648674 -0600",
 )
 
 git_repository(
