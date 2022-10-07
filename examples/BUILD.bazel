@@ -76,7 +76,7 @@ swift_binary(
     deps = [
         "//:diffusion",
         "@SwiftNumerics//:Numerics",
-        "@ccv//lib:ccv",
+        "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
     ],
 )
@@ -91,7 +91,7 @@ swift_binary(
     deps = [
         "//:diffusion",
         "@SwiftNumerics//:Numerics",
-        "@ccv//lib:ccv",
+        "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
     ],
 )
@@ -106,6 +106,7 @@ swift_binary(
     deps = [
         "//:diffusion",
         "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
         "@ccv//lib:ccv",
         "@s4nnc//nnc",
     ],

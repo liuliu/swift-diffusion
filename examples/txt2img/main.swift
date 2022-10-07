@@ -1,7 +1,7 @@
-import C_ccv
 import Diffusion
 import Foundation
 import NNC
+import PNG
 
 public struct DiffusionModel {
   public var linearStart: Float
@@ -177,21 +177,20 @@ graph.withNoGrad {
   let z = 1.0 / scaleFactor * x
   let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: Float16.self)).toCPU()
   print("Total time \(Date().timeIntervalSince(startTime))")
-  let image = ccv_dense_matrix_new(
-    Int32(startHeight * 8), Int32(startWidth * 8), Int32(CCV_8U | CCV_C3), nil, 0)
-  // I have better way to copy this out (basically, transpose and then ccv_shift). Doing this just for fun.
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
   for y in 0..<startHeight * 8 {
     for x in 0..<startWidth * 8 {
       let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
-      image!.pointee.data.u8[y * startWidth * 8 * 3 + x * 3] = UInt8(
+      rgba[y * startWidth * 8 + x].r = UInt8(
         min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
-      image!.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 1] = UInt8(
+      rgba[y * startWidth * 8 + x].g = UInt8(
         min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
-      image!.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 2] = UInt8(
+      rgba[y * startWidth * 8 + x].b = UInt8(
         min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
     }
   }
-  let _ = (workDir + "/txt2img.png").withCString {
-    ccv_write(image, UnsafeMutablePointer(mutating: $0), nil, Int32(CCV_IO_PNG_FILE), nil)
-  }
+  let image = PNG.Data.Rectangular(
+    packing: rgba, size: (startWidth * 8, startHeight * 8),
+    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+  try! image.compress(path: workDir + "/txt2img.png", level: 4)
 }

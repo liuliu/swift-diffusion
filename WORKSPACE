@@ -3,9 +3,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 git_repository(
     name = "s4nnc",
-    commit = "780468973860418b04db59eae21ed265a3ba481f",
+    commit = "d26c1ba5b9c8434c6a62607942f45cdccc8911b7",
     remote = "https://github.com/liuliu/s4nnc.git",
-    shallow_since = "1664587544 -0400",
+    shallow_since = "1665167809 -0400",
 )
 
 load("@s4nnc//:deps.bzl", "s4nnc_deps")
@@ -27,14 +27,18 @@ ccv_setting(
     name = "local_config_ccv",
     have_cblas = True,
     have_cudnn = True,
-    have_fftw3 = True,
-    have_gsl = True,
-    have_libjpeg = True,
-    have_libpng = True,
     have_nccl = True,
     have_pthread = True,
     use_dispatch = True,
     use_openmp = True,
+)
+
+new_git_repository(
+    name = "SwiftPNG",
+    build_file = "swift-png.BUILD",
+    commit = "075dfb248ae327822635370e9d4f94a5d3fe93b2",
+    remote = "https://github.com/kelvin13/swift-png",
+    #shallow_since = "",
 )
 
 git_repository(
