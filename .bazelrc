@@ -6,6 +6,8 @@ common:cuda_clang --define=using_cuda=true --define=using_cuda_clang=true
 
 common:win-cuda --define=using_cuda=true --define=using_cuda_nvcc=true
 
+common:mps --define=enable_mps=true
+
 common --disk_cache=.cache
 
 build --cxxopt='--std=c++17'
