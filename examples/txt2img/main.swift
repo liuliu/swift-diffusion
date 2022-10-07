@@ -3,6 +3,8 @@ import Foundation
 import NNC
 import PNG
 
+public typealias UseFloatingPoint = Float
+
 public struct DiffusionModel {
   public var linearStart: Float
   public var linearEnd: Float
@@ -83,8 +85,9 @@ let decoder = Decoder(
   startHeight: startHeight)
 
 func xPrevAndPredX0(
-  x: DynamicGraph.Tensor<Float16>, et: DynamicGraph.Tensor<Float16>, alpha: Float, alphaPrev: Float
-) -> (DynamicGraph.Tensor<Float16>, DynamicGraph.Tensor<Float16>) {
+  x: DynamicGraph.Tensor<UseFloatingPoint>, et: DynamicGraph.Tensor<UseFloatingPoint>, alpha: Float,
+  alphaPrev: Float
+) -> (DynamicGraph.Tensor<UseFloatingPoint>, DynamicGraph.Tensor<UseFloatingPoint>) {
   let predX0 = (1 / alpha.squareRoot()) * (x - (1 - alpha).squareRoot() * et)
   let dirXt = (1 - alphaPrev).squareRoot() * et
   let xPrev = alphaPrev.squareRoot() * predX0 + dirXt
@@ -105,31 +108,33 @@ graph.withNoGrad {
     inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
       of: Float.self
     ).reshaped(.CHW(2, 77, 768))
-  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
+  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   x_T.randn(std: 1, mean: 0)
   var x = x_T
-  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: Float16.self)
-  c = DynamicGraph.Tensor<Float16>(from: c)
-  let _ = unet(inputs: xIn, graph.variable(Tensor<Float16>(from: ts[0])), c)
-  let _ = decoder(inputs: DynamicGraph.Tensor<Float>(x))
+  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+  c = DynamicGraph.Tensor<UseFloatingPoint>(from: c)
+  let _ = unet(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts[0])), c)
+  let _ = decoder(inputs: x)
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
   }
   let alphasCumprod = model.alphasCumprod
-  var oldEps = [DynamicGraph.Tensor<Float16>]()
+  var oldEps = [DynamicGraph.Tensor<UseFloatingPoint>]()
   let startTime = Date()
   DynamicGraph.setProfiler(true)
   // Now do PLMS sampling.
   for i in 0..<model.steps {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
-    let t = graph.variable(Tensor<Float16>(from: ts[i]))
-    let tNext = Tensor<Float16>(from: ts[min(i + 1, ts.count - 1)])
+    let t = graph.variable(Tensor<UseFloatingPoint>(from: ts[i]))
+    let tNext = Tensor<UseFloatingPoint>(from: ts[min(i + 1, ts.count - 1)])
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
-    var et = unet(inputs: xIn, t, c)[0].as(of: Float16.self)
-    var etUncond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
-    var etCond = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
+    var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
+    var etUncond = graph.variable(
+      .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+    var etCond = graph.variable(
+      .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
     etUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
       et[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
     etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
@@ -137,18 +142,18 @@ graph.withNoGrad {
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
     let alpha = alphasCumprod[timestep]
     let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
-    let etPrime: DynamicGraph.Tensor<Float16>
+    let etPrime: DynamicGraph.Tensor<UseFloatingPoint>
     switch oldEps.count {
     case 0:
       let (xPrev, _) = xPrevAndPredX0(x: x, et: et, alpha: alpha, alphaPrev: alphaPrev)
       // Compute etNext.
       xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
       xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
-      var etNext = unet(inputs: xIn, graph.variable(tNext), c)[0].as(of: Float16.self)
+      var etNext = unet(inputs: xIn, graph.variable(tNext), c)[0].as(of: UseFloatingPoint.self)
       var etNextUncond = graph.variable(
-        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
+        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
       var etNextCond = graph.variable(
-        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: Float16.self)
+        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
       etNextUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
         etNext[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
       etNextCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
@@ -175,7 +180,8 @@ graph.withNoGrad {
     }
   }
   let z = 1.0 / scaleFactor * x
-  let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: Float16.self)).toCPU()
+  let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: UseFloatingPoint.self))
+    .toCPU()
   print("Total time \(Date().timeIntervalSince(startTime))")
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
   for y in 0..<startHeight * 8 {
