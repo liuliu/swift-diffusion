@@ -116,6 +116,7 @@ let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
 let graph = DynamicGraph()
 
 let textModel = CLIPTextModel(
+  Float.self,
   vocabularySize: 49408, maxLength: 77, embeddingSize: 768, numLayers: 12, numHeads: 12,
   batchSize: 2, intermediateSize: 3072)
 

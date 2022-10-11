@@ -2,14 +2,16 @@ import NNC
 
 /// Text Model
 
-func CLIPTextEmbedding(batchSize: Int, vocabularySize: Int, maxLength: Int, embeddingSize: Int)
+func CLIPTextEmbedding<T: TensorNumeric>(
+  _ dataType: T.Type, batchSize: Int, vocabularySize: Int, maxLength: Int, embeddingSize: Int
+)
   -> Model
 {
   let tokens = Input()
   let positions = Input()
   let tokenEmbed = Embedding(
-    Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize)
-  let positionEmbed = Embedding(Float.self, vocabularySize: maxLength, embeddingSize: embeddingSize)
+    T.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize)
+  let positionEmbed = Embedding(T.self, vocabularySize: maxLength, embeddingSize: embeddingSize)
   let embedding = tokenEmbed(tokens) + positionEmbed(positions)
   return Model([tokens, positions], [embedding], name: "embeddings")
 }
@@ -66,7 +68,8 @@ func CLIPEncoderLayer(k: Int, h: Int, b: Int, t: Int, intermediateSize: Int) -> 
   return Model([x, casualAttentionMask], [out])
 }
 
-public func CLIPTextModel(
+public func CLIPTextModel<T: TensorNumeric>(
+  _ dataType: T.Type,
   vocabularySize: Int, maxLength: Int, embeddingSize: Int, numLayers: Int, numHeads: Int,
   batchSize: Int, intermediateSize: Int
 ) -> Model {
@@ -74,7 +77,7 @@ public func CLIPTextModel(
   let positions = Input()
   let casualAttentionMask = Input()
   let embedding = CLIPTextEmbedding(
-    batchSize: batchSize,
+    T.self, batchSize: batchSize,
     vocabularySize: vocabularySize, maxLength: maxLength, embeddingSize: embeddingSize)
   var out = embedding(tokens, positions)
   let k = embeddingSize / numHeads

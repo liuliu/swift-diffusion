@@ -3,7 +3,7 @@ import Foundation
 import NNC
 import PNG
 
-public typealias UseFloatingPoint = Float
+public typealias UseFloatingPoint = Float16
 
 public struct DiffusionModel {
   public var linearStart: Float
@@ -53,6 +53,7 @@ let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
 let graph = DynamicGraph()
 
 let textModel = CLIPTextModel(
+  UseFloatingPoint.self,
   vocabularySize: 49408, maxLength: 77, embeddingSize: 768, numLayers: 12, numHeads: 12,
   batchSize: 2, intermediateSize: 3072)
 
@@ -65,11 +66,11 @@ for i in 0..<77 {
   positionTensor[i + 77] = Int32(i)
 }
 
-let casualAttentionMask = graph.variable(Tensor<Float>(.CPU, .NHWC(1, 1, 77, 77)))
+let casualAttentionMask = graph.variable(Tensor<UseFloatingPoint>(.CPU, .NHWC(1, 1, 77, 77)))
 casualAttentionMask.full(0)
 for i in 0..<76 {
   for j in (i + 1)..<77 {
-    casualAttentionMask[0, 0, i, j] = -Float.greatestFiniteMagnitude
+    casualAttentionMask[0, 0, i, j] = -UseFloatingPoint.greatestFiniteMagnitude
   }
 }
 
@@ -104,15 +105,14 @@ graph.withNoGrad {
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("text_model", model: textModel)
   }
-  var c: DynamicGraph.AnyTensor = textModel(
+  let c: DynamicGraph.AnyTensor = textModel(
     inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
-      of: Float.self
+      of: UseFloatingPoint.self
     ).reshaped(.CHW(2, 77, 768))
   let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   x_T.randn(std: 1, mean: 0)
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-  c = DynamicGraph.Tensor<UseFloatingPoint>(from: c)
   let _ = unet(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts[0])), c)
   let _ = decoder(inputs: x)
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
