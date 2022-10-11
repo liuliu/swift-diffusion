@@ -33,6 +33,7 @@ extension DiffusionModel {
 }
 
 DynamicGraph.setSeed(40)
+DynamicGraph.memoryEfficient = true
 
 let unconditionalGuidanceScale: Float = 7.5
 let scaleFactor: Float = 0.18215
