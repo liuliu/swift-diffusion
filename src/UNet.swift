@@ -310,7 +310,8 @@ public func UNet(batchSize: Int, startWidth: Int, startHeight: Int) -> Model {
     startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
   var out = inputBlocks
   let middleBlock = MiddleBlock(
-    channels: 1280, numHeads: 8, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
+    channels: 1280, numHeads: 8, batchSize: batchSize, height: startHeight / 8,
+    width: startWidth / 8, embeddingSize: 77,
     x: out,
     emb: emb, c: c)
   out = middleBlock
