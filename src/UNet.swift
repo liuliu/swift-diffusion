@@ -35,28 +35,28 @@ func TimeEmbed(modelChannels: Int) -> Model {
 func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> Model {
   let x = Input()
   let emb = Input()
-  let inLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  let inLayerNorm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
   var out = inLayerNorm(x)
   out = out.swish()
   let inLayerConv2d = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW)
   out = inLayerConv2d(out)
   let embLayer = Dense(count: outChannels)
   var embOut = emb.swish()
-  embOut = embLayer(embOut).reshaped([b, outChannels, 1, 1])
+  embOut = embLayer(embOut).reshaped([b, 1, 1, outChannels])
   out = out + embOut
-  let outLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  let outLayerNorm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
   out = outLayerNorm(out)
   out = out.swish()
   // Dropout if needed in the future (for training).
   let outLayerConv2d = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW)
   if skipConnection {
     let skip = Convolution(
       groups: 1, filters: outChannels, filterSize: [1, 1],
-      hint: Hint(stride: [1, 1]))
+      hint: Hint(stride: [1, 1]), format: .NCHW)
     out = skip(x) + outLayerConv2d(out)  // This layer should be zero init if training.
   } else {
     out = x + outLayerConv2d(out)  // This layer should be zero init if training.
@@ -69,10 +69,10 @@ func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> Model {
   let tokeys = Dense(count: k * h, noBias: true)
   let toqueries = Dense(count: k * h, noBias: true)
   let tovalues = Dense(count: k * h, noBias: true)
-  let keys = tokeys(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  let keys = tokeys(x).reshaped([b, hw, h, k]).transposed(1, 2)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
-    .permuted(0, 2, 1, 3)
-  let values = tovalues(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+    .transposed(1, 2)
+  let values = tovalues(x).reshaped([b, hw, h, k]).transposed(1, 2)
   var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * hw, hw])
   dot = dot.softmax()
@@ -90,10 +90,10 @@ func CrossAttention(k: Int, h: Int, b: Int, hw: Int, t: Int) -> Model {
   let tokeys = Dense(count: k * h, noBias: true)
   let toqueries = Dense(count: k * h, noBias: true)
   let tovalues = Dense(count: k * h, noBias: true)
-  let keys = tokeys(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  let keys = tokeys(c).reshaped([b, t, h, k]).transposed(1, 2)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
-    .permuted(0, 2, 1, 3)
-  let values = tovalues(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+    .transposed(1, 2)
+  let values = tovalues(c).reshaped([b, t, h, k]).transposed(1, 2)
   var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * hw, t])
   dot = dot.softmax()
@@ -143,15 +143,15 @@ func SpatialTransformer(
 ) -> Model {
   let x = Input()
   let c = Input()
-  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  let norm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-6, reduce: [1, 2])
   var out = norm(x)
-  let projIn = Convolution(groups: 1, filters: k * h, filterSize: [1, 1])
+  let projIn = Convolution(groups: 1, filters: k * h, filterSize: [1, 1], format: .NCHW)
   let hw = height * width
-  out = projIn(out).reshaped([b, k * h, hw]).permuted(0, 2, 1)
+  out = projIn(out).reshaped([b, hw, k * h])
   let block = BasicTransformerBlock(
     k: k, h: h, b: b, hw: hw, t: t, intermediateSize: intermediateSize)
-  out = block(out, c).reshaped([b, height, width, k * h]).permuted(0, 3, 1, 2)
-  let projOut = Convolution(groups: 1, filters: ch, filterSize: [1, 1])
+  out = block(out, c).reshaped([b, height, width, k * h])
+  let projOut = Convolution(groups: 1, filters: ch, filterSize: [1, 1], format: .NCHW)
   out = projOut(out) + x
   return Model([x, c], [out])
 }
@@ -204,7 +204,7 @@ func InputBlocks(
 ) -> ([Model.IO], Model.IO) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW)
   var out = conv2d(x)
   var layerStart = 1
   var height = startHeight
@@ -232,7 +232,7 @@ func InputBlocks(
     if i != channels.count - 1 {
       let downsample = Convolution(
         groups: 1, filters: channel, filterSize: [3, 3],
-        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [0, 0])))
+        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [0, 0])), format: .NCHW)
       out = downsample(out)
       passLayers.append(out)
       height = height / 2
@@ -272,7 +272,7 @@ func OutputBlocks(
     let ds = dss[i]
     let attentionBlock = attentionRes.contains(ds)
     for j in 0..<(numRepeat + 1) {
-      out = Concat(axis: 1)(out, inputs[inputIdx])
+      out = Concat(axis: 3)(out, inputs[inputIdx])
       inputIdx -= 1
       let outputLayer = BlockLayer(
         prefix: "output_blocks",
@@ -288,7 +288,8 @@ func OutputBlocks(
         out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
         let conv2d = Convolution(
           groups: 1, filters: channel, filterSize: [3, 3],
-          hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+          hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW
+        )
         out = conv2d(out)
       }
       layerStart += 1
@@ -321,12 +322,12 @@ public func UNet(batchSize: Int, startWidth: Int, startHeight: Int) -> Model {
     startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
     inputs: inputs)
   out = outputBlocks
-  let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  let outNorm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
   out = outNorm(out)
   out = out.swish()
   let outConv2d = Convolution(
     groups: 1, filters: 4, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW)
   out = outConv2d(out)
   return Model([x, t_emb, c], [out])
 }

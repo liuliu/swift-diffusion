@@ -41,29 +41,29 @@ func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> (
 ) {
   let x = Input()
   let emb = Input()
-  let inLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  let inLayerNorm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
   var out = inLayerNorm(x)
   out = Swish()(out)
   let inLayerConv2d = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW)
   out = inLayerConv2d(out)
   let embLayer = Dense(count: outChannels)
   var embOut = Swish()(emb)
-  embOut = embLayer(embOut).reshaped([b, outChannels, 1, 1])
+  embOut = embLayer(embOut).reshaped([b, 1, 1, outChannels])
   out = out + embOut
-  let outLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  let outLayerNorm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
   out = outLayerNorm(out)
   out = Swish()(out)
   // Dropout if needed in the future (for training).
   let outLayerConv2d = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW)
   var skipModel: Model? = nil
   if skipConnection {
     let skip = Convolution(
       groups: 1, filters: outChannels, filterSize: [1, 1],
-      hint: Hint(stride: [1, 1]))
+      hint: Hint(stride: [1, 1]), format: .NCHW)
     out = skip(x) + outLayerConv2d(out)  // This layer should be zero init if training.
     skipModel = skip
   } else {
@@ -163,17 +163,17 @@ func SpatialTransformer(
 ) {
   let x = Input()
   let c = Input()
-  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  let norm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-6, reduce: [1, 2])
   var out = norm(x)
-  let projIn = Convolution(groups: 1, filters: k * h, filterSize: [1, 1])
+  let projIn = Convolution(groups: 1, filters: k * h, filterSize: [1, 1], format: .NCHW)
   let hw = height * width
-  out = projIn(out).reshaped([b, k * h, hw]).permuted(0, 2, 1)
+  out = projIn(out).reshaped([b, hw, k * h])
   let (
     layerNorm1, tokeys1, toqueries1, tovalues1, unifyheads1, layerNorm2, tokeys2, toqueries2,
     tovalues2, unifyheads2, layerNorm3, fc10, fc11, fc2, block
   ) = BasicTransformerBlock(k: k, h: h, b: b, hw: hw, t: t, intermediateSize: intermediateSize)
-  out = block(out, c).reshaped([b, height, width, k * h]).permuted(0, 3, 1, 2)
-  let projOut = Convolution(groups: 1, filters: ch, filterSize: [1, 1])
+  out = block(out, c).reshaped([b, height, width, k * h])
+  let projOut = Convolution(groups: 1, filters: ch, filterSize: [1, 1], format: .NCHW)
   out = projOut(out) + x
   return (
     norm, projIn, layerNorm1, tokeys1, toqueries1, tovalues1, unifyheads1, layerNorm2, tokeys2,
@@ -608,7 +608,7 @@ func InputBlocks(
 ) -> ((PythonObject) -> Void, [Model.IO], Model.IO) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW)
   var out = conv2d(x)
   var layerStart = 1
   var height = startHeight
@@ -638,7 +638,7 @@ func InputBlocks(
     if i != channels.count - 1 {
       let downsample = Convolution(
         groups: 1, filters: channel, filterSize: [3, 3],
-        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [0, 0])))
+        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [0, 0])), format: .NCHW)
       out = downsample(out)
       passLayers.append(out)
       let downLayer = layerStart
@@ -696,7 +696,7 @@ func OutputBlocks(
     let ds = dss[i]
     let attentionBlock = attentionRes.contains(ds)
     for j in 0..<(numRepeat + 1) {
-      out = Concat(axis: 1)(out, inputs[inputIdx])
+      out = Concat(axis: 3)(out, inputs[inputIdx])
       inputIdx -= 1
       let (reader, outputLayer) = BlockLayer(
         prefix: "output_blocks",
@@ -713,7 +713,8 @@ func OutputBlocks(
         out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
         let conv2d = Convolution(
           groups: 1, filters: channel, filterSize: [3, 3],
-          hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+          hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW
+        )
         out = conv2d(out)
         let upLayer = layerStart
         let convIdx = attentionBlock ? 2 : 1
@@ -762,12 +763,12 @@ func UNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
     startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
     inputs: inputs)
   out = outputBlocks
-  let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  let outNorm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
   out = outNorm(out)
   out = Swish()(out)
   let outConv2d = Convolution(
     groups: 1, filters: 4, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .NCHW)
   out = outConv2d(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let time_embed_0_weight = state_dict["diffusion_model.time_embed.0.weight"].numpy()
@@ -820,7 +821,17 @@ let graph = DynamicGraph()
 let t_emb = graph.variable(
   timeEmbedding(timesteps: 981, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
 ).toGPU(0)
-let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
+var xT = Tensor<Float>(.CPU, .NHWC(2, 64, 64, 4))
+for i in 0..<2 {
+  for y in 0..<64 {
+    for j in 0..<64 {
+      for k in 0..<4 {
+        xT[i, y, j, k] = Float(x[i, k, y, j])!
+      }
+    }
+  }
+}
+let xTensor = graph.variable(xT).toGPU(0)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
 let (reader, unet) = UNet(batchSize: 2)
 graph.workspaceSize = 1_024 * 1_024 * 1_024
@@ -836,7 +847,7 @@ graph.withNoGrad {
       let y = j < 3 ? j : 58 + j
       for k in 0..<6 {
         let z = k < 3 ? k : 58 + k
-        print("0 \(x) \(y) \(z) \(attnOutCPU[0, x, y, z])")
+        print("0 \(x) \(y) \(z) \(attnOutCPU[0, y, z, x])")
       }
     }
   }
@@ -846,7 +857,7 @@ graph.withNoGrad {
       let y = j < 3 ? j : 58 + j
       for k in 0..<6 {
         let z = k < 3 ? k : 58 + k
-        print("1 \(x) \(y) \(z) \(attnOutCPU[1, x, y, z])")
+        print("1 \(x) \(y) \(z) \(attnOutCPU[1, y, z, x])")
       }
     }
   }

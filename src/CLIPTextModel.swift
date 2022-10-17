@@ -22,10 +22,10 @@ func CLIPAttention(k: Int, h: Int, b: Int, t: Int) -> Model {
   let tokeys = Dense(count: k * h)
   let toqueries = Dense(count: k * h)
   let tovalues = Dense(count: k * h)
-  let keys = tokeys(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  let keys = tokeys(x).reshaped([b, t, h, k]).transposed(1, 2)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t, h, k])
-    .permuted(0, 2, 1, 3)
-  let values = tovalues(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+    .transposed(1, 2)
+  let values = tovalues(x).reshaped([b, t, h, k]).transposed(1, 2)
   var dot = Matmul(transposeB: (2, 3))(queries, keys) + casualAttentionMask
   dot = dot.reshaped([b * h * t, t])
   dot = dot.softmax()

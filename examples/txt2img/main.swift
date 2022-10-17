@@ -110,10 +110,10 @@ graph.withNoGrad {
     inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
       of: UseFloatingPoint.self
     ).reshaped(.CHW(2, 77, 768))
-  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+  let x_T = graph.variable(.GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
   x_T.randn(std: 1, mean: 0)
   var x = x_T
-  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+  var xIn = graph.variable(.GPU(0), .NHWC(2, startHeight, startWidth, 4), of: UseFloatingPoint.self)
   unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts[0])), c)
   decoder.compile(inputs: x)
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
@@ -129,17 +129,17 @@ graph.withNoGrad {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
     let t = graph.variable(Tensor<UseFloatingPoint>(from: ts[i]))
     let tNext = Tensor<UseFloatingPoint>(from: ts[min(i + 1, ts.count - 1)])
-    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
-    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
+    xIn[0..<1, 0..<startHeight, 0..<startWidth, 0..<4] = x
+    xIn[1..<2, 0..<startHeight, 0..<startWidth, 0..<4] = x
     var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
     var etUncond = graph.variable(
-      .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+      .GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
     var etCond = graph.variable(
-      .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-    etUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-      et[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
-    etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-      et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
+      .GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
+    etUncond[0..<1, 0..<startHeight, 0..<startWidth, 0..<4] =
+      et[0..<1, 0..<startHeight, 0..<startWidth, 0..<4]
+    etCond[0..<1, 0..<startHeight, 0..<startWidth, 0..<4] =
+      et[1..<2, 0..<startHeight, 0..<startWidth, 0..<4]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
     let alpha = alphasCumprod[timestep]
     let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
@@ -148,17 +148,17 @@ graph.withNoGrad {
     case 0:
       let (xPrev, _) = xPrevAndPredX0(x: x, et: et, alpha: alpha, alphaPrev: alphaPrev)
       // Compute etNext.
-      xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
-      xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
+      xIn[0..<1, 0..<startHeight, 0..<startWidth, 0..<4] = xPrev
+      xIn[1..<2, 0..<startHeight, 0..<startWidth, 0..<4] = xPrev
       var etNext = unet(inputs: xIn, graph.variable(tNext), c)[0].as(of: UseFloatingPoint.self)
       var etNextUncond = graph.variable(
-        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+        .GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
       var etNextCond = graph.variable(
-        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-      etNextUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-        etNext[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
-      etNextCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-        etNext[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
+        .GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
+      etNextUncond[0..<1, 0..<startHeight, 0..<startWidth, 0..<4] =
+        etNext[0..<1, 0..<startHeight, 0..<startWidth, 0..<4]
+      etNextCond[0..<1, 0..<startHeight, 0..<startWidth, 0..<4] =
+        etNext[1..<2, 0..<startHeight, 0..<startWidth, 0..<4]
       etNext = etNextUncond + unconditionalGuidanceScale * (etNextCond - etNextUncond)
       etPrime = 0.5 * (et + etNext)
     case 1:
@@ -187,7 +187,7 @@ graph.withNoGrad {
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
   for y in 0..<startHeight * 8 {
     for x in 0..<startWidth * 8 {
-      let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
+      let (r, g, b) = (img[0, y, x, 0], img[0, y, x, 1], img[0, y, x, 2])
       rgba[y * startWidth * 8 + x].r = UInt8(
         min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
       rgba[y * startWidth * 8 + x].g = UInt8(
