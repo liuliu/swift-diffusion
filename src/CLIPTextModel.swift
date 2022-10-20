@@ -24,7 +24,7 @@ func CLIPAttention(k: Int, h: Int, b: Int, t: Int) -> Model {
   let tovalues = Dense(count: k * h)
   let keys = tokeys(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t, h, k])
-    .transposed(1, 2)
+    .permuted(0, 2, 1, 3)
   let values = tovalues(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   var dot = Matmul(transposeB: (2, 3))(queries, keys) + casualAttentionMask
   dot = dot.reshaped([b * h * t, t])

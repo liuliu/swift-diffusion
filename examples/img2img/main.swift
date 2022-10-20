@@ -108,7 +108,7 @@ graph.withNoGrad {
   let tokensTensorGPU = tokensTensor.toGPU(0)
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
-  let _ = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
+  textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("text_model", model: textModel)
   }
@@ -120,10 +120,10 @@ graph.withNoGrad {
   noise.randn(std: 1, mean: 0)
   var x = noise
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-  let _ = unet(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts[0])), c)
-  let _ = decoder(inputs: x)
+  unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts[0])), c)
+  decoder.compile(inputs: x)
   let initImg = graph.variable(initImg.toGPU(0))
-  let _ = encoder(inputs: initImg)
+  encoder.compile(inputs: initImg)
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
