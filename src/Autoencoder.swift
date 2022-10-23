@@ -90,8 +90,8 @@ public func Encoder(
         groups: 1, filters: channel, filterSize: [3, 3],
         hint: Hint(stride: [2, 2], border: Hint.Border(begin: [2, 2], end: [1, 1])), format: .NCHW)
       out = conv2d(out).reshaped(
-        [batchSize, channel, height, width], offset: [0, 0, 1, 1],
-        strides: [channel * (height + 1) * (width + 1), (height + 1) * (width + 1), width + 1, 1])
+        [batchSize, height, width, channel], offset: [0, 1, 1, 0],
+        strides: [channel * (height + 1) * (width + 1), (width + 1) * channel, channel, 1])
     }
   }
   let midBlock1 = ResnetBlock(

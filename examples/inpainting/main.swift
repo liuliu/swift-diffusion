@@ -40,6 +40,7 @@ extension DiffusionModel {
 }
 
 DynamicGraph.setSeed(38)
+DynamicGraph.memoryEfficient = true
 
 let unconditionalGuidanceScale: Float = 10
 let scaleFactor: Float = 0.18215
@@ -55,14 +56,14 @@ let text =
   CommandLine.arguments.count > 2
   ? CommandLine.arguments.suffix(from: 2).joined(separator: " ") : ""
 
-var initImg = Tensor<UseFloatingPoint>(.CPU, .NCHW(1, 3, startHeight * 8, startWidth * 8))
-var initMask = Tensor<UseFloatingPoint>(.CPU, .NCHW(1, 1, startHeight, startWidth))
+var initImg = Tensor<UseFloatingPoint>(.CPU, .NHWC(1, startHeight * 8, startWidth * 8, 3))
+var initMask = Tensor<UseFloatingPoint>(.CPU, .NHWC(1, startHeight, startWidth, 1))
 var initImage = ccv_dense_matrix_new(
   Int32(startHeight * 8), Int32(startWidth * 8), Int32(CCV_8U | CCV_C3), nil, 0)!
 if let image = try PNG.Data.Rectangular.decompress(path: workDir + "/init_inpainting.png") {
   for y in 0..<startHeight {
     for x in 0..<startWidth {
-      initMask[0, 0, y, x] = 0
+      initMask[0, y, x, 0] = 0
     }
   }
   let rgba = image.unpack(as: PNG.RGBA<UInt8>.self)
@@ -70,17 +71,17 @@ if let image = try PNG.Data.Rectangular.decompress(path: workDir + "/init_inpain
     for x in 0..<startWidth * 8 {
       let pixel = rgba[y * startWidth * 8 + x]
       if pixel.g == 255 && pixel.r == 0 && pixel.b == 0 {
-        initMask[0, 0, y / 8, x / 8] = 1
-        initImg[0, 0, y, x] = 0
-        initImg[0, 1, y, x] = 0
-        initImg[0, 2, y, x] = 0
+        initMask[0, y / 8, x / 8, 0] = 1
+        initImg[0, y, x, 0] = 0
+        initImg[0, y, x, 1] = 0
+        initImg[0, y, x, 2] = 0
         initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3] = 123
         initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 1] = 117
         initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 2] = 104
       } else {
-        initImg[0, 0, y, x] = UseFloatingPoint(Float(pixel.r) / 255 * 2 - 1)
-        initImg[0, 1, y, x] = UseFloatingPoint(Float(pixel.g) / 255 * 2 - 1)
-        initImg[0, 2, y, x] = UseFloatingPoint(Float(pixel.b) / 255 * 2 - 1)
+        initImg[0, y, x, 0] = UseFloatingPoint(Float(pixel.r) / 255 * 2 - 1)
+        initImg[0, y, x, 1] = UseFloatingPoint(Float(pixel.g) / 255 * 2 - 1)
+        initImg[0, y, x, 2] = UseFloatingPoint(Float(pixel.b) / 255 * 2 - 1)
         initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3] = pixel.r
         initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 1] = pixel.g
         initImage.pointee.data.u8[y * startWidth * 8 * 3 + x * 3 + 2] = pixel.b
@@ -90,7 +91,7 @@ if let image = try PNG.Data.Rectangular.decompress(path: workDir + "/init_inpain
 }
 
 let vit: Model?
-var vitImg = Tensor<UseFloatingPoint>(.CPU, .NCHW(1, 3, 224, 224))
+var vitImg = Tensor<UseFloatingPoint>(.CPU, .NHWC(1, 3, 224, 224))
 if text == "" {
   vit = VisionTransformer(
     grid: 16, width: 1024, outputDim: 768, layers: 24, heads: 16, batchSize: 1)
@@ -167,10 +168,10 @@ graph.withNoGrad {
     of: UseFloatingPoint.self
   ).reshaped(.CHW(2, 77, 768))
   let noise = graph.variable(
-    .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+    .GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
   noise.randn(std: 1, mean: 0)
   var x = noise
-  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+  var xIn = graph.variable(.GPU(0), .NHWC(2, startHeight, startWidth, 4), of: UseFloatingPoint.self)
   unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts[0])), c)
   decoder.compile(inputs: x)
   let initImg = graph.variable(initImg.toGPU(0))
@@ -201,11 +202,11 @@ graph.withNoGrad {
     }
   }
   let parameters = encoder(inputs: initImg)[0].as(of: UseFloatingPoint.self)
-  let mean = parameters[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
-  let logvar = parameters[0..<1, 4..<8, 0..<startHeight, 0..<startWidth].clamped(-30...20)
+  let mean = parameters[0..<1, 0..<startHeight, 0..<startWidth, 0..<4]
+  let logvar = parameters[0..<1, 0..<startHeight, 0..<startWidth, 4..<8].copied().clamped(-30...20)
   let initMask = graph.variable(initMask.toGPU(0))
   let std = Functional.exp(0.5 * logvar) .* initMask
-  let n = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+  let n = graph.variable(.GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
   n.randn(std: 1, mean: 0)
   let sample = scaleFactor * (mean + std .* n)
   let alphasCumprod = model.alphasCumprod
@@ -215,7 +216,7 @@ graph.withNoGrad {
   let sqrtAlphasCumprod = alphasCumprod[initTimestep].squareRoot()
   let sqrtOneMinusAlphasCumprod = (1 - alphasCumprod[initTimestep]).squareRoot()
   var initNegMask = graph.variable(
-    .GPU(0), .NCHW(1, 1, startHeight, startWidth), of: UseFloatingPoint.self)
+    .GPU(0), .NHWC(1, startHeight, startWidth, 1), of: UseFloatingPoint.self)
   initNegMask.full(1)
   initNegMask = initNegMask - initMask
   let zEnc = sqrtAlphasCumprod * sample + sqrtOneMinusAlphasCumprod * noise
@@ -225,17 +226,17 @@ graph.withNoGrad {
   for i in (model.steps - tEnc)..<model.steps {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
     let t = graph.variable(Tensor<UseFloatingPoint>(from: ts[i]))
-    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
-    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
+    xIn[0..<1, 0..<startHeight, 0..<startWidth, 0..<4] = x
+    xIn[1..<2, 0..<startHeight, 0..<startWidth, 0..<4] = x
     var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
     var etUncond = graph.variable(
-      .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+      .GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
     var etCond = graph.variable(
-      .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-    etUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-      et[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
-    etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-      et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
+      .GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
+    etUncond[0..<1, 0..<startHeight, 0..<startWidth, 0..<4] =
+      et[0..<1, 0..<startHeight, 0..<startWidth, 0..<4]
+    etCond[0..<1, 0..<startHeight, 0..<startWidth, 0..<4] =
+      et[1..<2, 0..<startHeight, 0..<startWidth, 0..<4]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
     let alpha = alphasCumprod[timestep]
     let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
@@ -258,7 +259,7 @@ graph.withNoGrad {
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
   for y in 0..<startHeight * 8 {
     for x in 0..<startWidth * 8 {
-      let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
+      let (r, g, b) = (img[0, y, x, 0], img[0, y, x, 1], img[0, y, x, 2])
       rgba[y * startWidth * 8 + x].r = UInt8(
         min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
       rgba[y * startWidth * 8 + x].g = UInt8(
