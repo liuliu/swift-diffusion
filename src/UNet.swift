@@ -163,18 +163,16 @@ func BlockLayer(
 ) -> Model {
   let x = Input()
   let emb = Input()
-  let c = Input()
   precondition(channels % numHeads == 0)
   let k = channels / numHeads
   let resBlock = ResBlock(b: batchSize, outChannels: channels, skipConnection: skipConnection)
   var out = resBlock(x, emb)
   if attentionBlock {
+    let c = Input()
     let transformer = SpatialTransformer(
       ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, t: embeddingSize,
       intermediateSize: channels * 4)
     out = transformer(out, c)
-  }
-  if attentionBlock {
     return Model([x, emb, c], [out])
   } else {
     return Model([x, emb], [out])
