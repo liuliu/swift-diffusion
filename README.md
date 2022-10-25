@@ -30,7 +30,7 @@ There are quite a bit of setup right now. It would help if I move to support Swi
 
 First, after checking out this repository to your local storage, you need to install Bazel and various dependencies for s4nnc. To install Bazel, follow: https://bazel.build/install.
 
-You also need to download the model. I put the Stable Diffusion v1.4 model in http://static.libccv.org/sd-v1.4.ckpt. Note that this is a s4nnc-compatible file, not PyTorch one you download elsewhere. You can check related examples for how this file is generated.
+You also need to download the model. I put the Stable Diffusion v1.4 model in https://static.libnnc.org/sd-v1.4.ckpt. Note that this is a s4nnc-compatible file, not PyTorch one you download elsewhere. You can check related examples for how this file is generated.
 
 ### Linux
 
