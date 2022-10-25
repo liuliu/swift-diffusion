@@ -32,7 +32,8 @@ extension DiffusionModel {
   }
 }
 
-DynamicGraph.setSeed(40)
+let seed = UInt32.random(in: UInt32.min...UInt32.max)
+DynamicGraph.setSeed(seed)
 DynamicGraph.memoryEfficient = true
 
 let unconditionalGuidanceScale: Float = 7.5
@@ -106,12 +107,18 @@ graph.withNoGrad {
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("text_model", model: textModel)
   }
+  graph.openStore(workDir + "/runtime-data-\(seed).dbg") {
+    $0.write("tokens", variable: tokensTensor)
+  }
   let c: DynamicGraph.AnyTensor = textModel(
     inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
       of: UseFloatingPoint.self
     ).reshaped(.CHW(2, 77, 768))
   let x_T = graph.variable(.GPU(0), .NHWC(1, startHeight, startWidth, 4), of: UseFloatingPoint.self)
   x_T.randn(std: 1, mean: 0)
+  graph.openStore(workDir + "/runtime-data-\(seed).dbg") {
+    $0.write("x_T", variable: x_T)
+  }
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NHWC(2, startHeight, startWidth, 4), of: UseFloatingPoint.self)
   unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts[0])), c)
@@ -200,4 +207,5 @@ graph.withNoGrad {
     packing: rgba, size: (startWidth * 8, startHeight * 8),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
   try! image.compress(path: workDir + "/txt2img.png", level: 4)
+  try? FileManager.default.removeItem(atPath: workDir + "/runtime-data-\(seed).dbg")
 }
