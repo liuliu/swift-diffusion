@@ -51,7 +51,7 @@ let tokenizer = CLIPTokenizer(
   vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
 
 let workDir = CommandLine.arguments[1]
-let text =
+var text =
   CommandLine.arguments.count > 2
   ? CommandLine.arguments.suffix(from: 2).joined(separator: " ") : ""
 
@@ -89,29 +89,6 @@ if let image = try PNG.Data.Rectangular.decompress(path: workDir + "/init_inpain
   }
 }
 
-let vit: Model?
-var vitImg = Tensor<UseFloatingPoint>(.CPU, .NCHW(1, 3, 224, 224))
-if text == "" {
-  vit = VisionTransformer(
-    grid: 16, width: 1024, outputDim: 768, layers: 24, heads: 16, batchSize: 1)
-  var vitImage: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
-  ccv_resample(initImage, &vitImage, 0, 224, 224, Int32(CCV_INTER_AREA))
-  if let vitImage = vitImage {
-    for y in 0..<224 {
-      for x in 0..<224 {
-        let r = vitImage.pointee.data.u8[y * 224 * 3 + x * 3]
-        let g = vitImage.pointee.data.u8[y * 224 * 3 + x * 3 + 1]
-        let b = vitImage.pointee.data.u8[y * 224 * 3 + x * 3 + 2]
-        vitImg[0, 0, y, x] = UseFloatingPoint((Float(r) / 255 - 0.48145466) / 0.26862954)
-        vitImg[0, 1, y, x] = UseFloatingPoint((Float(g) / 255 - 0.4578275) / 0.26130258)
-        vitImg[0, 2, y, x] = UseFloatingPoint((Float(b) / 255 - 0.40821073) / 0.27577711)
-      }
-    }
-  }
-} else {
-  vit = nil
-}
-
 let unconditionalTokens = tokenizer.tokenize(text: "", truncation: true, maxLength: 77)
 let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
 
@@ -126,7 +103,7 @@ let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 for i in 0..<77 {
   tokensTensor[i] = unconditionalTokens[i]
-  tokensTensor[i + 77] = text == "" && i == 0 ? 49406 : tokens[i]
+  tokensTensor[i + 77] = tokens[i]
   positionTensor[i] = Int32(i)
   positionTensor[i + 77] = Int32(i)
 }
@@ -163,42 +140,24 @@ graph.withNoGrad {
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("text_model", model: textModel)
   }
-  var c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
+  let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
     of: UseFloatingPoint.self
   ).reshaped(.CHW(2, 77, 768))
   let noise = graph.variable(
     .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   noise.randn(std: 1, mean: 0)
   var x = noise
-  var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+  var xIn = graph.variable(.GPU(0), .NCHW(2, 9, startHeight, startWidth), of: UseFloatingPoint.self)
   unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts[0])), c)
   decoder.compile(inputs: x)
   let initImg = graph.variable(initImg.toGPU(0))
   encoder.compile(inputs: initImg)
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
-    $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
     $0.read("encoder", model: encoder)
   }
-  if let vit = vit {
-    let vitImg = graph.variable(vitImg.toGPU(0))
-    let classEmbedding = graph.variable(.GPU(0), .CHW(1, 1, 1024), of: UseFloatingPoint.self)
-    let positionalEmbedding = graph.variable(
-      .GPU(0), .CHW(1, 16 * 16 + 1, 1024), of: UseFloatingPoint.self)
-    let inverseProj = graph.variable(.GPU(0), .NC(768, 768), of: UseFloatingPoint.self)
-    let _ = vit(inputs: vitImg, classEmbedding, positionalEmbedding)
-    graph.openStore(workDir + "/image_model.ckpt") {
-      $0.read("vit", model: vit)
-      $0.read("class_embedding", variable: classEmbedding)
-      $0.read("positional_embedding", variable: positionalEmbedding)
-      $0.read("inverse_proj", variable: inverseProj)
-    }
-    let out = vit(inputs: vitImg, classEmbedding, positionalEmbedding)[0].as(
-      of: UseFloatingPoint.self)
-    let inversed = 0.0001 * (out.reshaped(.NC(1, 768)) * inverseProj)
-    for i in 1..<76 {
-      c[1..<2, i..<(i + 1), 0..<768] = inversed.reshaped(.CHW(1, 1, 768))
-    }
+  graph.openStore(workDir + "/sd-v1.5-inpainting.ckpt") {
+    $0.read("unet", model: unet)
   }
   let parameters = encoder(inputs: initImg)[0].as(of: UseFloatingPoint.self)
   let mean = parameters[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
@@ -218,6 +177,7 @@ graph.withNoGrad {
     .GPU(0), .NCHW(1, 1, startHeight, startWidth), of: UseFloatingPoint.self)
   initNegMask.full(1)
   initNegMask = initNegMask - initMask
+  let maskedImg = scaleFactor * mean
   let zEnc = sqrtAlphasCumprod * sample + sqrtOneMinusAlphasCumprod * noise
   x = zEnc .* initNegMask + noise .* initMask
   DynamicGraph.setProfiler(true)
@@ -226,7 +186,11 @@ graph.withNoGrad {
     let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
     let t = graph.variable(Tensor<UseFloatingPoint>(from: ts[i]))
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
+    xIn[0..<1, 4..<5, 0..<startHeight, 0..<startWidth] = initMask
+    xIn[0..<1, 5..<9, 0..<startHeight, 0..<startWidth] = maskedImg
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
+    xIn[1..<2, 4..<5, 0..<startHeight, 0..<startWidth] = initMask
+    xIn[1..<2, 5..<9, 0..<startHeight, 0..<startWidth] = maskedImg
     var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
