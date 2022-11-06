@@ -70,10 +70,10 @@ let unconditionalGuidanceScale: Float = 7.5
 let scaleFactor: Float = 0.18215
 let startWidth: Int = 64
 let startHeight: Int = 64
-let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 20)
-let sigmas = model.sigmas(0.1...10)
+let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 30)
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
+let sigmas = model.sigmas(sigmasForTimesteps[1]...sigmasForTimesteps[998])
 let tokenizer = CLIPTokenizer(
   vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
 
