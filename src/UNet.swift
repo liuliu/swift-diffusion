@@ -23,6 +23,26 @@ public func timeEmbedding(timestep: Int, batchSize: Int, embeddingSize: Int, max
   return embedding
 }
 
+public func timeEmbedding(timestep: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int)
+  -> Tensor<
+    Float
+  >
+{
+  precondition(embeddingSize % 2 == 0)
+  var embedding = Tensor<Float>(.CPU, .NC(batchSize, embeddingSize))
+  let half = embeddingSize / 2
+  for i in 0..<half {
+    let freq: Float = exp(-log(Float(maxPeriod)) * Float(i) / Float(half)) * timestep
+    let cosFreq = cos(freq)
+    let sinFreq = sin(freq)
+    for j in 0..<batchSize {
+      embedding[j, i] = cosFreq
+      embedding[j, i + half] = sinFreq
+    }
+  }
+  return embedding
+}
+
 func TimeEmbed(modelChannels: Int) -> Model {
   let x = Input()
   let fc0 = Dense(count: modelChannels * 4)

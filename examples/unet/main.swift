@@ -798,14 +798,14 @@ numpy.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-let x = torch.randn([2, 9, 64, 64])
+let x = torch.randn([2, 4, 64, 64])
 let t = torch.full([1], 981)
 let c = torch.randn([2, 77, 768])
 
 let config = omegaconf.OmegaConf.load(
-  "/home/liu/workspace/stable-diffusion/configs/stable-diffusion/v1-inpainting.yaml")
+  "/home/liu/workspace/stable-diffusion/configs/stable-diffusion/v1-inference.yaml")
 let pl_sd = torch.load(
-  "/home/liu/workspace/stable-diffusion/models/ldm/stable-diffusion-v1/sd-v1-5-inpainting.ckpt",
+  "/home/liu/workspace/stable-diffusion/models/ldm/stable-diffusion-v1/Cyberpunk-Anime-Diffusion.ckpt",
   map_location: "cpu")
 let sd = pl_sd["state_dict"]
 let model = ldm_util.instantiate_from_config(config.model)

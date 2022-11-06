@@ -30,6 +30,37 @@ extension DiffusionModel {
       return cumprod
     }
   }
+  // This is Karras scheduler sigmas.
+  public func sigmas(_ range: ClosedRange<Float>, rho: Float = 7.0) -> [Float] {
+    let minInvRho = pow(range.lowerBound, 1.0 / rho)
+    let maxInvRho = pow(range.upperBound, 1.0 / rho)
+    var sigmas = [Float]()
+    for i in 0..<steps {
+      sigmas.append(pow(maxInvRho + Float(i) * (minInvRho - maxInvRho) / Float(steps - 1), rho))
+    }
+    sigmas.append(0)
+    return sigmas
+  }
+
+  public static func sigmas(from alphasCumprod: [Float]) -> [Float] {
+    return alphasCumprod.map { ((1 - $0) / $0).squareRoot() }
+  }
+
+  public static func timestep(from sigma: Float, sigmas: [Float]) -> Float {
+    // Find in between which sigma resides.
+    var highIdx: Int = sigmas.count
+    for (i, s) in sigmas.enumerated() {
+      if sigma < s {
+        highIdx = i
+        break
+      }
+    }
+    let low = log(sigmas[highIdx - 1])
+    let high = log(sigmas[highIdx])
+    let logSigma = log(sigma)
+    let w = min(max((low - logSigma) / (low - high), 0), 1)
+    return (1.0 - w) * Float(highIdx - 1) + w * Float(highIdx)
+  }
 }
 
 DynamicGraph.setSeed(40)
@@ -39,7 +70,10 @@ let unconditionalGuidanceScale: Float = 7.5
 let scaleFactor: Float = 0.18215
 let startWidth: Int = 64
 let startHeight: Int = 64
-let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 50)
+let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 20)
+let sigmas = model.sigmas(0.1...10)
+let alphasCumprod = model.alphasCumprod
+let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
 let tokenizer = CLIPTokenizer(
   vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
 
@@ -75,26 +109,10 @@ for i in 0..<76 {
   }
 }
 
-var ts = [Tensor<Float>]()
-for i in 0..<model.steps {
-  let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
-  ts.append(
-    timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0))
-}
 let unet = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
 let decoder = Decoder(
   channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
   startHeight: startHeight)
-
-func xPrevAndPredX0(
-  x: DynamicGraph.Tensor<UseFloatingPoint>, et: DynamicGraph.Tensor<UseFloatingPoint>, alpha: Float,
-  alphaPrev: Float
-) -> (DynamicGraph.Tensor<UseFloatingPoint>, DynamicGraph.Tensor<UseFloatingPoint>) {
-  let predX0 = (1 / alpha.squareRoot()) * (x - (1 - alpha).squareRoot() * et)
-  let dirXt = (1 - alphaPrev).squareRoot() * et
-  let xPrev = alphaPrev.squareRoot() * predX0 + dirXt
-  return (xPrev, predX0)
-}
 
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 
@@ -114,23 +132,28 @@ graph.withNoGrad {
   x_T.randn(std: 1, mean: 0)
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-  unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts[0])), c)
+  let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
+  unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts)), c)
   decoder.compile(inputs: x)
   graph.openStore(workDir + "/sd-v1.4.ckpt") {
     $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
   }
-  let alphasCumprod = model.alphasCumprod
-  var oldEps = [DynamicGraph.Tensor<UseFloatingPoint>]()
+  var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil
   let startTime = Date()
   DynamicGraph.setProfiler(true)
-  // Now do PLMS sampling.
+  // Now do DPM++ 2M Karras sampling. (DPM++ 2S a Karras requires two denoising per step, not ideal for my use case).
+  x = sigmas[0] * x
   for i in 0..<model.steps {
-    let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
-    let t = graph.variable(Tensor<UseFloatingPoint>(from: ts[i]))
-    let tNext = Tensor<UseFloatingPoint>(from: ts[min(i + 1, ts.count - 1)])
-    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
-    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
+    let sigma = sigmas[i]
+    let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
+    let ts = timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
+      .toGPU(0)
+    let t = graph.variable(Tensor<UseFloatingPoint>(from: ts))
+    let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
+    let cOut = -sigma
+    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
+    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
@@ -141,44 +164,20 @@ graph.withNoGrad {
     etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
       et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
-    let alpha = alphasCumprod[timestep]
-    let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
-    let etPrime: DynamicGraph.Tensor<UseFloatingPoint>
-    switch oldEps.count {
-    case 0:
-      let (xPrev, _) = xPrevAndPredX0(x: x, et: et, alpha: alpha, alphaPrev: alphaPrev)
-      // Compute etNext.
-      xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
-      xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = xPrev
-      var etNext = unet(inputs: xIn, graph.variable(tNext), c)[0].as(of: UseFloatingPoint.self)
-      var etNextUncond = graph.variable(
-        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-      var etNextCond = graph.variable(
-        .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-      etNextUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-        etNext[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
-      etNextCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
-        etNext[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
-      etNext = etNextUncond + unconditionalGuidanceScale * (etNextCond - etNextUncond)
-      etPrime = 0.5 * (et + etNext)
-    case 1:
-      etPrime = 0.5 * (3 * et - oldEps[0])
-    case 2:
-      etPrime =
-        Float(1) / Float(12) * (Float(23) * et - Float(16) * oldEps[1] + Float(5) * oldEps[0])
-    case 3:
-      etPrime =
-        Float(1) / Float(24)
-        * (Float(55) * et - Float(59) * oldEps[2] + Float(37) * oldEps[1] - Float(9) * oldEps[0])
-    default:
-      fatalError()
+    let denoised = x + cOut * et
+    let h = log(sigmas[i]) - log(sigmas[i + 1])
+    if let oldDenoised = oldDenoised, i < model.steps - 1 {
+      let hLast = log(sigmas[i - 1]) - log(sigmas[i])
+      let r = hLast / h
+      let denoisedD =
+        Float(Float(1) + Float(1) / (2 * r)) * denoised - Float(Float(1) / (2 * r)) * oldDenoised
+      x = (sigmas[i + 1] / sigmas[i]) * x - (exp(-h) - 1) * denoisedD
+    } else if i == model.steps - 1 {
+      x = denoised
+    } else {
+      x = (sigmas[i + 1] / sigmas[i]) * x - (exp(-h) - 1) * denoised
     }
-    let (xPrev, _) = xPrevAndPredX0(x: x, et: etPrime, alpha: alpha, alphaPrev: alphaPrev)
-    x = xPrev
-    oldEps.append(et)
-    if oldEps.count > 3 {
-      oldEps.removeFirst()
-    }
+    oldDenoised = denoised
   }
   let z = 1.0 / scaleFactor * x
   let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: UseFloatingPoint.self))
