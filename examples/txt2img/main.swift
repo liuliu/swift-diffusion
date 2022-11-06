@@ -91,10 +91,10 @@ let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
 // This is for Karras scheduler (used in DPM++ 2M Karras)
-// let sigmas = model.karrasSigmas(sigmasForTimesteps[1]...sigmasForTimesteps[998])
+let sigmas = model.karrasSigmas(sigmasForTimesteps[1]...sigmasForTimesteps[998])
 // This is for Euler Ancestral
-let sigmas = model.fixedStepSigmas(
-  sigmasForTimesteps[0]...sigmasForTimesteps[999], sigmas: sigmasForTimesteps)
+// let sigmas = model.fixedStepSigmas(
+//   sigmasForTimesteps[0]...sigmasForTimesteps[999], sigmas: sigmasForTimesteps)
 let tokenizer = CLIPTokenizer(
   vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
 
@@ -160,7 +160,7 @@ graph.withNoGrad {
     $0.read("unet", model: unet)
     $0.read("decoder", model: decoder)
   }
-  // var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil
+  var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil
   let startTime = Date()
   DynamicGraph.setProfiler(true)
   // Now do DPM++ 2M Karras sampling. (DPM++ 2S a Karras requires two denoising per step, not ideal for my use case).
@@ -172,6 +172,7 @@ graph.withNoGrad {
       .toGPU(0)
     let t = graph.variable(Tensor<UseFloatingPoint>(from: ts))
     let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
+    let cOut = -sigma
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
@@ -184,6 +185,7 @@ graph.withNoGrad {
     etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
       et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
+    /* // Below is the Euler ancestral sampling implementation.
     let sigmaUp = min(
       sigmas[i + 1],
       1.0
@@ -198,22 +200,23 @@ graph.withNoGrad {
     if i < model.steps - 1 {
       x = x + sigmaUp * noise
     }
-    /* // Below is the DPM++ 2M Karras sampling implementation.
+    */
+    // Below is the DPM++ 2M Karras sampling implementation.
     let denoised = x + cOut * et
     let h = log(sigmas[i]) - log(sigmas[i + 1])
     if let oldDenoised = oldDenoised, i < model.steps - 1 {
       let hLast = log(sigmas[i - 1]) - log(sigmas[i])
-      let r = hLast / h
-      let denoisedD =
-        Float(Float(1) + Float(1) / (2 * r)) * denoised - Float(Float(1) / (2 * r)) * oldDenoised
-      x = (sigmas[i + 1] / sigmas[i]) * x - (exp(-h) - 1) * denoisedD
+      let r = (h / hLast) / 2
+      let denoisedD = (1 + r) * denoised - r * oldDenoised
+      let w = sigmas[i + 1] / sigmas[i]
+      x = w * x - (w - 1) * denoisedD
     } else if i == model.steps - 1 {
       x = denoised
     } else {
-      x = (sigmas[i + 1] / sigmas[i]) * x - (exp(-h) - 1) * denoised
+      let w = sigmas[i + 1] / sigmas[i]
+      x = w * x - (w - 1) * denoised
     }
     oldDenoised = denoised
-    */
   }
   let z = 1.0 / scaleFactor * x
   let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: UseFloatingPoint.self))
