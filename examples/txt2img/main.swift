@@ -172,7 +172,6 @@ graph.withNoGrad {
       .toGPU(0)
     let t = graph.variable(Tensor<UseFloatingPoint>(from: ts))
     let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
-    let cOut = -sigma
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
@@ -185,15 +184,14 @@ graph.withNoGrad {
     etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
       et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
-    let d = cOut * et
     let sigmaUp = min(
       sigmas[i + 1],
       1.0
-        * ((sigmas[i + 1] * sigmas[i + 1]) * (sigmas[i] * sigmas[i] - sigmas[i + 1] * sigmas[i + 1])
-        / (sigmas[i] * sigmas[i])).squareRoot())
+        * ((sigmas[i + 1] * sigmas[i + 1]) * (sigma * sigma - sigmas[i + 1] * sigmas[i + 1])
+        / (sigma * sigma)).squareRoot())
     let sigmaDown = (sigmas[i + 1] * sigmas[i + 1] - sigmaUp * sigmaUp).squareRoot()
-    let dt = (sigmaDown - sigmas[i]) / sigmas[i]
-    x = x - dt * d
+    let dt = sigmaDown - sigma  // Notice this is already a negative.
+    x = x + dt * et
     let noise = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
     noise.randn(std: 1, mean: 0)
