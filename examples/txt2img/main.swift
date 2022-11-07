@@ -64,14 +64,24 @@ extension DiffusionModel {
   }
 
   public static func timestep(from sigma: Float, sigmas: [Float]) -> Float {
+    guard sigma > sigmas[0] else {
+      return 0
+    }
+    guard sigma < sigmas[sigmas.count - 1] else {
+      return Float(sigmas.count - 1)
+    }
     // Find in between which sigma resides.
-    var highIdx: Int = sigmas.count
-    for (i, s) in sigmas.enumerated() {
-      if sigma < s {
-        highIdx = i
-        break
+    var highIdx: Int = sigmas.count - 1
+    var lowIdx: Int = 0
+    while lowIdx < highIdx - 1 {
+      let midIdx = lowIdx + (highIdx - lowIdx) / 2
+      if sigma < sigmas[midIdx] {
+        highIdx = midIdx
+      } else {
+        lowIdx = midIdx
       }
     }
+    assert(sigma >= sigmas[highIdx - 1] && sigma <= sigmas[highIdx])
     let low = log(sigmas[highIdx - 1])
     let high = log(sigmas[highIdx])
     let logSigma = log(sigma)
@@ -91,7 +101,7 @@ let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
 // This is for Karras scheduler (used in DPM++ 2M Karras)
-let sigmas = model.karrasSigmas(sigmasForTimesteps[1]...sigmasForTimesteps[998])
+let sigmas = model.karrasSigmas(sigmasForTimesteps[0]...sigmasForTimesteps[999])
 // This is for Euler Ancestral
 // let sigmas = model.fixedStepSigmas(
 //   sigmasForTimesteps[0]...sigmasForTimesteps[999], sigmas: sigmasForTimesteps)
