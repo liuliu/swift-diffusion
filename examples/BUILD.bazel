@@ -45,8 +45,30 @@ swift_binary(
 )
 
 swift_binary(
+    name = "dreambooth",
+    srcs = ["dreambooth/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "encoder",
     srcs = ["encoder/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
+    name = "realesrgan",
+    srcs = ["realesrgan/main.swift"],
     deps = [
         "@PythonKit",
         "@SwiftNumerics//:Numerics",
