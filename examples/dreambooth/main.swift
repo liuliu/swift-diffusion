@@ -950,7 +950,7 @@ let t = torch.full([1], 981)
 let c = torch.randn([2, 77, 768])
 
 let pl_sd = torch.load(
-  "/home/liu/workspace/stable-diffusion/models/ldm/stable-diffusion-v1/Tron-Legacy-Style-trnlgcy.ckpt",
+  "/home/liu/workspace/stable-diffusion/models/ldm/stable-diffusion-v1/dnd_model30000.ckpt",
   map_location: "cpu")
 let sd = pl_sd["state_dict"]
 
@@ -963,13 +963,6 @@ let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
 let (reader, unet) = UNet(batchSize: 2)
 graph.workspaceSize = 1_024 * 1_024 * 1_024
-graph.withNoGrad {
-  let _ = unet(inputs: xTensor, t_emb, cTensor)
-  reader(sd)
-  graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
-    $0.write("unet", model: unet)
-  }
-}
 
 let (
   tokenEmbed, positionEmbed, layerNorm1s, tokeys, toqueries, tovalues, unifyheads, layerNorm2s,
@@ -992,92 +985,111 @@ for i in 0..<76 {
   }
 }
 
-let _ = textModel(inputs: tokensTensor, positionTensor, casualAttentionMask)
+graph.withNoGrad {
+  /// Load UNet.
+  let _ = unet(inputs: xTensor, t_emb, cTensor)
+  reader(sd)
+  graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
+    $0.write("unet", model: unet)
+  }
 
-let vocab = sd["cond_stage_model.transformer.text_model.embeddings.token_embedding.weight"]
-let pos = sd["cond_stage_model.transformer.text_model.embeddings.position_embedding.weight"]
-tokenEmbed.parameters.copy(from: try! Tensor<Float>(numpy: vocab.float().numpy()))
-positionEmbed.parameters.copy(from: try! Tensor<Float>(numpy: pos.float().numpy()))
+  /// Load text model.
+  let _ = textModel(
+    inputs: tokensTensor.toGPU(0), positionTensor.toGPU(0), casualAttentionMask.toGPU(0))
 
-for i in 0..<12 {
-  let layer_norm_1_weight = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).layer_norm1.weight"
-  ].float().numpy()
-  let layer_norm_1_bias = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).layer_norm1.bias"
-  ].float().numpy()
-  layerNorm1s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: layer_norm_1_weight))
-  layerNorm1s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: layer_norm_1_bias))
+  let vocab = sd["cond_stage_model.transformer.text_model.embeddings.token_embedding.weight"]
+  let pos = sd["cond_stage_model.transformer.text_model.embeddings.position_embedding.weight"]
+  tokenEmbed.parameters.copy(from: try! Tensor<Float>(numpy: vocab.float().numpy()))
+  positionEmbed.parameters.copy(from: try! Tensor<Float>(numpy: pos.float().numpy()))
 
-  let k_proj_weight = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.k_proj.weight"
-  ].float().numpy()
-  let k_proj_bias = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.k_proj.bias"
-  ].float().numpy()
-  tokeys[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: k_proj_weight))
-  tokeys[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: k_proj_bias))
+  for i in 0..<12 {
+    let layer_norm_1_weight = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).layer_norm1.weight"
+    ].float().numpy()
+    let layer_norm_1_bias = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).layer_norm1.bias"
+    ].float().numpy()
+    layerNorm1s[i].parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: layer_norm_1_weight))
+    layerNorm1s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: layer_norm_1_bias))
 
-  let v_proj_weight = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.v_proj.weight"
-  ].float().numpy()
-  let v_proj_bias = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.v_proj.bias"
-  ].float().numpy()
-  tovalues[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: v_proj_weight))
-  tovalues[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: v_proj_bias))
+    let k_proj_weight = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.k_proj.weight"
+    ].float().numpy()
+    let k_proj_bias = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.k_proj.bias"
+    ].float().numpy()
+    tokeys[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: k_proj_weight))
+    tokeys[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: k_proj_bias))
 
-  let q_proj_weight = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.q_proj.weight"
-  ].float().numpy()
-  let q_proj_bias = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.q_proj.bias"
-  ].float().numpy()
-  toqueries[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: q_proj_weight))
-  toqueries[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: q_proj_bias))
+    let v_proj_weight = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.v_proj.weight"
+    ].float().numpy()
+    let v_proj_bias = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.v_proj.bias"
+    ].float().numpy()
+    tovalues[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: v_proj_weight))
+    tovalues[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: v_proj_bias))
 
-  let out_proj_weight = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.out_proj.weight"
+    let q_proj_weight = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.q_proj.weight"
+    ].float().numpy()
+    let q_proj_bias = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.q_proj.bias"
+    ].float().numpy()
+    toqueries[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: q_proj_weight))
+    toqueries[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: q_proj_bias))
+
+    let out_proj_weight = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.out_proj.weight"
+    ]
+    .float().numpy()
+    let out_proj_bias = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.out_proj.bias"
+    ].float().numpy()
+    unifyheads[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_proj_weight))
+    unifyheads[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_proj_bias))
+
+    let layer_norm_2_weight = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).layer_norm2.weight"
+    ].float().numpy()
+    let layer_norm_2_bias = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).layer_norm2.bias"
+    ].float().numpy()
+    layerNorm2s[i].parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: layer_norm_2_weight))
+    layerNorm2s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: layer_norm_2_bias))
+
+    let fc1_weight = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).mlp.fc1.weight"
+    ]
+    .float().numpy()
+    let fc1_bias = sd["cond_stage_model.transformer.text_model.encoder.layers.\(i).mlp.fc1.bias"]
+      .float().numpy()
+    fc1s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: fc1_weight))
+    fc1s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: fc1_bias))
+
+    let fc2_weight = sd[
+      "cond_stage_model.transformer.text_model.encoder.layers.\(i).mlp.fc2.weight"
+    ]
+    .float().numpy()
+    let fc2_bias = sd["cond_stage_model.transformer.text_model.encoder.layers.\(i).mlp.fc2.bias"]
+      .float().numpy()
+    fc2s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: fc2_weight))
+    fc2s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: fc2_bias))
+  }
+
+  let final_layer_norm_weight = sd[
+    "cond_stage_model.transformer.text_model.final_layer_norm.weight"
   ]
   .float().numpy()
-  let out_proj_bias = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).self_attn.out_proj.bias"
-  ].float().numpy()
-  unifyheads[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_proj_weight))
-  unifyheads[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_proj_bias))
-
-  let layer_norm_2_weight = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).layer_norm2.weight"
-  ].float().numpy()
-  let layer_norm_2_bias = sd[
-    "cond_stage_model.transformer.text_model.encoder.layers.\(i).layer_norm2.bias"
-  ].float().numpy()
-  layerNorm2s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: layer_norm_2_weight))
-  layerNorm2s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: layer_norm_2_bias))
-
-  let fc1_weight = sd["cond_stage_model.transformer.text_model.encoder.layers.\(i).mlp.fc1.weight"]
+  let final_layer_norm_bias = sd["cond_stage_model.transformer.text_model.final_layer_norm.bias"]
     .float().numpy()
-  let fc1_bias = sd["cond_stage_model.transformer.text_model.encoder.layers.\(i).mlp.fc1.bias"]
-    .float().numpy()
-  fc1s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: fc1_weight))
-  fc1s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: fc1_bias))
+  finalLayerNorm.parameters(for: .weight).copy(
+    from: try! Tensor<Float>(numpy: final_layer_norm_weight))
+  finalLayerNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: final_layer_norm_bias))
 
-  let fc2_weight = sd["cond_stage_model.transformer.text_model.encoder.layers.\(i).mlp.fc2.weight"]
-    .float().numpy()
-  let fc2_bias = sd["cond_stage_model.transformer.text_model.encoder.layers.\(i).mlp.fc2.bias"]
-    .float().numpy()
-  fc2s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: fc2_weight))
-  fc2s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: fc2_bias))
-}
-
-let final_layer_norm_weight = sd["cond_stage_model.transformer.text_model.final_layer_norm.weight"]
-  .float().numpy()
-let final_layer_norm_bias = sd["cond_stage_model.transformer.text_model.final_layer_norm.bias"]
-  .float().numpy()
-finalLayerNorm.parameters(for: .weight).copy(
-  from: try! Tensor<Float>(numpy: final_layer_norm_weight))
-finalLayerNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: final_layer_norm_bias))
-
-graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
-  $0.write("text_model", model: textModel)
+  graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
+    $0.write("text_model", model: textModel)
+  }
 }
