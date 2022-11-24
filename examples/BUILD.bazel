@@ -12,6 +12,17 @@ swift_binary(
 )
 
 swift_binary(
+    name = "open_clip",
+    srcs = ["open_clip/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "vit",
     srcs = ["vit/main.swift"],
     deps = [
@@ -130,6 +141,15 @@ swift_binary(
         "@SwiftNumerics//:Numerics",
         "@SwiftPNG//:PNG",
         "@ccv//lib:ccv",
+        "@s4nnc//nnc",
+    ],
+)
+
+swift_binary(
+    name = "pickle",
+    srcs = ["pickle/main.swift"],
+    deps = [
+        "@SwiftNumerics//:Numerics",
         "@s4nnc//nnc",
     ],
 )
