@@ -105,6 +105,8 @@ swift_binary(
     data = [
         "clip/merges.txt",
         "clip/vocab.json",
+        "open_clip/bpe_simple_vocab_16e6.txt",
+        "open_clip/vocab_16e6.json",
     ],
     deps = [
         "//:diffusion",

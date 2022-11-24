@@ -800,20 +800,22 @@ torch.cuda.manual_seed_all(42)
 
 let x = torch.randn([2, 4, 64, 64])
 let t = torch.full([1], 981)
-let c = torch.randn([2, 77, 768])
+let c = torch.randn([2, 77, 1024])
 
 let config = omegaconf.OmegaConf.load(
-  "/home/liu/workspace/stable-diffusion/configs/stable-diffusion/v1-inference.yaml")
+  "/home/liu/workspace/stablediffusion/configs/stable-diffusion/v2-inference.yaml")
 let pl_sd = torch.load(
-  "/home/liu/workspace/stable-diffusion/models/ldm/stable-diffusion-v1/Cyberpunk-Anime-Diffusion.ckpt",
+  "/home/liu/workspace/stablediffusion/models/stable-diffusion-v2/512-base-ema.ckpt",
   map_location: "cpu")
 let sd = pl_sd["state_dict"]
 let model = ldm_util.instantiate_from_config(config.model)
 model.load_state_dict(sd, strict: false)
 model.eval()
 let state_dict = model.model.state_dict()
+/*
 let ret = model.apply_model(x, t, c)
 print(ret)
+*/
 
 let graph = DynamicGraph()
 

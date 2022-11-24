@@ -212,7 +212,6 @@ let pl_sd = torch.load(
   "/home/liu/workspace/stable-diffusion/models/ldm/stable-diffusion-v1/vae-ft-mse-840000-ema-pruned.ckpt",
   map_location: "cpu")
 let sd = pl_sd["state_dict"]
-/*
 let model = ldm_util.instantiate_from_config(config.model)
 model.load_state_dict(sd, strict: false)
 model.eval()
@@ -221,9 +220,6 @@ print(model.scale_factor)
 let state_dict = model.first_stage_model.state_dict()
 let ret = model.decode_first_stage(x)
 print(ret)
-*/
-let z = x
-let state_dict = sd
 
 let graph = DynamicGraph()
 let zTensor = graph.variable(try! Tensor<Float>(numpy: z.numpy())).toGPU(0)
