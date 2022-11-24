@@ -27,9 +27,9 @@ public struct CLIPTokenizer {
       bpeRanks[Pair(first: String(splits[0]), second: String(splits[1]))] = i
     }
     self.bpeRanks = bpeRanks
-    self.unknownToken = self.vocabulary["<|endoftext|>"]!
-    self.startToken = self.vocabulary["<|startoftext|>"]!
-    self.endToken = self.vocabulary["<|endoftext|>"]!
+    self.unknownToken = self.vocabulary["<|endoftext|>"] ?? self.vocabulary["<end_of_text>"]!
+    self.startToken = self.vocabulary["<|startoftext|>"] ?? self.vocabulary["<start_of_text>"]!
+    self.endToken = self.vocabulary["<|endoftext|>"] ?? self.vocabulary["<end_of_text>"]!
   }
 
   public func tokenize(text: String, truncation: Bool, maxLength: Int) -> [Int32] {
@@ -67,7 +67,7 @@ public struct CLIPTokenizer {
         tokens.append(fixText[splitIndex..<lastIndex])
         continue
       }
-      if pat.hasSuffix("<|startoftext|>") {
+      if pat.hasSuffix("<|startoftext|>") || pat.hasSuffix("<start_of_text>") {
         let splitIndex = fixText.index(index, offsetBy: -14)
         if lastIndex < splitIndex {
           tokens.append(fixText[lastIndex..<splitIndex])
@@ -76,7 +76,7 @@ public struct CLIPTokenizer {
         tokens.append(fixText[splitIndex..<lastIndex])
         continue
       }
-      if pat.hasSuffix("<|endoftext|>") {
+      if pat.hasSuffix("<|endoftext|>") || pat.hasSuffix("<end_of_text>") {
         let splitIndex = fixText.index(index, offsetBy: -12)
         if lastIndex < splitIndex {
           tokens.append(fixText[lastIndex..<splitIndex])
@@ -99,7 +99,10 @@ public struct CLIPTokenizer {
     // Now filter token further by split if it not a number nor a letter.
     tokens = tokens.flatMap { token -> [Substring] in
       // Remove special tokens (start and end)
-      guard token != "<|startoftext|>" && token != "<|endoftext|>" else {
+      guard
+        token != "<|startoftext|>" && token != "<|endoftext|>" && token != "<start_of_text>"
+          && token != "<end_of_text>"
+      else {
         return []
       }
       // Skip these tokens

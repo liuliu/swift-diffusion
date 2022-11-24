@@ -3,7 +3,7 @@ import Foundation
 import NNC
 import PNG
 
-public typealias UseFloatingPoint = Float16
+public typealias UseFloatingPoint = Float
 
 public struct DiffusionModel {
   public var linearStart: Float
@@ -93,7 +93,7 @@ extension DiffusionModel {
 DynamicGraph.setSeed(40)
 DynamicGraph.memoryEfficient = true
 
-let unconditionalGuidanceScale: Float = 7.5
+let unconditionalGuidanceScale: Float = 9
 let scaleFactor: Float = 0.18215
 let startWidth: Int = 64
 let startHeight: Int = 64
@@ -106,7 +106,8 @@ let sigmas = model.karrasSigmas(sigmasForTimesteps[0]...sigmasForTimesteps[999])
 // let sigmas = model.fixedStepSigmas(
 //   sigmasForTimesteps[0]...sigmasForTimesteps[999], sigmas: sigmasForTimesteps)
 let tokenizer = CLIPTokenizer(
-  vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
+  vocabulary: "examples/open_clip/vocab_16e6.json",
+  merges: "examples/open_clip/bpe_simple_vocab_16e6.txt")
 
 let workDir = CommandLine.arguments[1]
 let text =
@@ -118,18 +119,26 @@ let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
 
 let graph = DynamicGraph()
 
-let textModel = CLIPTextModel(
+let textModel = OpenCLIPTextModel(
   UseFloatingPoint.self,
-  vocabularySize: 49408, maxLength: 77, embeddingSize: 768, numLayers: 12, numHeads: 12,
-  batchSize: 2, intermediateSize: 3072)
+  vocabularySize: 49408, maxLength: 77, embeddingSize: 1024, numLayers: 23, numHeads: 16,
+  batchSize: 2, intermediateSize: 4096)
 
 let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
+var endOfUnconditionalTokens = false
+var endOfTokens = false
 for i in 0..<77 {
-  tokensTensor[i] = unconditionalTokens[i]
-  tokensTensor[i + 77] = tokens[i]
+  tokensTensor[i] = !endOfUnconditionalTokens ? unconditionalTokens[i] : 0
+  tokensTensor[i + 77] = !endOfTokens ? tokens[i] : 0
   positionTensor[i] = Int32(i)
   positionTensor[i + 77] = Int32(i)
+  if tokens[i] == 49407 {
+    endOfTokens = true
+  }
+  if unconditionalTokens[i] == 49407 {
+    endOfUnconditionalTokens = true
+  }
 }
 
 let casualAttentionMask = graph.variable(Tensor<UseFloatingPoint>(.CPU, .NHWC(1, 1, 77, 77)))
@@ -152,13 +161,15 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
   textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore(workDir + "/sd-v1.4.ckpt") {
+  graph.openStore(workDir + "/open_clip_vit_h14_f32.ckpt") {
     $0.read("text_model", model: textModel)
   }
   let c: DynamicGraph.AnyTensor = textModel(
     inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
       of: UseFloatingPoint.self
-    ).reshaped(.CHW(2, 77, 768))
+    ).reshaped(.CHW(2, 77, 1024))
+  debugPrint(c)
+  fatalError()
   let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   x_T.randn(std: 1, mean: 0)
   var x = x_T
@@ -166,8 +177,10 @@ graph.withNoGrad {
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
   unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts)), c)
   decoder.compile(inputs: x)
-  graph.openStore(workDir + "/sd-v1.4.ckpt") {
+  graph.openStore(workDir + "/sd_v2.0_f32.ckpt") {
     $0.read("unet", model: unet)
+  }
+  graph.openStore(workDir + "/vae_sd_v2.0_f32.ckpt") {
     $0.read("decoder", model: decoder)
   }
   var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil

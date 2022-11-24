@@ -207,9 +207,9 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
 let x = torch.randn([1, 4, 64, 64])
 
 let config = omegaconf.OmegaConf.load(
-  "/home/liu/workspace/stable-diffusion/configs/stable-diffusion/v1-inference.yaml")
+  "/home/liu/workspace/stablediffusion/configs/stable-diffusion/v2-inference.yaml")
 let pl_sd = torch.load(
-  "/home/liu/workspace/stable-diffusion/models/ldm/stable-diffusion-v1/vae-ft-mse-840000-ema-pruned.ckpt",
+  "/home/liu/workspace/stablediffusion/models/stable-diffusion-v2/512-base-ema.ckpt",
   map_location: "cpu")
 let sd = pl_sd["state_dict"]
 let model = ldm_util.instantiate_from_config(config.model)
