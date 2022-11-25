@@ -115,7 +115,7 @@ let (model, _, _) = open_clip.create_model_and_transforms(
   "ViT-H-14", device: torch.device("cpu"), pretrained: "laion2b_s32b_b79k"
 ).tuple3
 
-let tokens = open_clip.tokenize(["a professional photograph of an astronaut riding a horse"])
+let tokens = open_clip.tokenize([""])  // a professional photograph of an astronaut riding a horse"])
 var x = model.token_embedding(tokens)
 x = x + model.positional_embedding
 x = x.permute(1, 0, 2)
@@ -138,6 +138,7 @@ let (
   batchSize: 1, intermediateSize: 4096)
 
 let graph = DynamicGraph()
+/*
 let tokensTensor = graph.variable(.CPU, .C(77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(77), of: Int32.self)
 let tokensNumpy = tokens.numpy()
@@ -212,14 +213,11 @@ finalLayerNorm.parameters(for: .weight).copy(
 finalLayerNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: final_layer_norm_bias))
 
 let c = textModel(inputs: tokensTensor, positionTensor, casualAttentionMask)[0].as(of: Float.self)
-for i in 0..<6 {
-  let x = i < 3 ? i : 71 + i
-  for j in 0..<6 {
-    let y = j < 3 ? j : 1018 + j
-    print("\(x) \(y) \(c[x, y])")
-  }
-}
+debugPrint(c)
+*/
+let pyX = try! Tensor<Float>(numpy: x.detach().numpy())
 
 graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
-  $0.write("text_model", model: textModel)
+  // $0.write("text_model", model: textModel)
+  $0.write("unconditional_c", tensor: pyX)
 }

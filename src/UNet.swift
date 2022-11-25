@@ -200,11 +200,12 @@ func BlockLayer(
 }
 
 func MiddleBlock(
-  channels: Int, numHeads: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
+  channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
   x: Model.IO, emb: Model.IO, c: Model.IO
 ) -> Model.IO {
-  precondition(channels % numHeads == 0)
-  let k = channels / numHeads
+  precondition(channels % numHeadChannels == 0)
+  let numHeads = channels / numHeadChannels
+  let k = numHeadChannels
   let resBlock1 = ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   var out = resBlock1(x, emb)
   let transformer = SpatialTransformer(
@@ -217,7 +218,8 @@ func MiddleBlock(
 }
 
 func InputBlocks(
-  channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
   embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO
 ) -> ([Model.IO], Model.IO) {
   let conv2d = Convolution(
@@ -236,7 +238,8 @@ func InputBlocks(
       let inputLayer = BlockLayer(
         prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
-        attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels,
+        batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       previousChannel = channel
       if attentionBlock {
@@ -263,7 +266,8 @@ func InputBlocks(
 }
 
 func OutputBlocks(
-  channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
   embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO,
   inputs: [Model.IO]
 ) -> Model.IO {
@@ -295,7 +299,8 @@ func OutputBlocks(
       let outputLayer = BlockLayer(
         prefix: "output_blocks",
         layerStart: layerStart, skipConnection: true,
-        attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels,
+        batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       if attentionBlock {
         out = outputLayer(out, emb, c)
@@ -323,18 +328,18 @@ public func UNet(batchSize: Int, startWidth: Int, startHeight: Int) -> Model {
   let emb = timeEmbed(t_emb)
   let attentionRes = Set([4, 2, 1])
   let (inputs, inputBlocks) = InputBlocks(
-    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: startHeight,
     startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
   var out = inputBlocks
   let middleBlock = MiddleBlock(
-    channels: 1280, numHeads: 8, batchSize: batchSize, height: startHeight / 8,
+    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: startHeight / 8,
     width: startWidth / 8, embeddingSize: 77,
     x: out,
     emb: emb, c: c)
   out = middleBlock
   let outputBlocks = OutputBlocks(
-    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: startHeight,
     startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
     inputs: inputs)

@@ -1,7 +1,9 @@
 import Diffusion
 import Foundation
 import NNC
+import NNCPythonConversion
 import PNG
+import PythonKit
 
 public typealias UseFloatingPoint = Float
 
@@ -89,6 +91,14 @@ extension DiffusionModel {
     return (1.0 - w) * Float(highIdx - 1) + w * Float(highIdx)
   }
 }
+let torch = Python.import("torch")
+let random = Python.import("random")
+let numpy = Python.import("numpy")
+
+random.seed(42)
+numpy.random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
 
 DynamicGraph.setSeed(40)
 DynamicGraph.memoryEfficient = true
@@ -97,7 +107,7 @@ let unconditionalGuidanceScale: Float = 9
 let scaleFactor: Float = 0.18215
 let startWidth: Int = 64
 let startHeight: Int = 64
-let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 30)
+let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 50)
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
 // This is for Karras scheduler (used in DPM++ 2M Karras)
@@ -156,6 +166,9 @@ let decoder = Decoder(
 
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 
+let x_T_py = torch.randn([1, 4, startHeight, startWidth], device: torch.device("cpu")).numpy()
+let x_Tensor = try! Tensor<Float>(numpy: x_T_py)
+
 graph.withNoGrad {
   let tokensTensorGPU = tokensTensor.toGPU(0)
   let positionTensorGPU = positionTensor.toGPU(0)
@@ -164,14 +177,20 @@ graph.withNoGrad {
   graph.openStore(workDir + "/open_clip_vit_h14_f32.ckpt") {
     $0.read("text_model", model: textModel)
   }
-  let c: DynamicGraph.AnyTensor = textModel(
+  var c = textModel(
     inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
       of: UseFloatingPoint.self
     ).reshaped(.CHW(2, 77, 1024))
-  debugPrint(c)
-  fatalError()
-  let x_T = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-  x_T.randn(std: 1, mean: 0)
+  var uc: Tensor<Float>? = nil
+  var cc: Tensor<Float>? = nil
+  graph.openStore(workDir + "/text_model.ckpt") {
+    uc = Tensor<Float>($0.read("unconditional_c")!)
+    cc = Tensor<Float>($0.read("conditional_c")!)
+  }
+  c[0..<1, 0..<77, 0..<1024] = graph.variable(Tensor<UseFloatingPoint>(from: uc!).toGPU(0))
+  c[1..<2, 0..<77, 0..<1024] = graph.variable(Tensor<UseFloatingPoint>(from: cc!).toGPU(0))
+  let x_T = graph.variable(Tensor<UseFloatingPoint>(from: x_Tensor).toGPU(0))
+  // x_T.randn(std: 1, mean: 0)
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
@@ -183,21 +202,22 @@ graph.withNoGrad {
   graph.openStore(workDir + "/vae_sd_v2.0_f32.ckpt") {
     $0.read("decoder", model: decoder)
   }
-  var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil
+  // var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil
   let startTime = Date()
   DynamicGraph.setProfiler(true)
   // Now do DPM++ 2M Karras sampling. (DPM++ 2S a Karras requires two denoising per step, not ideal for my use case).
-  x = sigmas[0] * x
+  // x = sigmas[0] * x
   for i in 0..<model.steps {
-    let sigma = sigmas[i]
-    let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
+    // let sigma = sigmas[i]
+    // let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
+    let timestep = model.timesteps - model.timesteps / model.steps * (i + 1) + 1
     let ts = timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
       .toGPU(0)
     let t = graph.variable(Tensor<UseFloatingPoint>(from: ts))
-    let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
-    let cOut = -sigma
-    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
-    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
+    // let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
+    // let cOut = -sigma
+    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
+    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
     var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
@@ -208,6 +228,12 @@ graph.withNoGrad {
     etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
       et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
+    let alpha = alphasCumprod[timestep]
+    let alphaPrev = alphasCumprod[max(timestep - model.timesteps / model.steps, 0)]
+    let predX0 = (1 / alpha.squareRoot()) * (x - (1 - alpha).squareRoot() * et)
+    let dirXt = (1 - alphaPrev).squareRoot() * et
+    let xPrev = alphaPrev.squareRoot() * predX0 + dirXt
+    x = xPrev
     /* // Below is the Euler ancestral sampling implementation.
     let sigmaUp = min(
       sigmas[i + 1],
@@ -225,6 +251,7 @@ graph.withNoGrad {
     }
     */
     // Below is the DPM++ 2M Karras sampling implementation.
+    /*
     let denoised = x + cOut * et
     let h = log(sigmas[i]) - log(sigmas[i + 1])
     if let oldDenoised = oldDenoised, i < model.steps - 1 {
@@ -240,6 +267,7 @@ graph.withNoGrad {
       x = w * x - (w - 1) * denoised
     }
     oldDenoised = denoised
+    */
   }
   let z = 1.0 / scaleFactor * x
   let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: UseFloatingPoint.self))

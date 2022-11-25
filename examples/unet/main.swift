@@ -402,11 +402,12 @@ func BlockLayer(
 }
 
 func MiddleBlock(
-  channels: Int, numHeads: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
+  channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
   x: Model.IO, emb: Model.IO, c: Model.IO
 ) -> ((PythonObject) -> Void, Model.IO) {
-  precondition(channels % numHeads == 0)
-  let k = channels / numHeads
+  precondition(channels % numHeadChannels == 0)
+  let numHeads = channels / numHeadChannels
+  let k = numHeadChannels
   let (inLayerNorm1, inLayerConv2d1, embLayer1, outLayerNorm1, outLayerConv2d1, _, resBlock1) =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   var out = resBlock1(x, emb)
@@ -603,7 +604,8 @@ func MiddleBlock(
 }
 
 func InputBlocks(
-  channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
   embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO
 ) -> ((PythonObject) -> Void, [Model.IO], Model.IO) {
   let conv2d = Convolution(
@@ -623,7 +625,8 @@ func InputBlocks(
       let (reader, inputLayer) = BlockLayer(
         prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
-        attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels,
+        batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       previousChannel = channel
       if attentionBlock {
@@ -668,7 +671,8 @@ func InputBlocks(
 }
 
 func OutputBlocks(
-  channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
   embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO,
   inputs: [Model.IO]
 ) -> ((PythonObject) -> Void, Model.IO) {
@@ -701,7 +705,8 @@ func OutputBlocks(
       let (reader, outputLayer) = BlockLayer(
         prefix: "output_blocks",
         layerStart: layerStart, skipConnection: true,
-        attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels,
+        batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       if attentionBlock {
         out = outputLayer(out, emb, c)
@@ -747,17 +752,18 @@ func UNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   let emb = timeEmbed(t_emb)
   let attentionRes = Set([4, 2, 1])
   let (inputReader, inputs, inputBlocks) = InputBlocks(
-    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: 64,
     startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
   var out = inputBlocks
   let (middleReader, middleBlock) = MiddleBlock(
-    channels: 1280, numHeads: 8, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
+    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 8, width: 8,
+    embeddingSize: 77,
     x: out,
     emb: emb, c: c)
   out = middleBlock
   let (outputReader, outputBlocks) = OutputBlocks(
-    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: 64,
     startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
     inputs: inputs)
@@ -812,6 +818,7 @@ let model = ldm_util.instantiate_from_config(config.model)
 model.load_state_dict(sd, strict: false)
 model.eval()
 let state_dict = model.model.state_dict()
+print(state_dict.keys())
 /*
 let ret = model.apply_model(x, t, c)
 print(ret)
