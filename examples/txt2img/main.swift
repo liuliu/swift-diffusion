@@ -114,8 +114,9 @@ let text =
   CommandLine.arguments.count > 2
   ? CommandLine.arguments.suffix(from: 2).joined(separator: " ") : ""
 
-let unconditionalTokens = tokenizer.tokenize(text: "", truncation: true, maxLength: 77)
-let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
+let unconditionalTokens = tokenizer.tokenize(
+  text: "", truncation: true, maxLength: 77, paddingToken: 0)
+let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77, paddingToken: 0)
 
 let graph = DynamicGraph()
 
@@ -126,19 +127,11 @@ let textModel = OpenCLIPTextModel(
 
 let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
-var endOfUnconditionalTokens = false
-var endOfTokens = false
 for i in 0..<77 {
-  tokensTensor[i] = !endOfUnconditionalTokens ? unconditionalTokens[i] : 0
-  tokensTensor[i + 77] = !endOfTokens ? tokens[i] : 0
+  tokensTensor[i] = unconditionalTokens[i]
+  tokensTensor[i + 77] = tokens[i]
   positionTensor[i] = Int32(i)
   positionTensor[i + 77] = Int32(i)
-  if tokens[i] == 49407 {
-    endOfTokens = true
-  }
-  if unconditionalTokens[i] == 49407 {
-    endOfUnconditionalTokens = true
-  }
 }
 
 let casualAttentionMask = graph.variable(Tensor<UseFloatingPoint>(.CPU, .NHWC(1, 1, 77, 77)))

@@ -32,7 +32,9 @@ public struct CLIPTokenizer {
     self.endToken = self.vocabulary["<|endoftext|>"] ?? self.vocabulary["<end_of_text>"]!
   }
 
-  public func tokenize(text: String, truncation: Bool, maxLength: Int) -> [Int32] {
+  public func tokenize(text: String, truncation: Bool, maxLength: Int, paddingToken: Int32? = nil)
+    -> [Int32]
+  {
     let fixText = text.split(separator: " ").joined(separator: " ").lowercased()
     // Logic for r"""<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+"""
     // Implement this with for loop rather than regex so it is applicable with Swift 5.6.x
@@ -146,8 +148,12 @@ public struct CLIPTokenizer {
       }
     }
     if ids.count < maxLength {
-      for _ in ids.count..<maxLength {
-        ids.append(endToken)
+      let paddingToken = paddingToken ?? endToken
+      ids.append(endToken)
+      if ids.count < maxLength {
+        for _ in ids.count..<maxLength {
+          ids.append(paddingToken)
+        }
       }
     } else {
       ids.append(endToken)
