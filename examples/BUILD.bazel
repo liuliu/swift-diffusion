@@ -144,13 +144,3 @@ swift_binary(
         "@s4nnc//nnc",
     ],
 )
-
-swift_binary(
-    name = "pickle",
-    srcs = ["pickle/main.swift"],
-    deps = [
-        "@PythonKit",
-        "@SwiftNumerics//:Numerics",
-        "@s4nnc//nnc",
-    ],
-)
