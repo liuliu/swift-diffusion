@@ -950,7 +950,7 @@ let t = torch.full([1], 981)
 let c = torch.randn([2, 77, 768])
 
 let pl_sd = torch.load(
-  "/home/liu/workspace/stable-diffusion/models/ldm/stable-diffusion-v1/dnd_model30000.ckpt",
+  "/fast/Data/SD/eldenRing-v3-pruned.ckpt",
   map_location: "cpu")
 let sd = pl_sd["state_dict"]
 

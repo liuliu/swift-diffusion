@@ -33,12 +33,31 @@ ccv_setting(
     use_openmp = True,
 )
 
+git_repository(
+    name = "swift-fickling",
+    commit = "63be8645bb40db1c2fc88d3bb5591bdfd9f475f1",
+    remote = "https://github.com/liuliu/swift-fickling.git",
+    shallow_since = "1669934751 -0500",
+)
+
+load("@swift-fickling//:deps.bzl", "swift_fickling_deps")
+
+swift_fickling_deps()
+
 new_git_repository(
     name = "SwiftPNG",
     build_file = "swift-png.BUILD",
     commit = "075dfb248ae327822635370e9d4f94a5d3fe93b2",
     remote = "https://github.com/kelvin13/swift-png",
     shallow_since = "1645648674 -0600",
+)
+
+new_git_repository(
+    name = "ZIPFoundation",
+    build_file = "zip-foundation.BUILD",
+    commit = "642436f3684009ca7a5e3d6b30f2ecea26f8f772",
+    remote = "https://github.com/weichsel/ZIPFoundation.git",
+    shallow_since = "1665504317 +0200",
 )
 
 git_repository(
