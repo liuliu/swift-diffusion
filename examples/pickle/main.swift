@@ -4,9 +4,9 @@ import Foundation
 import NNC
 import ZIPFoundation
 
-public typealias UseFloatingPoint = Float16
+public typealias UseFloatingPoint = Float32
 
-let filename = "/fast/Data/SD/PaperCut_v1.ckpt"
+let filename = "/fast/Data/SD/eldenRing-v3-pruned.ckpt"
 
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 
@@ -57,6 +57,35 @@ struct TensorDescriptor {
   var storageOffset: Int
   var shape: [Int]
   var strides: [Int]
+}
+
+extension TensorDescriptor {
+  func inflate<T: TensorNumeric>(from zip: Archive, of type: T.Type) throws -> Tensor<T> {
+    var v = 1
+    for i in stride(from: shape.count - 1, through: 0, by: -1) {
+      precondition(strides[i] == v)
+      v *= shape[i]
+    }
+    let entry = archive["archive/data/\(storage.name)"]!
+    var data = Data()
+    let _ = try archive.extract(entry) { data.append($0) }
+    return data.withUnsafeMutableBytes {
+      guard let address = $0.baseAddress else { fatalError() }
+      let tensor: AnyTensor
+      if storage.dataType == .Float16 {
+        tensor = Tensor<Float16>(
+          .CPU, format: .NCHW, shape: TensorShape(shape),
+          unsafeMutablePointer: address.assumingMemoryBound(to: Float16.self), bindLifetimeOf: entry
+        ).copied()
+      } else {
+        tensor = Tensor<Float>(
+          .CPU, format: .NCHW, shape: TensorShape(shape),
+          unsafeMutablePointer: address.assumingMemoryBound(to: Float.self), bindLifetimeOf: entry
+        ).copied()
+      }
+      return Tensor<T>(from: tensor)
+    }
+  }
 }
 
 interpreter.intercept(module: "UNPICKLER", function: "persistent_load") { module, function, args in
@@ -208,6 +237,994 @@ func CLIPTextModel<T: TensorNumeric>(
   )
 }
 
+/// UNet Model.
+
+func timeEmbedding(timesteps: Int, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
+  Float
+> {
+  precondition(embeddingSize % 2 == 0)
+  var embedding = Tensor<Float>(.CPU, .NC(batchSize, embeddingSize))
+  let half = embeddingSize / 2
+  for i in 0..<half {
+    let freq: Float = exp(-log(Float(maxPeriod)) * Float(i) / Float(half)) * Float(timesteps)
+    let cosFreq = cos(freq)
+    let sinFreq = sin(freq)
+    for j in 0..<batchSize {
+      embedding[j, i] = cosFreq
+      embedding[j, i + half] = sinFreq
+    }
+  }
+  return embedding
+}
+
+func TimeEmbed(modelChannels: Int) -> (Model, Model, Model) {
+  let x = Input()
+  let fc0 = Dense(count: modelChannels * 4)
+  var out = fc0(x).swish()
+  let fc2 = Dense(count: modelChannels * 4)
+  out = fc2(out)
+  return (fc0, fc2, Model([x], [out]))
+}
+
+func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> (
+  Model, Model, Model, Model, Model, Model?, Model
+) {
+  let x = Input()
+  let emb = Input()
+  let inLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  var out = inLayerNorm(x)
+  out = Swish()(out)
+  let inLayerConv2d = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = inLayerConv2d(out)
+  let embLayer = Dense(count: outChannels)
+  var embOut = Swish()(emb)
+  embOut = embLayer(embOut).reshaped([b, outChannels, 1, 1])
+  out = out + embOut
+  let outLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  out = outLayerNorm(out)
+  out = Swish()(out)
+  // Dropout if needed in the future (for training).
+  let outLayerConv2d = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  var skipModel: Model? = nil
+  if skipConnection {
+    let skip = Convolution(
+      groups: 1, filters: outChannels, filterSize: [1, 1],
+      hint: Hint(stride: [1, 1]))
+    out = skip(x) + outLayerConv2d(out)  // This layer should be zero init if training.
+    skipModel = skip
+  } else {
+    out = x + outLayerConv2d(out)  // This layer should be zero init if training.
+  }
+  return (
+    inLayerNorm, inLayerConv2d, embLayer, outLayerNorm, outLayerConv2d, skipModel,
+    Model([x, emb], [out])
+  )
+}
+
+func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> (Model, Model, Model, Model, Model) {
+  let x = Input()
+  let tokeys = Dense(count: k * h, noBias: true)
+  let toqueries = Dense(count: k * h, noBias: true)
+  let tovalues = Dense(count: k * h, noBias: true)
+  let keys = tokeys(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys)
+  dot = dot.reshaped([b * h * hw, hw])
+  dot = dot.softmax()
+  dot = dot.reshaped([b, h, hw, hw])
+  var out = dot * values
+  out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, hw, h * k])
+  let unifyheads = Dense(count: k * h)
+  out = unifyheads(out)
+  return (tokeys, toqueries, tovalues, unifyheads, Model([x], [out]))
+}
+
+func CrossAttention(k: Int, h: Int, b: Int, hw: Int, t: Int) -> (Model, Model, Model, Model, Model)
+{
+  let x = Input()
+  let c = Input()
+  let tokeys = Dense(count: k * h, noBias: true)
+  let toqueries = Dense(count: k * h, noBias: true)
+  let tovalues = Dense(count: k * h, noBias: true)
+  let keys = tokeys(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys)
+  dot = dot.reshaped([b * h * hw, t])
+  dot = dot.softmax()
+  dot = dot.reshaped([b, h, hw, t])
+  var out = dot * values
+  out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, hw, h * k])
+  let unifyheads = Dense(count: k * h)
+  out = unifyheads(out)
+  return (tokeys, toqueries, tovalues, unifyheads, Model([x, c], [out]))
+}
+
+func FeedForward(hiddenSize: Int, intermediateSize: Int) -> (Model, Model, Model, Model) {
+  let x = Input()
+  let fc10 = Dense(count: intermediateSize)
+  let fc11 = Dense(count: intermediateSize)
+  var out = fc10(x)
+  out = out .* GELU()(fc11(x))
+  let fc2 = Dense(count: hiddenSize)
+  out = fc2(out)
+  return (fc10, fc11, fc2, Model([x], [out]))
+}
+
+func BasicTransformerBlock(k: Int, h: Int, b: Int, hw: Int, t: Int, intermediateSize: Int) -> (
+  Model, Model, Model, Model, Model, Model, Model, Model, Model, Model, Model, Model, Model, Model,
+  Model
+) {
+  let x = Input()
+  let c = Input()
+  let layerNorm1 = LayerNorm(epsilon: 1e-5, axis: [2])
+  var out = layerNorm1(x)
+  let (tokeys1, toqueries1, tovalues1, unifyheads1, attn1) = SelfAttention(k: k, h: h, b: b, hw: hw)
+  out = attn1(out) + x
+  var residual = out
+  let layerNorm2 = LayerNorm(epsilon: 1e-5, axis: [2])
+  out = layerNorm2(out)
+  let (tokeys2, toqueries2, tovalues2, unifyheads2, attn2) = CrossAttention(
+    k: k, h: h, b: b, hw: hw, t: t)
+  out = attn2(out, c) + residual
+  residual = out
+  let layerNorm3 = LayerNorm(epsilon: 1e-5, axis: [2])
+  out = layerNorm3(out)
+  let (fc10, fc11, fc2, ff) = FeedForward(hiddenSize: k * h, intermediateSize: intermediateSize)
+  out = ff(out) + residual
+  return (
+    layerNorm1, tokeys1, toqueries1, tovalues1, unifyheads1, layerNorm2, tokeys2, toqueries2,
+    tovalues2, unifyheads2, layerNorm3, fc10, fc11, fc2, Model([x, c], [out])
+  )
+}
+
+func SpatialTransformer(
+  ch: Int, k: Int, h: Int, b: Int, height: Int, width: Int, t: Int, intermediateSize: Int
+) -> (
+  Model, Model, Model, Model, Model, Model, Model, Model, Model, Model, Model, Model, Model, Model,
+  Model, Model, Model, Model
+) {
+  let x = Input()
+  let c = Input()
+  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  var out = norm(x)
+  let projIn = Convolution(groups: 1, filters: k * h, filterSize: [1, 1])
+  let hw = height * width
+  out = projIn(out).reshaped([b, k * h, hw]).permuted(0, 2, 1)
+  let (
+    layerNorm1, tokeys1, toqueries1, tovalues1, unifyheads1, layerNorm2, tokeys2, toqueries2,
+    tovalues2, unifyheads2, layerNorm3, fc10, fc11, fc2, block
+  ) = BasicTransformerBlock(k: k, h: h, b: b, hw: hw, t: t, intermediateSize: intermediateSize)
+  out = block(out, c).reshaped([b, height, width, k * h]).permuted(0, 3, 1, 2)
+  let projOut = Convolution(groups: 1, filters: ch, filterSize: [1, 1])
+  out = projOut(out) + x
+  return (
+    norm, projIn, layerNorm1, tokeys1, toqueries1, tovalues1, unifyheads1, layerNorm2, tokeys2,
+    toqueries2, tovalues2, unifyheads2, layerNorm3, fc10, fc11, fc2, projOut, Model([x, c], [out])
+  )
+}
+
+func BlockLayer(
+  prefix: String,
+  layerStart: Int, skipConnection: Bool, attentionBlock: Bool, channels: Int, numHeads: Int,
+  batchSize: Int, height: Int, width: Int, embeddingSize: Int, intermediateSize: Int
+) -> ((OrderedDictionary<String, Any>) throws -> Void, Model) {
+  let x = Input()
+  let emb = Input()
+  let c = Input()
+  precondition(channels % numHeads == 0)
+  let k = channels / numHeads
+  let (inLayerNorm, inLayerConv2d, embLayer, outLayerNorm, outLayerConv2d, skipModel, resBlock) =
+    ResBlock(b: batchSize, outChannels: channels, skipConnection: skipConnection)
+  var out = resBlock(x, emb)
+  var norm: Model? = nil
+  var projIn: Model? = nil
+  var layerNorm1: Model? = nil
+  var tokeys1: Model? = nil
+  var toqueries1: Model? = nil
+  var tovalues1: Model? = nil
+  var unifyheads1: Model? = nil
+  var layerNorm2: Model? = nil
+  var tokeys2: Model? = nil
+  var toqueries2: Model? = nil
+  var tovalues2: Model? = nil
+  var unifyheads2: Model? = nil
+  var layerNorm3: Model? = nil
+  var fc10: Model? = nil
+  var fc11: Model? = nil
+  var tfc2: Model? = nil
+  var projOut: Model? = nil
+  if attentionBlock {
+    let transformer: Model
+    (
+      norm, projIn, layerNorm1, tokeys1, toqueries1, tovalues1, unifyheads1, layerNorm2, tokeys2,
+      toqueries2, tovalues2, unifyheads2, layerNorm3, fc10, fc11, tfc2, projOut, transformer
+    ) = SpatialTransformer(
+      ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, t: embeddingSize,
+      intermediateSize: channels * 4)
+    out = transformer(out, c)
+  }
+  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+    let in_layers_0_weight =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.in_layers.0.weight"
+      ] as! TensorDescriptor
+    let in_layers_0_bias =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.in_layers.0.bias"
+      ] as! TensorDescriptor
+    try inLayerNorm.parameters(for: .weight).copy(
+      from: in_layers_0_weight, zip: archive, of: UseFloatingPoint.self)
+    try inLayerNorm.parameters(for: .bias).copy(
+      from: in_layers_0_bias, zip: archive, of: UseFloatingPoint.self)
+    let in_layers_2_weight =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.in_layers.2.weight"
+      ] as! TensorDescriptor
+    let in_layers_2_bias =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.in_layers.2.bias"
+      ] as! TensorDescriptor
+    try inLayerConv2d.parameters(for: .weight).copy(
+      from: in_layers_2_weight, zip: archive, of: UseFloatingPoint.self)
+    try inLayerConv2d.parameters(for: .bias).copy(
+      from: in_layers_2_bias, zip: archive, of: UseFloatingPoint.self)
+    let emb_layers_1_weight =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.emb_layers.1.weight"
+      ] as! TensorDescriptor
+    let emb_layers_1_bias =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.emb_layers.1.bias"
+      ] as! TensorDescriptor
+    try embLayer.parameters(for: .weight).copy(
+      from: emb_layers_1_weight, zip: archive, of: UseFloatingPoint.self)
+    try embLayer.parameters(for: .bias).copy(
+      from: emb_layers_1_bias, zip: archive, of: UseFloatingPoint.self)
+    let out_layers_0_weight =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.out_layers.0.weight"
+      ] as! TensorDescriptor
+    let out_layers_0_bias =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.out_layers.0.bias"
+      ] as! TensorDescriptor
+    try outLayerNorm.parameters(for: .weight).copy(
+      from: out_layers_0_weight, zip: archive, of: UseFloatingPoint.self)
+    try outLayerNorm.parameters(for: .bias).copy(
+      from: out_layers_0_bias, zip: archive, of: UseFloatingPoint.self)
+    let out_layers_3_weight =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.out_layers.3.weight"
+      ] as! TensorDescriptor
+    let out_layers_3_bias =
+      state_dict[
+        "model.diffusion_model.\(prefix).\(layerStart).0.out_layers.3.bias"
+      ] as! TensorDescriptor
+    try outLayerConv2d.parameters(for: .weight).copy(
+      from: out_layers_3_weight, zip: archive, of: UseFloatingPoint.self)
+    try outLayerConv2d.parameters(for: .bias).copy(
+      from: out_layers_3_bias, zip: archive, of: UseFloatingPoint.self)
+    if let skipModel = skipModel {
+      let skip_connection_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).0.skip_connection.weight"
+        ] as! TensorDescriptor
+      let skip_connection_bias =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).0.skip_connection.bias"
+        ] as! TensorDescriptor
+      try skipModel.parameters(for: .weight).copy(
+        from: skip_connection_weight, zip: archive, of: UseFloatingPoint.self)
+      try skipModel.parameters(for: .bias).copy(
+        from: skip_connection_bias, zip: archive, of: UseFloatingPoint.self)
+    }
+    if let norm = norm, let projIn = projIn, let layerNorm1 = layerNorm1, let tokeys1 = tokeys1,
+      let toqueries1 = toqueries1, let tovalues1 = tovalues1, let unifyheads1 = unifyheads1,
+      let layerNorm2 = layerNorm2, let tokeys2 = tokeys2, let toqueries2 = toqueries2,
+      let tovalues2 = tovalues2, let unifyheads2 = unifyheads2, let layerNorm3 = layerNorm3,
+      let fc10 = fc10, let fc11 = fc11, let tfc2 = tfc2, let projOut = projOut
+    {
+      let norm_weight =
+        state_dict["model.diffusion_model.\(prefix).\(layerStart).1.norm.weight"]
+        as! TensorDescriptor
+      let norm_bias =
+        state_dict["model.diffusion_model.\(prefix).\(layerStart).1.norm.bias"]
+        as! TensorDescriptor
+      try norm.parameters(for: .weight).copy(
+        from: norm_weight, zip: archive, of: UseFloatingPoint.self)
+      try norm.parameters(for: .bias).copy(from: norm_bias, zip: archive, of: UseFloatingPoint.self)
+      let proj_in_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.proj_in.weight"
+        ]
+        as! TensorDescriptor
+      let proj_in_bias =
+        state_dict["model.diffusion_model.\(prefix).\(layerStart).1.proj_in.bias"]
+        as! TensorDescriptor
+      try projIn.parameters(for: .weight).copy(
+        from: proj_in_weight, zip: archive, of: UseFloatingPoint.self)
+      try projIn.parameters(for: .bias).copy(
+        from: proj_in_bias, zip: archive, of: UseFloatingPoint.self)
+      let attn1_to_k_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_k.weight"
+        ] as! TensorDescriptor
+      try tokeys1.parameters(for: .weight).copy(
+        from: attn1_to_k_weight, zip: archive, of: UseFloatingPoint.self)
+      let attn1_to_q_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_q.weight"
+        ] as! TensorDescriptor
+      try toqueries1.parameters(for: .weight).copy(
+        from: attn1_to_q_weight, zip: archive, of: UseFloatingPoint.self)
+      let attn1_to_v_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_v.weight"
+        ] as! TensorDescriptor
+      try tovalues1.parameters(for: .weight).copy(
+        from: attn1_to_v_weight, zip: archive, of: UseFloatingPoint.self)
+      let attn1_to_out_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_out.0.weight"
+        ] as! TensorDescriptor
+      let attn1_to_out_bias =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn1.to_out.0.bias"
+        ] as! TensorDescriptor
+      try unifyheads1.parameters(for: .weight).copy(
+        from: attn1_to_out_weight, zip: archive, of: UseFloatingPoint.self)
+      try unifyheads1.parameters(for: .bias).copy(
+        from: attn1_to_out_bias, zip: archive, of: UseFloatingPoint.self)
+      let ff_net_0_proj_weight = try
+        (state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.ff.net.0.proj.weight"
+        ] as! TensorDescriptor).inflate(from: archive, of: UseFloatingPoint.self)
+      let ff_net_0_proj_bias = try
+        (state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.ff.net.0.proj.bias"
+        ] as! TensorDescriptor).inflate(from: archive, of: UseFloatingPoint.self)
+      fc10.parameters(for: .weight).copy(
+        from: ff_net_0_proj_weight[0..<intermediateSize, 0..<ff_net_0_proj_weight.shape[1]])
+      fc10.parameters(for: .bias).copy(
+        from: ff_net_0_proj_bias[0..<intermediateSize])
+      fc11.parameters(for: .weight).copy(
+        from: ff_net_0_proj_weight[
+          intermediateSize..<ff_net_0_proj_weight.shape[0], 0..<ff_net_0_proj_weight.shape[1]])
+      fc11.parameters(for: .bias).copy(
+        from: ff_net_0_proj_bias[intermediateSize..<ff_net_0_proj_bias.shape[0]])
+      let ff_net_2_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.ff.net.2.weight"
+        ] as! TensorDescriptor
+      let ff_net_2_bias =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.ff.net.2.bias"
+        ] as! TensorDescriptor
+      try tfc2.parameters(for: .weight).copy(
+        from: ff_net_2_weight, zip: archive, of: UseFloatingPoint.self)
+      try tfc2.parameters(for: .bias).copy(
+        from: ff_net_2_bias, zip: archive, of: UseFloatingPoint.self)
+      let attn2_to_k_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_k.weight"
+        ] as! TensorDescriptor
+      try tokeys2.parameters(for: .weight).copy(
+        from: attn2_to_k_weight, zip: archive, of: UseFloatingPoint.self)
+      let attn2_to_q_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_q.weight"
+        ] as! TensorDescriptor
+      try toqueries2.parameters(for: .weight).copy(
+        from: attn2_to_q_weight, zip: archive, of: UseFloatingPoint.self)
+      let attn2_to_v_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_v.weight"
+        ] as! TensorDescriptor
+      try tovalues2.parameters(for: .weight).copy(
+        from: attn2_to_v_weight, zip: archive, of: UseFloatingPoint.self)
+      let attn2_to_out_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_out.0.weight"
+        ] as! TensorDescriptor
+      let attn2_to_out_bias =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.attn2.to_out.0.bias"
+        ] as! TensorDescriptor
+      try unifyheads2.parameters(for: .weight).copy(
+        from: attn2_to_out_weight, zip: archive, of: UseFloatingPoint.self)
+      try unifyheads2.parameters(for: .bias).copy(
+        from: attn2_to_out_bias, zip: archive, of: UseFloatingPoint.self)
+      let norm1_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm1.weight"
+        ]
+        as! TensorDescriptor
+      let norm1_bias =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm1.bias"
+        ]
+        as! TensorDescriptor
+      try layerNorm1.parameters(for: .weight).copy(
+        from: norm1_weight, zip: archive, of: UseFloatingPoint.self)
+      try layerNorm1.parameters(for: .bias).copy(
+        from: norm1_bias, zip: archive, of: UseFloatingPoint.self)
+      let norm2_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm2.weight"
+        ]
+        as! TensorDescriptor
+      let norm2_bias =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm2.bias"
+        ]
+        as! TensorDescriptor
+      try layerNorm2.parameters(for: .weight).copy(
+        from: norm2_weight, zip: archive, of: UseFloatingPoint.self)
+      try layerNorm2.parameters(for: .bias).copy(
+        from: norm2_bias, zip: archive, of: UseFloatingPoint.self)
+      let norm3_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm3.weight"
+        ]
+        as! TensorDescriptor
+      let norm3_bias =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.transformer_blocks.0.norm3.bias"
+        ]
+        as! TensorDescriptor
+      try layerNorm3.parameters(for: .weight).copy(
+        from: norm3_weight, zip: archive, of: UseFloatingPoint.self)
+      try layerNorm3.parameters(for: .bias).copy(
+        from: norm3_bias, zip: archive, of: UseFloatingPoint.self)
+      let proj_out_weight =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.proj_out.weight"
+        ] as! TensorDescriptor
+      let proj_out_bias =
+        state_dict[
+          "model.diffusion_model.\(prefix).\(layerStart).1.proj_out.bias"
+        ]
+        as! TensorDescriptor
+      try projOut.parameters(for: .weight).copy(
+        from: proj_out_weight, zip: archive, of: UseFloatingPoint.self)
+      try projOut.parameters(for: .bias).copy(
+        from: proj_out_bias, zip: archive, of: UseFloatingPoint.self)
+    }
+  }
+  if attentionBlock {
+    return (reader, Model([x, emb, c], [out]))
+  } else {
+    return (reader, Model([x, emb], [out]))
+  }
+}
+
+func MiddleBlock(
+  channels: Int, numHeads: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
+  x: Model.IO, emb: Model.IO, c: Model.IO
+) -> ((OrderedDictionary<String, Any>) throws -> Void, Model.IO) {
+  precondition(channels % numHeads == 0)
+  let k = channels / numHeads
+  let (inLayerNorm1, inLayerConv2d1, embLayer1, outLayerNorm1, outLayerConv2d1, _, resBlock1) =
+    ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
+  var out = resBlock1(x, emb)
+  let (
+    norm, projIn, layerNorm1, tokeys1, toqueries1, tovalues1, unifyheads1, layerNorm2, tokeys2,
+    toqueries2, tovalues2, unifyheads2, layerNorm3, fc10, fc11, tfc2, projOut, transformer
+  ) = SpatialTransformer(
+    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, t: embeddingSize,
+    intermediateSize: channels * 4)
+  out = transformer(out, c)
+  let (inLayerNorm2, inLayerConv2d2, embLayer2, outLayerNorm2, outLayerConv2d2, _, resBlock2) =
+    ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
+  out = resBlock2(out, emb)
+  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+    let intermediateSize = channels * 4
+    let in_layers_0_0_weight =
+      state_dict["model.diffusion_model.middle_block.0.in_layers.0.weight"]
+      as! TensorDescriptor
+    let in_layers_0_0_bias =
+      state_dict["model.diffusion_model.middle_block.0.in_layers.0.bias"]
+      as! TensorDescriptor
+    try inLayerNorm1.parameters(for: .weight).copy(
+      from: in_layers_0_0_weight, zip: archive, of: UseFloatingPoint.self)
+    try inLayerNorm1.parameters(for: .bias).copy(
+      from: in_layers_0_0_bias, zip: archive, of: UseFloatingPoint.self)
+    let in_layers_0_2_weight =
+      state_dict["model.diffusion_model.middle_block.0.in_layers.2.weight"]
+      as! TensorDescriptor
+    let in_layers_0_2_bias =
+      state_dict["model.diffusion_model.middle_block.0.in_layers.2.bias"]
+      as! TensorDescriptor
+    try inLayerConv2d1.parameters(for: .weight).copy(
+      from: in_layers_0_2_weight, zip: archive, of: UseFloatingPoint.self)
+    try inLayerConv2d1.parameters(for: .bias).copy(
+      from: in_layers_0_2_bias, zip: archive, of: UseFloatingPoint.self)
+    let emb_layers_0_1_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.0.emb_layers.1.weight"
+      ]
+      as! TensorDescriptor
+    let emb_layers_0_1_bias =
+      state_dict["model.diffusion_model.middle_block.0.emb_layers.1.bias"]
+      as! TensorDescriptor
+    try embLayer1.parameters(for: .weight).copy(
+      from: emb_layers_0_1_weight, zip: archive, of: UseFloatingPoint.self)
+    try embLayer1.parameters(for: .bias).copy(
+      from: emb_layers_0_1_bias, zip: archive, of: UseFloatingPoint.self)
+    let out_layers_0_0_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.0.out_layers.0.weight"
+      ]
+      as! TensorDescriptor
+    let out_layers_0_0_bias =
+      state_dict[
+        "model.diffusion_model.middle_block.0.out_layers.0.bias"
+      ] as! TensorDescriptor
+    try outLayerNorm1.parameters(for: .weight).copy(
+      from: out_layers_0_0_weight, zip: archive, of: UseFloatingPoint.self)
+    try outLayerNorm1.parameters(for: .bias).copy(
+      from: out_layers_0_0_bias, zip: archive, of: UseFloatingPoint.self)
+    let out_layers_0_3_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.0.out_layers.3.weight"
+      ]
+      as! TensorDescriptor
+    let out_layers_0_3_bias =
+      state_dict["model.diffusion_model.middle_block.0.out_layers.3.bias"]
+      as! TensorDescriptor
+    try outLayerConv2d1.parameters(for: .weight).copy(
+      from: out_layers_0_3_weight, zip: archive, of: UseFloatingPoint.self)
+    try outLayerConv2d1.parameters(for: .bias).copy(
+      from: out_layers_0_3_bias, zip: archive, of: UseFloatingPoint.self)
+    let norm_weight =
+      state_dict["model.diffusion_model.middle_block.1.norm.weight"]
+      as! TensorDescriptor
+    let norm_bias =
+      state_dict["model.diffusion_model.middle_block.1.norm.bias"] as! TensorDescriptor
+    try norm.parameters(for: .weight).copy(
+      from: norm_weight, zip: archive, of: UseFloatingPoint.self)
+    try norm.parameters(for: .bias).copy(from: norm_bias, zip: archive, of: UseFloatingPoint.self)
+    let proj_in_weight =
+      state_dict["model.diffusion_model.middle_block.1.proj_in.weight"]
+      as! TensorDescriptor
+    let proj_in_bias =
+      state_dict["model.diffusion_model.middle_block.1.proj_in.bias"]
+      as! TensorDescriptor
+    try projIn.parameters(for: .weight).copy(
+      from: proj_in_weight, zip: archive, of: UseFloatingPoint.self)
+    try projIn.parameters(for: .bias).copy(
+      from: proj_in_bias, zip: archive, of: UseFloatingPoint.self)
+    let attn1_to_k_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_k.weight"
+      ] as! TensorDescriptor
+    try tokeys1.parameters(for: .weight).copy(
+      from: attn1_to_k_weight, zip: archive, of: UseFloatingPoint.self)
+    let attn1_to_q_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_q.weight"
+      ] as! TensorDescriptor
+    try toqueries1.parameters(for: .weight).copy(
+      from: attn1_to_q_weight, zip: archive, of: UseFloatingPoint.self)
+    let attn1_to_v_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_v.weight"
+      ] as! TensorDescriptor
+    try tovalues1.parameters(for: .weight).copy(
+      from: attn1_to_v_weight, zip: archive, of: UseFloatingPoint.self)
+    let attn1_to_out_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_out.0.weight"
+      ] as! TensorDescriptor
+    let attn1_to_out_bias =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_out.0.bias"
+      ] as! TensorDescriptor
+    try unifyheads1.parameters(for: .weight).copy(
+      from: attn1_to_out_weight, zip: archive, of: UseFloatingPoint.self)
+    try unifyheads1.parameters(for: .bias).copy(
+      from: attn1_to_out_bias, zip: archive, of: UseFloatingPoint.self)
+    let ff_net_0_proj_weight = try
+      (state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.ff.net.0.proj.weight"
+      ] as! TensorDescriptor).inflate(from: archive, of: UseFloatingPoint.self)
+    let ff_net_0_proj_bias = try
+      (state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.ff.net.0.proj.bias"
+      ] as! TensorDescriptor).inflate(from: archive, of: UseFloatingPoint.self)
+    fc10.parameters(for: .weight).copy(
+      from: ff_net_0_proj_weight[0..<intermediateSize, 0..<ff_net_0_proj_weight.shape[1]])
+    fc10.parameters(for: .bias).copy(
+      from: ff_net_0_proj_bias[0..<intermediateSize])
+    fc11.parameters(for: .weight).copy(
+      from: ff_net_0_proj_weight[
+        intermediateSize..<ff_net_0_proj_weight.shape[0], 0..<ff_net_0_proj_weight.shape[1]])
+    fc11.parameters(for: .bias).copy(
+      from: ff_net_0_proj_bias[intermediateSize..<ff_net_0_proj_bias.shape[0]])
+    let ff_net_2_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.ff.net.2.weight"
+      ] as! TensorDescriptor
+    let ff_net_2_bias =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.ff.net.2.bias"
+      ] as! TensorDescriptor
+    try tfc2.parameters(for: .weight).copy(
+      from: ff_net_2_weight, zip: archive, of: UseFloatingPoint.self)
+    try tfc2.parameters(for: .bias).copy(
+      from: ff_net_2_bias, zip: archive, of: UseFloatingPoint.self)
+    let attn2_to_k_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_k.weight"
+      ] as! TensorDescriptor
+    try tokeys2.parameters(for: .weight).copy(
+      from: attn2_to_k_weight, zip: archive, of: UseFloatingPoint.self)
+    let attn2_to_q_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_q.weight"
+      ] as! TensorDescriptor
+    try toqueries2.parameters(for: .weight).copy(
+      from: attn2_to_q_weight, zip: archive, of: UseFloatingPoint.self)
+    let attn2_to_v_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_v.weight"
+      ] as! TensorDescriptor
+    try tovalues2.parameters(for: .weight).copy(
+      from: attn2_to_v_weight, zip: archive, of: UseFloatingPoint.self)
+    let attn2_to_out_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_out.0.weight"
+      ] as! TensorDescriptor
+    let attn2_to_out_bias =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.attn2.to_out.0.bias"
+      ] as! TensorDescriptor
+    try unifyheads2.parameters(for: .weight).copy(
+      from: attn2_to_out_weight, zip: archive, of: UseFloatingPoint.self)
+    try unifyheads2.parameters(for: .bias).copy(
+      from: attn2_to_out_bias, zip: archive, of: UseFloatingPoint.self)
+    let norm1_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.norm1.weight"
+      ]
+      as! TensorDescriptor
+    let norm1_bias =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.norm1.bias"
+      ]
+      as! TensorDescriptor
+    try layerNorm1.parameters(for: .weight).copy(
+      from: norm1_weight, zip: archive, of: UseFloatingPoint.self)
+    try layerNorm1.parameters(for: .bias).copy(
+      from: norm1_bias, zip: archive, of: UseFloatingPoint.self)
+    let norm2_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.norm2.weight"
+      ]
+      as! TensorDescriptor
+    let norm2_bias =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.norm2.bias"
+      ]
+      as! TensorDescriptor
+    try layerNorm2.parameters(for: .weight).copy(
+      from: norm2_weight, zip: archive, of: UseFloatingPoint.self)
+    try layerNorm2.parameters(for: .bias).copy(
+      from: norm2_bias, zip: archive, of: UseFloatingPoint.self)
+    let norm3_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.norm3.weight"
+      ]
+      as! TensorDescriptor
+    let norm3_bias =
+      state_dict[
+        "model.diffusion_model.middle_block.1.transformer_blocks.0.norm3.bias"
+      ]
+      as! TensorDescriptor
+    try layerNorm3.parameters(for: .weight).copy(
+      from: norm3_weight, zip: archive, of: UseFloatingPoint.self)
+    try layerNorm3.parameters(for: .bias).copy(
+      from: norm3_bias, zip: archive, of: UseFloatingPoint.self)
+    let proj_out_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.1.proj_out.weight"
+      ] as! TensorDescriptor
+    let proj_out_bias =
+      state_dict["model.diffusion_model.middle_block.1.proj_out.bias"]
+      as! TensorDescriptor
+    try projOut.parameters(for: .weight).copy(
+      from: proj_out_weight, zip: archive, of: UseFloatingPoint.self)
+    try projOut.parameters(for: .bias).copy(
+      from: proj_out_bias, zip: archive, of: UseFloatingPoint.self)
+    let in_layers_2_0_weight =
+      state_dict["model.diffusion_model.middle_block.2.in_layers.0.weight"]
+      as! TensorDescriptor
+    let in_layers_2_0_bias =
+      state_dict["model.diffusion_model.middle_block.2.in_layers.0.bias"]
+      as! TensorDescriptor
+    try inLayerNorm2.parameters(for: .weight).copy(
+      from: in_layers_2_0_weight, zip: archive, of: UseFloatingPoint.self)
+    try inLayerNorm2.parameters(for: .bias).copy(
+      from: in_layers_2_0_bias, zip: archive, of: UseFloatingPoint.self)
+    let in_layers_2_2_weight =
+      state_dict["model.diffusion_model.middle_block.2.in_layers.2.weight"]
+      as! TensorDescriptor
+    let in_layers_2_2_bias =
+      state_dict["model.diffusion_model.middle_block.2.in_layers.2.bias"]
+      as! TensorDescriptor
+    try inLayerConv2d2.parameters(for: .weight).copy(
+      from: in_layers_2_2_weight, zip: archive, of: UseFloatingPoint.self)
+    try inLayerConv2d2.parameters(for: .bias).copy(
+      from: in_layers_2_2_bias, zip: archive, of: UseFloatingPoint.self)
+    let emb_layers_2_1_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.2.emb_layers.1.weight"
+      ]
+      as! TensorDescriptor
+    let emb_layers_2_1_bias =
+      state_dict["model.diffusion_model.middle_block.2.emb_layers.1.bias"]
+      as! TensorDescriptor
+    try embLayer2.parameters(for: .weight).copy(
+      from: emb_layers_2_1_weight, zip: archive, of: UseFloatingPoint.self)
+    try embLayer2.parameters(for: .bias).copy(
+      from: emb_layers_2_1_bias, zip: archive, of: UseFloatingPoint.self)
+    let out_layers_2_0_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.2.out_layers.0.weight"
+      ]
+      as! TensorDescriptor
+    let out_layers_2_0_bias =
+      state_dict[
+        "model.diffusion_model.middle_block.2.out_layers.0.bias"
+      ] as! TensorDescriptor
+    try outLayerNorm2.parameters(for: .weight).copy(
+      from: out_layers_2_0_weight, zip: archive, of: UseFloatingPoint.self)
+    try outLayerNorm2.parameters(for: .bias).copy(
+      from: out_layers_2_0_bias, zip: archive, of: UseFloatingPoint.self)
+    let out_layers_2_3_weight =
+      state_dict[
+        "model.diffusion_model.middle_block.2.out_layers.3.weight"
+      ]
+      as! TensorDescriptor
+    let out_layers_2_3_bias =
+      state_dict["model.diffusion_model.middle_block.2.out_layers.3.bias"]
+      as! TensorDescriptor
+    try outLayerConv2d2.parameters(for: .weight).copy(
+      from: out_layers_2_3_weight, zip: archive, of: UseFloatingPoint.self)
+    try outLayerConv2d2.parameters(for: .bias).copy(
+      from: out_layers_2_3_bias, zip: archive, of: UseFloatingPoint.self)
+  }
+  return (reader, out)
+}
+
+func InputBlocks(
+  channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO
+) -> ((OrderedDictionary<String, Any>) throws -> Void, [Model.IO], Model.IO) {
+  let conv2d = Convolution(
+    groups: 1, filters: 320, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  var out = conv2d(x)
+  var layerStart = 1
+  var height = startHeight
+  var width = startWidth
+  var readers = [(OrderedDictionary<String, Any>) throws -> Void]()
+  var previousChannel = channels[0]
+  var ds = 1
+  var passLayers = [out]
+  for (i, channel) in channels.enumerated() {
+    let attentionBlock = attentionRes.contains(ds)
+    for _ in 0..<numRepeat {
+      let (reader, inputLayer) = BlockLayer(
+        prefix: "input_blocks",
+        layerStart: layerStart, skipConnection: previousChannel != channel,
+        attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
+        height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
+      previousChannel = channel
+      if attentionBlock {
+        out = inputLayer(out, emb, c)
+      } else {
+        out = inputLayer(out, emb)
+      }
+      passLayers.append(out)
+      readers.append(reader)
+      layerStart += 1
+    }
+    if i != channels.count - 1 {
+      let downsample = Convolution(
+        groups: 1, filters: channel, filterSize: [3, 3],
+        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [0, 0])))
+      out = downsample(out)
+      passLayers.append(out)
+      let downLayer = layerStart
+      let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+        let op_weight =
+          state_dict["model.diffusion_model.input_blocks.\(downLayer).0.op.weight"]
+          as! TensorDescriptor
+        let op_bias =
+          state_dict["model.diffusion_model.input_blocks.\(downLayer).0.op.bias"]
+          as! TensorDescriptor
+        try downsample.parameters(for: .weight).copy(
+          from: op_weight, zip: archive, of: UseFloatingPoint.self)
+        try downsample.parameters(for: .bias).copy(
+          from: op_bias, zip: archive, of: UseFloatingPoint.self)
+      }
+      readers.append(reader)
+      height = height / 2
+      width = width / 2
+      layerStart += 1
+      ds *= 2
+    }
+  }
+  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+    let input_blocks_0_0_weight =
+      state_dict["model.diffusion_model.input_blocks.0.0.weight"]
+      as! TensorDescriptor
+    let input_blocks_0_0_bias =
+      state_dict["model.diffusion_model.input_blocks.0.0.bias"] as! TensorDescriptor
+    try conv2d.parameters(for: .weight).copy(
+      from: input_blocks_0_0_weight, zip: archive, of: UseFloatingPoint.self)
+    try conv2d.parameters(for: .bias).copy(
+      from: input_blocks_0_0_bias, zip: archive, of: UseFloatingPoint.self)
+    for reader in readers {
+      try reader(state_dict)
+    }
+  }
+  return (reader, passLayers, out)
+}
+
+func OutputBlocks(
+  channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO,
+  inputs: [Model.IO]
+) -> ((OrderedDictionary<String, Any>) throws -> Void, Model.IO) {
+  var layerStart = 0
+  var height = startHeight
+  var width = startWidth
+  var readers = [(OrderedDictionary<String, Any>) throws -> Void]()
+  var ds = 1
+  var heights = [height]
+  var widths = [width]
+  var dss = [ds]
+  for _ in 0..<channels.count - 1 {
+    height = height / 2
+    width = width / 2
+    ds *= 2
+    heights.append(height)
+    widths.append(width)
+    dss.append(ds)
+  }
+  var out = x
+  var inputIdx = inputs.count - 1
+  for (i, channel) in channels.enumerated().reversed() {
+    let height = heights[i]
+    let width = widths[i]
+    let ds = dss[i]
+    let attentionBlock = attentionRes.contains(ds)
+    for j in 0..<(numRepeat + 1) {
+      out = Concat(axis: 1)(out, inputs[inputIdx])
+      inputIdx -= 1
+      let (reader, outputLayer) = BlockLayer(
+        prefix: "output_blocks",
+        layerStart: layerStart, skipConnection: true,
+        attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
+        height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
+      if attentionBlock {
+        out = outputLayer(out, emb, c)
+      } else {
+        out = outputLayer(out, emb)
+      }
+      readers.append(reader)
+      if i > 0 && j == numRepeat {
+        out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
+        let conv2d = Convolution(
+          groups: 1, filters: channel, filterSize: [3, 3],
+          hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+        out = conv2d(out)
+        let upLayer = layerStart
+        let convIdx = attentionBlock ? 2 : 1
+        let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+          let op_weight =
+            state_dict[
+              "model.diffusion_model.output_blocks.\(upLayer).\(convIdx).conv.weight"
+            ] as! TensorDescriptor
+          let op_bias =
+            state_dict[
+              "model.diffusion_model.output_blocks.\(upLayer).\(convIdx).conv.bias"
+            ]
+            as! TensorDescriptor
+          try conv2d.parameters(for: .weight).copy(
+            from: op_weight, zip: archive, of: UseFloatingPoint.self)
+          try conv2d.parameters(for: .bias).copy(
+            from: op_bias, zip: archive, of: UseFloatingPoint.self)
+        }
+        readers.append(reader)
+      }
+      layerStart += 1
+    }
+  }
+  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+    for reader in readers {
+      try reader(state_dict)
+    }
+  }
+  return (reader, out)
+}
+
+func UNet(batchSize: Int) -> ((OrderedDictionary<String, Any>) throws -> Void, Model) {
+  let x = Input()
+  let t_emb = Input()
+  let c = Input()
+  let (fc0, fc2, timeEmbed) = TimeEmbed(modelChannels: 320)
+  let emb = timeEmbed(t_emb)
+  let attentionRes = Set([4, 2, 1])
+  let (inputReader, inputs, inputBlocks) = InputBlocks(
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    startHeight: 64,
+    startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
+  var out = inputBlocks
+  let (middleReader, middleBlock) = MiddleBlock(
+    channels: 1280, numHeads: 8, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
+    x: out,
+    emb: emb, c: c)
+  out = middleBlock
+  let (outputReader, outputBlocks) = OutputBlocks(
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    startHeight: 64,
+    startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
+    inputs: inputs)
+  out = outputBlocks
+  let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  out = outNorm(out)
+  out = Swish()(out)
+  let outConv2d = Convolution(
+    groups: 1, filters: 4, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = outConv2d(out)
+  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+    let time_embed_0_weight =
+      state_dict["model.diffusion_model.time_embed.0.weight"] as! TensorDescriptor
+    let time_embed_0_bias =
+      state_dict["model.diffusion_model.time_embed.0.bias"] as! TensorDescriptor
+    let time_embed_2_weight =
+      state_dict["model.diffusion_model.time_embed.2.weight"] as! TensorDescriptor
+    let time_embed_2_bias =
+      state_dict["model.diffusion_model.time_embed.2.bias"] as! TensorDescriptor
+    try fc0.parameters(for: .weight).copy(
+      from: time_embed_0_weight, zip: archive, of: UseFloatingPoint.self)
+    try fc0.parameters(for: .bias).copy(
+      from: time_embed_0_bias, zip: archive, of: UseFloatingPoint.self)
+    try fc2.parameters(for: .weight).copy(
+      from: time_embed_2_weight, zip: archive, of: UseFloatingPoint.self)
+    try fc2.parameters(for: .bias).copy(
+      from: time_embed_2_bias, zip: archive, of: UseFloatingPoint.self)
+    try inputReader(state_dict)
+    try middleReader(state_dict)
+    try outputReader(state_dict)
+    let out_0_weight = state_dict["model.diffusion_model.out.0.weight"] as! TensorDescriptor
+    let out_0_bias = state_dict["model.diffusion_model.out.0.bias"] as! TensorDescriptor
+    try outNorm.parameters(for: .weight).copy(
+      from: out_0_weight, zip: archive, of: UseFloatingPoint.self)
+    try outNorm.parameters(for: .bias).copy(
+      from: out_0_bias, zip: archive, of: UseFloatingPoint.self)
+    let out_2_weight = state_dict["model.diffusion_model.out.2.weight"] as! TensorDescriptor
+    let out_2_bias = state_dict["model.diffusion_model.out.2.bias"] as! TensorDescriptor
+    try outConv2d.parameters(for: .weight).copy(
+      from: out_2_weight, zip: archive, of: UseFloatingPoint.self)
+    try outConv2d.parameters(for: .bias).copy(
+      from: out_2_bias, zip: archive, of: UseFloatingPoint.self)
+  }
+  return (reader, Model([x, t_emb, c], [out]))
+}
+
 let (
   tokenEmbed, positionEmbed, layerNorm1s, tokeys, toqueries, tovalues, unifyheads, layerNorm2s,
   fc1s, fc2s, finalLayerNorm, textModel
@@ -235,7 +1252,23 @@ for i in 0..<76 {
   }
 }
 
+let t_emb = graph.variable(
+  Tensor<UseFloatingPoint>(
+    from: timeEmbedding(timesteps: 981, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000))
+).toGPU(0)
+let xTensor = graph.variable(.CPU, .NCHW(2, 4, 64, 64), of: UseFloatingPoint.self).toGPU(0)
+let cTensor = graph.variable(.CPU, .CHW(2, 77, 768), of: UseFloatingPoint.self).toGPU(0)
+let (reader, unet) = UNet(batchSize: 2)
+
 try graph.withNoGrad {
+  /// Load UNet.
+  unet.compile(inputs: xTensor, t_emb, cTensor)
+  try reader(state_dict)
+  graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
+    $0.write("unet", model: unet)
+  }
+
+  /// Load text model.
   textModel.compile(
     inputs: tokensTensor.toGPU(0), positionTensor.toGPU(0), casualAttentionMask.toGPU(0))
   let vocab =
