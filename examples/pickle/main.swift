@@ -4,9 +4,39 @@ import Foundation
 import NNC
 import ZIPFoundation
 
-public typealias UseFloatingPoint = Float32
+public typealias UseFloatingPoint = Float16
 
-let filename = "/fast/Data/SD/eldenRing-v3-pruned.ckpt"
+let file1 = "/home/liu/workspace/swift-diffusion/mdjrny_v4_f16.ckpt"
+let file2 = "/home/liu/workspace/swift-diffusion/unet.ckpt"
+
+let graph = DynamicGraph()
+
+graph.openStore(file1) { store1 in
+  let keys1 = store1.keys
+  graph.openStore(file2) { store2 in
+    let keys2 = store2.keys
+    precondition(keys1 == keys2)
+    for key in keys2 {
+      let tensor1 = store1.read(key)!
+      let tensor2 = store2.read(key)!
+      let tensor1Size = tensor1.shape.reduce(1, *)
+      let tensor2Size = tensor2.shape.reduce(1, *)
+      precondition(tensor1Size == tensor2Size)
+      let tensor1r = Tensor<UseFloatingPoint>(tensor1).reshaped(.C(tensor1Size)).toCPU()
+      let tensor2r = Tensor<UseFloatingPoint>(tensor2).reshaped(.C(tensor2Size)).toCPU()
+      for i in 0..<tensor1Size {
+        if tensor1r[i] != tensor2r[i] {
+          print(
+            "\(key) loc \(i), v1 \(tensor1.shape) \(tensor1r[i]), v2 \(tensor2.shape) \(tensor2r[i])"
+          )
+          break
+        }
+      }
+    }
+  }
+}
+/*
+let filename = "/fast/Data/SD/mdjrny-v4.ckpt"
 
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 
@@ -76,14 +106,14 @@ extension TensorDescriptor {
         tensor = Tensor<Float16>(
           .CPU, format: .NCHW, shape: TensorShape(shape),
           unsafeMutablePointer: address.assumingMemoryBound(to: Float16.self), bindLifetimeOf: entry
-        ).copied()
+        )
       } else {
         tensor = Tensor<Float>(
           .CPU, format: .NCHW, shape: TensorShape(shape),
           unsafeMutablePointer: address.assumingMemoryBound(to: Float.self), bindLifetimeOf: entry
-        ).copied()
+        )
       }
-      return Tensor<T>(from: tensor)
+      return Tensor<T>(from: tensor).copied()
     }
   }
 }
@@ -103,6 +133,7 @@ interpreter.intercept(module: "torch._utils", function: "_rebuild_tensor_v2") {
     let shape = args[2] as? [Int],
     let strides = args[3] as? [Int]
   else { return [nil] }
+  precondition(storageOffset == 0)
   let tensorDescriptor = TensorDescriptor(
     storage: storage, storageOffset: storageOffset, shape: shape, strides: strides)
   return [tensorDescriptor]
@@ -1402,3 +1433,4 @@ try graph.withNoGrad {
     $0.write("text_model", model: textModel)
   }
 }
+*/
