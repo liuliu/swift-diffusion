@@ -1,11 +1,12 @@
+import Collections
 import Fickling
 import Foundation
 import NNC
 import ZIPFoundation
 
-public typealias UseFloatingPoint = Float
+public typealias UseFloatingPoint = Float16
 
-let filename = "/fast/Data/SD/eldenRing-v3-pruned.ckpt"
+let filename = "/fast/Data/SD/PaperCut_v1.ckpt"
 
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 
@@ -19,6 +20,11 @@ extension Model.Parameters {
   func copy<T: TensorNumeric>(
     from tensorDescriptor: TensorDescriptor, zip: Archive, of type: T.Type
   ) throws {
+    var v = 1
+    for i in stride(from: tensorDescriptor.shape.count - 1, through: 0, by: -1) {
+      precondition(tensorDescriptor.strides[i] == v)
+      v *= tensorDescriptor.shape[i]
+    }
     let entry = archive["archive/data/\(tensorDescriptor.storage.name)"]!
     var data = Data()
     let _ = try archive.extract(entry) { data.append($0) }
@@ -48,6 +54,7 @@ struct Storage {
 
 struct TensorDescriptor {
   var storage: Storage
+  var storageOffset: Int
   var shape: [Int]
   var strides: [Int]
 }
@@ -63,18 +70,25 @@ interpreter.intercept(module: "UNPICKLER", function: "persistent_load") { module
 }
 interpreter.intercept(module: "torch._utils", function: "_rebuild_tensor_v2") {
   module, function, args in
-  guard args.count >= 5, let storage = args[0] as? Storage, let shape = args[2] as? [Int],
+  guard args.count >= 5, let storage = args[0] as? Storage, let storageOffset = args[1] as? Int,
+    let shape = args[2] as? [Int],
     let strides = args[3] as? [Int]
   else { return [nil] }
-  let tensorDescriptor = TensorDescriptor(storage: storage, shape: shape, strides: strides)
+  let tensorDescriptor = TensorDescriptor(
+    storage: storage, storageOffset: storageOffset, shape: shape, strides: strides)
   return [tensorDescriptor]
 }
 interpreter.intercept(module: nil, function: nil) { module, function, args in
   return [nil]
 }
 while try interpreter.step() {}
-let model = (interpreter.rootObject as? [String: Any])!
-let state_dict = (model["state_dict"] as? [String: Any])!
+let model =
+  (interpreter.rootObject as? OrderedDictionary<String, Any>)
+  ?? OrderedDictionary<String, Any>(
+    uniqueKeysWithValues: (interpreter.rootObject as? [String: Any])!)
+let state_dict =
+  (model["state_dict"] as? OrderedDictionary<String, Any>)
+  ?? OrderedDictionary<String, Any>(uniqueKeysWithValues: (model["state_dict"] as? [String: Any])!)
 
 /// CLIP Text Model
 
@@ -222,7 +236,8 @@ for i in 0..<76 {
 }
 
 try graph.withNoGrad {
-  textModel.compile(inputs: tokensTensor, positionTensor, casualAttentionMask)
+  textModel.compile(
+    inputs: tokensTensor.toGPU(0), positionTensor.toGPU(0), casualAttentionMask.toGPU(0))
   let vocab =
     state_dict["cond_stage_model.transformer.text_model.embeddings.token_embedding.weight"]
     as! TensorDescriptor
