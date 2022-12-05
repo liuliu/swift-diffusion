@@ -6,7 +6,7 @@ import ZIPFoundation
 
 public typealias UseFloatingPoint = Float16
 
-let file1 = "/home/liu/workspace/swift-diffusion/mdjrny_v4_f16.ckpt"
+let file1 = "/home/liu/workspace/swift-diffusion/nitro_v1_f16.ckpt"
 let file2 = "/home/liu/workspace/swift-diffusion/unet.ckpt"
 
 let graph = DynamicGraph()
@@ -36,7 +36,7 @@ graph.openStore(file1) { store1 in
   }
 }
 /*
-let filename = "/fast/Data/SD/mdjrny-v4.ckpt"
+let filename = "/fast/Data/SD/nitroDiffusion-v1.ckpt"
 
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 
@@ -142,13 +142,18 @@ interpreter.intercept(module: nil, function: nil) { module, function, args in
   return [nil]
 }
 while try interpreter.step() {}
-let model =
-  (interpreter.rootObject as? OrderedDictionary<String, Any>)
-  ?? OrderedDictionary<String, Any>(
-    uniqueKeysWithValues: (interpreter.rootObject as? [String: Any])!)
-let state_dict =
-  (model["state_dict"] as? OrderedDictionary<String, Any>)
-  ?? OrderedDictionary<String, Any>(uniqueKeysWithValues: (model["state_dict"] as? [String: Any])!)
+let model = (interpreter.rootObject as? Interpreter.Dictionary)!
+let state_dict = (model["state_dict"] as? Interpreter.Dictionary)!
+
+var renameVAE = [String: Any]()
+state_dict.forEach { key, value in
+  if key.hasPrefix("encoder.") || key.hasPrefix("decoder.") || key.hasPrefix("post_quant_conv.") || key.hasPrefix("quant_conv.") {
+    renameVAE[key] = value
+  }
+}
+for (key, value) in renameVAE {
+  state_dict["first_stage_model.\(key)"] = value
+}
 
 /// CLIP Text Model
 
@@ -446,7 +451,7 @@ func BlockLayer(
   prefix: String,
   layerStart: Int, skipConnection: Bool, attentionBlock: Bool, channels: Int, numHeads: Int,
   batchSize: Int, height: Int, width: Int, embeddingSize: Int, intermediateSize: Int
-) -> ((OrderedDictionary<String, Any>) throws -> Void, Model) {
+) -> ((Interpreter.Dictionary) throws -> Void, Model) {
   let x = Input()
   let emb = Input()
   let c = Input()
@@ -482,7 +487,7 @@ func BlockLayer(
       intermediateSize: channels * 4)
     out = transformer(out, c)
   }
-  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+  let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
     let in_layers_0_weight =
       state_dict[
         "model.diffusion_model.\(prefix).\(layerStart).0.in_layers.0.weight"
@@ -740,7 +745,7 @@ func BlockLayer(
 func MiddleBlock(
   channels: Int, numHeads: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
   x: Model.IO, emb: Model.IO, c: Model.IO
-) -> ((OrderedDictionary<String, Any>) throws -> Void, Model.IO) {
+) -> ((Interpreter.Dictionary) throws -> Void, Model.IO) {
   precondition(channels % numHeads == 0)
   let k = channels / numHeads
   let (inLayerNorm1, inLayerConv2d1, embLayer1, outLayerNorm1, outLayerConv2d1, _, resBlock1) =
@@ -756,7 +761,7 @@ func MiddleBlock(
   let (inLayerNorm2, inLayerConv2d2, embLayer2, outLayerNorm2, outLayerConv2d2, _, resBlock2) =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   out = resBlock2(out, emb)
-  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+  let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
     let intermediateSize = channels * 4
     let in_layers_0_0_weight =
       state_dict["model.diffusion_model.middle_block.0.in_layers.0.weight"]
@@ -1039,7 +1044,7 @@ func MiddleBlock(
 func InputBlocks(
   channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
   embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO
-) -> ((OrderedDictionary<String, Any>) throws -> Void, [Model.IO], Model.IO) {
+) -> ((Interpreter.Dictionary) throws -> Void, [Model.IO], Model.IO) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
@@ -1047,7 +1052,7 @@ func InputBlocks(
   var layerStart = 1
   var height = startHeight
   var width = startWidth
-  var readers = [(OrderedDictionary<String, Any>) throws -> Void]()
+  var readers = [(Interpreter.Dictionary) throws -> Void]()
   var previousChannel = channels[0]
   var ds = 1
   var passLayers = [out]
@@ -1076,7 +1081,7 @@ func InputBlocks(
       out = downsample(out)
       passLayers.append(out)
       let downLayer = layerStart
-      let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+      let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
         let op_weight =
           state_dict["model.diffusion_model.input_blocks.\(downLayer).0.op.weight"]
           as! TensorDescriptor
@@ -1095,7 +1100,7 @@ func InputBlocks(
       ds *= 2
     }
   }
-  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+  let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
     let input_blocks_0_0_weight =
       state_dict["model.diffusion_model.input_blocks.0.0.weight"]
       as! TensorDescriptor
@@ -1116,11 +1121,11 @@ func OutputBlocks(
   channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
   embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO,
   inputs: [Model.IO]
-) -> ((OrderedDictionary<String, Any>) throws -> Void, Model.IO) {
+) -> ((Interpreter.Dictionary) throws -> Void, Model.IO) {
   var layerStart = 0
   var height = startHeight
   var width = startWidth
-  var readers = [(OrderedDictionary<String, Any>) throws -> Void]()
+  var readers = [(Interpreter.Dictionary) throws -> Void]()
   var ds = 1
   var heights = [height]
   var widths = [width]
@@ -1162,7 +1167,7 @@ func OutputBlocks(
         out = conv2d(out)
         let upLayer = layerStart
         let convIdx = attentionBlock ? 2 : 1
-        let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+        let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
           let op_weight =
             state_dict[
               "model.diffusion_model.output_blocks.\(upLayer).\(convIdx).conv.weight"
@@ -1182,7 +1187,7 @@ func OutputBlocks(
       layerStart += 1
     }
   }
-  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+  let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
     for reader in readers {
       try reader(state_dict)
     }
@@ -1190,7 +1195,7 @@ func OutputBlocks(
   return (reader, out)
 }
 
-func UNet(batchSize: Int) -> ((OrderedDictionary<String, Any>) throws -> Void, Model) {
+func UNet(batchSize: Int) -> ((Interpreter.Dictionary) throws -> Void, Model) {
   let x = Input()
   let t_emb = Input()
   let c = Input()
@@ -1220,7 +1225,7 @@ func UNet(batchSize: Int) -> ((OrderedDictionary<String, Any>) throws -> Void, M
     groups: 1, filters: 4, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = outConv2d(out)
-  let reader: (OrderedDictionary<String, Any>) throws -> Void = { state_dict in
+  let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
     let time_embed_0_weight =
       state_dict["model.diffusion_model.time_embed.0.weight"] as! TensorDescriptor
     let time_embed_0_bias =
@@ -1256,6 +1261,291 @@ func UNet(batchSize: Int) -> ((OrderedDictionary<String, Any>) throws -> Void, M
   return (reader, Model([x, t_emb, c], [out]))
 }
 
+func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (
+  (Interpreter.Dictionary) throws -> Void, Model
+) {
+  let x = Input()
+  let norm1 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  var out = norm1(x)
+  out = Swish()(out)
+  let conv1 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = conv1(out)
+  let norm2 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  out = norm2(out)
+  out = Swish()(out)
+  let conv2 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = conv2(out)
+  let ninShortcut: Model?
+  if shortcut {
+    let nin = Convolution(
+      groups: 1, filters: outChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+    out = nin(x) + out
+    ninShortcut = nin
+  } else {
+    ninShortcut = nil
+    out = x + out
+  }
+  let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
+    let norm1_weight = state_dict["first_stage_model.\(prefix).norm1.weight"] as! TensorDescriptor
+    let norm1_bias = state_dict["first_stage_model.\(prefix).norm1.bias"] as! TensorDescriptor
+    try norm1.parameters(for: .weight).copy(from: norm1_weight, zip: archive, of: UseFloatingPoint.self)
+    try norm1.parameters(for: .bias).copy(from: norm1_bias, zip: archive, of: UseFloatingPoint.self)
+    let conv1_weight = state_dict["first_stage_model.\(prefix).conv1.weight"] as! TensorDescriptor
+    let conv1_bias = state_dict["first_stage_model.\(prefix).conv1.bias"] as! TensorDescriptor
+    try conv1.parameters(for: .weight).copy(from: conv1_weight, zip: archive, of: UseFloatingPoint.self)
+    try conv1.parameters(for: .bias).copy(from: conv1_bias, zip: archive, of: UseFloatingPoint.self)
+    let norm2_weight = state_dict["first_stage_model.\(prefix).norm2.weight"] as! TensorDescriptor
+    let norm2_bias = state_dict["first_stage_model.\(prefix).norm2.bias"] as! TensorDescriptor
+    try norm2.parameters(for: .weight).copy(from: norm2_weight, zip: archive, of: UseFloatingPoint.self)
+    try norm2.parameters(for: .bias).copy(from: norm2_bias, zip: archive, of: UseFloatingPoint.self)
+    let conv2_weight = state_dict["first_stage_model.\(prefix).conv2.weight"] as! TensorDescriptor
+    let conv2_bias = state_dict["first_stage_model.\(prefix).conv2.bias"] as! TensorDescriptor
+    try conv2.parameters(for: .weight).copy(from: conv2_weight, zip: archive, of: UseFloatingPoint.self)
+    try conv2.parameters(for: .bias).copy(from: conv2_bias, zip: archive, of: UseFloatingPoint.self)
+    if let ninShortcut = ninShortcut {
+      let nin_shortcut_weight = state_dict["first_stage_model.\(prefix).nin_shortcut.weight"] as! TensorDescriptor
+      let nin_shortcut_bias = state_dict["first_stage_model.\(prefix).nin_shortcut.bias"] as! TensorDescriptor
+      try ninShortcut.parameters(for: .weight).copy(
+        from: nin_shortcut_weight, zip: archive, of: UseFloatingPoint.self)
+      try ninShortcut.parameters(for: .bias).copy(from: nin_shortcut_bias, zip: archive, of: UseFloatingPoint.self)
+    }
+  }
+  return (reader, Model([x], [out]))
+}
+
+func AttnBlock(prefix: String, inChannels: Int, batchSize: Int, width: Int, height: Int) -> (
+  (Interpreter.Dictionary) throws -> Void, Model
+) {
+  let x = Input()
+  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  var out = norm(x)
+  let hw = width * height
+  let tokeys = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let k = tokeys(out).reshaped([batchSize, inChannels, hw])
+  let toqueries = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
+    batchSize, inChannels, hw,
+  ])
+  var dot = Matmul(transposeA: (1, 2))(q, k)
+  dot = dot.reshaped([batchSize * hw, hw])
+  dot = dot.softmax()
+  dot = dot.reshaped([batchSize, hw, hw])
+  let tovalues = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let v = tovalues(out).reshaped([batchSize, inChannels, hw])
+  out = Matmul(transposeB: (1, 2))(v, dot)
+  let projOut = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  out = x + projOut(out.reshaped([batchSize, inChannels, height, width]))
+  let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
+    let norm_weight = state_dict["first_stage_model.\(prefix).norm.weight"] as! TensorDescriptor
+    let norm_bias = state_dict["first_stage_model.\(prefix).norm.bias"] as! TensorDescriptor
+    try norm.parameters(for: .weight).copy(from: norm_weight, zip: archive, of: UseFloatingPoint.self)
+    try norm.parameters(for: .bias).copy(from: norm_bias, zip: archive, of: UseFloatingPoint.self)
+    let k_weight = state_dict["first_stage_model.\(prefix).k.weight"] as! TensorDescriptor
+    let k_bias = state_dict["first_stage_model.\(prefix).k.bias"] as! TensorDescriptor
+    try tokeys.parameters(for: .weight).copy(from: k_weight, zip: archive, of: UseFloatingPoint.self)
+    try tokeys.parameters(for: .bias).copy(from: k_bias, zip: archive, of: UseFloatingPoint.self)
+    let q_weight = state_dict["first_stage_model.\(prefix).q.weight"] as! TensorDescriptor
+    let q_bias = state_dict["first_stage_model.\(prefix).q.bias"] as! TensorDescriptor
+    try toqueries.parameters(for: .weight).copy(from: q_weight, zip: archive, of: UseFloatingPoint.self)
+    try toqueries.parameters(for: .bias).copy(from: q_bias, zip: archive, of: UseFloatingPoint.self)
+    let v_weight = state_dict["first_stage_model.\(prefix).v.weight"] as! TensorDescriptor
+    let v_bias = state_dict["first_stage_model.\(prefix).v.bias"] as! TensorDescriptor
+    try tovalues.parameters(for: .weight).copy(from: v_weight, zip: archive, of: UseFloatingPoint.self)
+    try tovalues.parameters(for: .bias).copy(from: v_bias, zip: archive, of: UseFloatingPoint.self)
+    let proj_out_weight = state_dict["first_stage_model.\(prefix).proj_out.weight"] as! TensorDescriptor
+    let proj_out_bias = state_dict["first_stage_model.\(prefix).proj_out.bias"] as! TensorDescriptor
+    try projOut.parameters(for: .weight).copy(from: proj_out_weight, zip: archive, of: UseFloatingPoint.self)
+    try projOut.parameters(for: .bias).copy(from: proj_out_bias, zip: archive, of: UseFloatingPoint.self)
+  }
+  return (reader, Model([x], [out]))
+}
+
+func Encoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, startHeight: Int)
+  -> ((Interpreter.Dictionary) throws -> Void, Model)
+{
+  let x = Input()
+  var previousChannel = channels[0]
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  var out = convIn(x)
+  var readers = [(Interpreter.Dictionary) throws -> Void]()
+  var height = startHeight
+  var width = startWidth
+  for _ in 1..<channels.count {
+    height *= 2
+    width *= 2
+  }
+  for (i, channel) in channels.enumerated() {
+    for j in 0..<numRepeat {
+      let (reader, block) = ResnetBlock(
+        prefix: "encoder.down.\(i).block.\(j)", outChannels: channel, shortcut: previousChannel != channel)
+      readers.append(reader)
+      out = block(out)
+      previousChannel = channel
+    }
+    if i < channels.count - 1 {
+      // Conv always pad left first, then right, and pad top first then bottom.
+      // Thus, we cannot have (0, 1, 0, 1) (left 0, right 1, top 0, bottom 1) padding as in
+      // Stable Diffusion. Instead, we pad to (2, 1, 2, 1) and simply discard the first row and first column.
+      height /= 2
+      width /= 2
+      let conv2d = Convolution(
+        groups: 1, filters: channel, filterSize: [3, 3],
+        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [2, 2], end: [1, 1])))
+      out = conv2d(out).reshaped(
+        [batchSize, channel, height, width], offset: [0, 0, 1, 1],
+        strides: [channel * (height + 1) * (width + 1), (height + 1) * (width + 1), width + 1, 1])
+      let downLayer = i
+      let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
+        let conv_weight = state_dict["first_stage_model.encoder.down.\(downLayer).downsample.conv.weight"] as! TensorDescriptor
+        let conv_bias = state_dict["first_stage_model.encoder.down.\(downLayer).downsample.conv.bias"] as! TensorDescriptor
+        try conv2d.parameters(for: .weight).copy(from: conv_weight, zip: archive, of: UseFloatingPoint.self)
+        try conv2d.parameters(for: .bias).copy(from: conv_bias, zip: archive, of: UseFloatingPoint.self)
+      }
+      readers.append(reader)
+    }
+  }
+  let (midBlockReader1, midBlock1) = ResnetBlock(
+    prefix: "encoder.mid.block_1", outChannels: previousChannel, shortcut: false)
+  out = midBlock1(out)
+  let (midAttnReader1, midAttn1) = AttnBlock(
+    prefix: "encoder.mid.attn_1", inChannels: previousChannel, batchSize: batchSize, width: startWidth,
+    height: startHeight)
+  out = midAttn1(out)
+  let (midBlockReader2, midBlock2) = ResnetBlock(
+    prefix: "encoder.mid.block_2", outChannels: previousChannel, shortcut: false)
+  out = midBlock2(out)
+  let normOut = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  out = normOut(out)
+  out = out.swish()
+  let convOut = Convolution(
+    groups: 1, filters: 8, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = convOut(out)
+  let quantConv2d = Convolution(
+    groups: 1, filters: 8, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  out = quantConv2d(out)
+  let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
+    let conv_in_weight = state_dict["first_stage_model.encoder.conv_in.weight"] as! TensorDescriptor
+    let conv_in_bias = state_dict["first_stage_model.encoder.conv_in.bias"] as! TensorDescriptor
+    try convIn.parameters(for: .weight).copy(from: conv_in_weight, zip: archive, of: UseFloatingPoint.self)
+    try convIn.parameters(for: .bias).copy(from: conv_in_bias, zip: archive, of: UseFloatingPoint.self)
+    for reader in readers {
+      try reader(state_dict)
+    }
+    try midBlockReader1(state_dict)
+    try midAttnReader1(state_dict)
+    try midBlockReader2(state_dict)
+    let norm_out_weight = state_dict["first_stage_model.encoder.norm_out.weight"] as! TensorDescriptor
+    let norm_out_bias = state_dict["first_stage_model.encoder.norm_out.bias"] as! TensorDescriptor
+    try normOut.parameters(for: .weight).copy(from: norm_out_weight, zip: archive, of: UseFloatingPoint.self)
+    try normOut.parameters(for: .bias).copy(from: norm_out_bias, zip: archive, of: UseFloatingPoint.self)
+    let conv_out_weight = state_dict["first_stage_model.encoder.conv_out.weight"] as! TensorDescriptor
+    let conv_out_bias = state_dict["first_stage_model.encoder.conv_out.bias"] as! TensorDescriptor
+    try convOut.parameters(for: .weight).copy(from: conv_out_weight, zip: archive, of: UseFloatingPoint.self)
+    try convOut.parameters(for: .bias).copy(from: conv_out_bias, zip: archive, of: UseFloatingPoint.self)
+    let quant_conv_weight = state_dict["first_stage_model.quant_conv.weight"] as! TensorDescriptor
+    let quant_conv_bias = state_dict["first_stage_model.quant_conv.bias"] as! TensorDescriptor
+    try quantConv2d.parameters(for: .weight).copy(
+      from: quant_conv_weight, zip: archive, of: UseFloatingPoint.self)
+    try quantConv2d.parameters(for: .bias).copy(
+      from: quant_conv_bias, zip: archive, of: UseFloatingPoint.self)
+  }
+  return (reader, Model([x], [out]))
+}
+
+func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, startHeight: Int)
+  -> ((Interpreter.Dictionary) throws -> Void, Model)
+{
+  let x = Input()
+  let postQuantConv2d = Convolution(
+    groups: 1, filters: 4, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  var out = postQuantConv2d(x)
+  var previousChannel = channels[channels.count - 1]
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = convIn(out)
+  let (midBlockReader1, midBlock1) = ResnetBlock(
+    prefix: "decoder.mid.block_1", outChannels: previousChannel, shortcut: false)
+  out = midBlock1(out)
+  let (midAttnReader1, midAttn1) = AttnBlock(
+    prefix: "decoder.mid.attn_1", inChannels: previousChannel, batchSize: batchSize, width: startWidth,
+    height: startHeight)
+  out = midAttn1(out)
+  let (midBlockReader2, midBlock2) = ResnetBlock(
+    prefix: "decoder.mid.block_2", outChannels: previousChannel, shortcut: false)
+  out = midBlock2(out)
+  var readers = [(Interpreter.Dictionary) throws -> Void]()
+  for (i, channel) in channels.enumerated().reversed() {
+    for j in 0..<numRepeat + 1 {
+      let (reader, block) = ResnetBlock(
+        prefix: "decoder.up.\(i).block.\(j)", outChannels: channel, shortcut: previousChannel != channel)
+      readers.append(reader)
+      out = block(out)
+      previousChannel = channel
+    }
+    if i > 0 {
+      out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
+      let conv2d = Convolution(
+        groups: 1, filters: channel, filterSize: [3, 3],
+        hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+      out = conv2d(out)
+      let upLayer = i
+      let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
+        let conv_weight = state_dict["first_stage_model.decoder.up.\(upLayer).upsample.conv.weight"] as! TensorDescriptor
+        let conv_bias = state_dict["first_stage_model.decoder.up.\(upLayer).upsample.conv.bias"] as! TensorDescriptor
+        try conv2d.parameters(for: .weight).copy(from: conv_weight, zip: archive, of: UseFloatingPoint.self)
+        try conv2d.parameters(for: .bias).copy(from: conv_bias, zip: archive, of: UseFloatingPoint.self)
+      }
+      readers.append(reader)
+    }
+  }
+  let normOut = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  out = normOut(out)
+  out = Swish()(out)
+  let convOut = Convolution(
+    groups: 1, filters: 3, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = convOut(out)
+  let reader: (Interpreter.Dictionary) throws -> Void = { state_dict in
+    let post_quant_conv_weight = state_dict["first_stage_model.post_quant_conv.weight"] as! TensorDescriptor
+    let post_quant_conv_bias = state_dict["first_stage_model.post_quant_conv.bias"] as! TensorDescriptor
+    try postQuantConv2d.parameters(for: .weight).copy(
+      from: post_quant_conv_weight, zip: archive, of: UseFloatingPoint.self)
+    try postQuantConv2d.parameters(for: .bias).copy(
+      from: post_quant_conv_bias, zip: archive, of: UseFloatingPoint.self)
+    let conv_in_weight = state_dict["first_stage_model.decoder.conv_in.weight"] as! TensorDescriptor
+    let conv_in_bias = state_dict["first_stage_model.decoder.conv_in.bias"] as! TensorDescriptor
+    try convIn.parameters(for: .weight).copy(from: conv_in_weight, zip: archive, of: UseFloatingPoint.self)
+    try convIn.parameters(for: .bias).copy(from: conv_in_bias, zip: archive, of: UseFloatingPoint.self)
+    try midBlockReader1(state_dict)
+    try midAttnReader1(state_dict)
+    try midBlockReader2(state_dict)
+    for reader in readers {
+      try reader(state_dict)
+    }
+    let norm_out_weight = state_dict["first_stage_model.decoder.norm_out.weight"] as! TensorDescriptor
+    let norm_out_bias = state_dict["first_stage_model.decoder.norm_out.bias"] as! TensorDescriptor
+    try normOut.parameters(for: .weight).copy(from: norm_out_weight, zip: archive, of: UseFloatingPoint.self)
+    try normOut.parameters(for: .bias).copy(from: norm_out_bias, zip: archive, of: UseFloatingPoint.self)
+    let conv_out_weight = state_dict["first_stage_model.decoder.conv_out.weight"] as! TensorDescriptor
+    let conv_out_bias = state_dict["first_stage_model.decoder.conv_out.bias"] as! TensorDescriptor
+    try convOut.parameters(for: .weight).copy(from: conv_out_weight, zip: archive, of: UseFloatingPoint.self)
+    try convOut.parameters(for: .bias).copy(from: conv_out_bias, zip: archive, of: UseFloatingPoint.self)
+  }
+  return (reader, Model([x], [out]))
+}
+
 let (
   tokenEmbed, positionEmbed, layerNorm1s, tokeys, toqueries, tovalues, unifyheads, layerNorm2s,
   fc1s, fc2s, finalLayerNorm, textModel
@@ -1289,12 +1579,20 @@ let t_emb = graph.variable(
 ).toGPU(0)
 let xTensor = graph.variable(.CPU, .NCHW(2, 4, 64, 64), of: UseFloatingPoint.self).toGPU(0)
 let cTensor = graph.variable(.CPU, .CHW(2, 77, 768), of: UseFloatingPoint.self).toGPU(0)
-let (reader, unet) = UNet(batchSize: 2)
+let (unetReader, unet) = UNet(batchSize: 2)
+
+let encoderTensor = graph.variable(.CPU, .NCHW(1, 3, 512, 512), of: UseFloatingPoint.self).toGPU(0)
+let (encoderReader, encoder) = Encoder(
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64, startHeight: 64)
+
+let decoderTensor = graph.variable(.CPU, .NCHW(1, 4, 64, 64), of: UseFloatingPoint.self).toGPU(0)
+let (decoderReader, decoder) = Decoder(
+  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64, startHeight: 64)
 
 try graph.withNoGrad {
   /// Load UNet.
   unet.compile(inputs: xTensor, t_emb, cTensor)
-  try reader(state_dict)
+  try unetReader(state_dict)
   graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
     $0.write("unet", model: unet)
   }
@@ -1431,6 +1729,16 @@ try graph.withNoGrad {
 
   graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
     $0.write("text_model", model: textModel)
+  }
+
+  /// Load Autoencoder.
+  decoder.compile(inputs: decoderTensor)
+  encoder.compile(inputs: encoderTensor)
+  try decoderReader(state_dict)
+  try encoderReader(state_dict)
+  graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
+    $0.write("decoder", model: decoder)
+    $0.write("encoder", model: encoder)
   }
 }
 */

@@ -35,9 +35,9 @@ ccv_setting(
 
 git_repository(
     name = "swift-fickling",
-    commit = "7f17cc31b9f3d109407aed33c3d34115761f0933",
+    commit = "21105bfddc28ec3fbf27c83223ecb518e2de3017",
     remote = "https://github.com/liuliu/swift-fickling.git",
-    shallow_since = "1670127304 -0500",
+    shallow_since = "1670218077 -0500",
 )
 
 load("@swift-fickling//:deps.bzl", "swift_fickling_deps")
