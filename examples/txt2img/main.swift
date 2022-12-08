@@ -142,7 +142,7 @@ for i in 0..<76 {
   }
 }
 
-let unet = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
+var unet: Model? = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
 let decoder = Decoder(
   channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
   startHeight: startHeight)
@@ -154,7 +154,7 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
   textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore(workDir + "/open_clip_vit_h14_f32.ckpt") {
+  graph.openStore(workDir + "/open_clip_vit_h14_f16.ckpt") {
     $0.read("text_model", model: textModel)
   }
   let c = textModel(
@@ -166,12 +166,12 @@ graph.withNoGrad {
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
-  unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts)), c)
+  unet!.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts)), c)
   decoder.compile(inputs: x)
-  graph.openStore(workDir + "/sd_v2.0_768_v_f32.ckpt") {
-    $0.read("unet", model: unet)
+  graph.openStore(workDir + "/sd_v2.1_768_v_f32.ckpt") {
+    $0.read("unet", model: unet!)
   }
-  graph.openStore(workDir + "/vae_ft_mse_840000_f32.ckpt") {
+  graph.openStore(workDir + "/vae_ft_mse_840000_f16.ckpt") {
     $0.read("decoder", model: decoder)
   }
   var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil
@@ -192,7 +192,7 @@ graph.withNoGrad {
     let cSkip = 1 / (sigma * sigma + 1)
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
-    var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
+    var et = unet!(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
     var etCond = graph.variable(
@@ -244,6 +244,7 @@ graph.withNoGrad {
     }
     oldDenoised = denoised
   }
+  unet = nil
   let z = 1.0 / scaleFactor * x
   let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: UseFloatingPoint.self))
     .toCPU()
