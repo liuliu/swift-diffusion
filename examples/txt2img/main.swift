@@ -154,7 +154,7 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
   textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore(workDir + "/open_clip_vit_h14_f16.ckpt") {
+  graph.openStore(workDir + "/open_clip_vit_h14_f32.ckpt") {
     $0.read("text_model", model: textModel)
   }
   let c = textModel(

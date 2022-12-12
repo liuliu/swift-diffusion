@@ -128,7 +128,12 @@ for (i, r) in model.transformer.resblocks.enumerated() {
 x = x.permute(1, 0, 2)
 x = model.ln_final(x)
 print(x)
-let state_dict = model.state_dict()
+// let state_dict = model.state_dict()
+
+let pl_sd = torch.load(
+  "/home/liu/workspace/stablediffusion/models/stable-diffusion-v2/redshift-diffusion-768.ckpt",
+  map_location: "cpu")
+let state_dict = pl_sd["state_dict"]
 
 let (
   tokenEmbed, positionEmbed, layerNorm1s, tokeys, toqueries, tovalues, unifyheads, layerNorm2s,
@@ -138,7 +143,6 @@ let (
   batchSize: 1, intermediateSize: 4096)
 
 let graph = DynamicGraph()
-/*
 let tokensTensor = graph.variable(.CPU, .C(77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(77), of: Int32.self)
 let tokensNumpy = tokens.numpy()
@@ -156,22 +160,26 @@ for i in 0..<76 {
 
 let _ = textModel(inputs: tokensTensor, positionTensor, casualAttentionMask)
 
-let vocab = state_dict["token_embedding.weight"]
-let pos = state_dict["positional_embedding"]
-tokenEmbed.parameters.copy(from: try! Tensor<Float>(numpy: vocab.numpy()))
-positionEmbed.parameters.copy(from: try! Tensor<Float>(numpy: pos.numpy()))
+let vocab = state_dict["cond_stage_model.model.token_embedding.weight"].float().numpy()
+let pos = state_dict["cond_stage_model.model.positional_embedding"].float().numpy()
+tokenEmbed.parameters.copy(from: try! Tensor<Float>(numpy: vocab))
+positionEmbed.parameters.copy(from: try! Tensor<Float>(numpy: pos))
 
 for i in 0..<23 {
-  let layer_norm_1_weight = state_dict["transformer.resblocks.\(i).ln_1.weight"].numpy()
-  let layer_norm_1_bias = state_dict["transformer.resblocks.\(i).ln_1.bias"].numpy()
+  let layer_norm_1_weight = state_dict[
+    "cond_stage_model.model.transformer.resblocks.\(i).ln_1.weight"
+  ].float().numpy()
+  let layer_norm_1_bias = state_dict["cond_stage_model.model.transformer.resblocks.\(i).ln_1.bias"]
+    .float().numpy()
   layerNorm1s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: layer_norm_1_weight))
   layerNorm1s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: layer_norm_1_bias))
 
-  let in_proj_weight = state_dict["transformer.resblocks.\(i).attn.in_proj_weight"].type(
-    torch.float
-  ).cpu().numpy()
-  let in_proj_bias = state_dict["transformer.resblocks.\(i).attn.in_proj_bias"].type(torch.float)
-    .cpu().numpy()
+  let in_proj_weight = state_dict[
+    "cond_stage_model.model.transformer.resblocks.\(i).attn.in_proj_weight"
+  ].float().numpy()
+  let in_proj_bias = state_dict[
+    "cond_stage_model.model.transformer.resblocks.\(i).attn.in_proj_bias"
+  ].float().numpy()
   toqueries[i].parameters(for: .weight).copy(
     from: try! Tensor<Float>(numpy: in_proj_weight[..<(1024), ...]))
   toqueries[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_proj_bias[..<(1024)]))
@@ -184,40 +192,47 @@ for i in 0..<23 {
   tovalues[i].parameters(for: .bias).copy(
     from: try! Tensor<Float>(numpy: in_proj_bias[(2 * 1024)...]))
 
-  let out_proj_weight = state_dict["transformer.resblocks.\(i).attn.out_proj.weight"]
+  let out_proj_weight = state_dict[
+    "cond_stage_model.model.transformer.resblocks.\(i).attn.out_proj.weight"
+  ].float()
     .numpy()
-  let out_proj_bias = state_dict["transformer.resblocks.\(i).attn.out_proj.bias"].numpy()
+  let out_proj_bias = state_dict[
+    "cond_stage_model.model.transformer.resblocks.\(i).attn.out_proj.bias"
+  ].float().numpy()
   unifyheads[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_proj_weight))
   unifyheads[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_proj_bias))
 
-  let layer_norm_2_weight = state_dict["transformer.resblocks.\(i).ln_2.weight"].numpy()
-  let layer_norm_2_bias = state_dict["transformer.resblocks.\(i).ln_2.bias"].numpy()
+  let layer_norm_2_weight = state_dict[
+    "cond_stage_model.model.transformer.resblocks.\(i).ln_2.weight"
+  ].float().numpy()
+  let layer_norm_2_bias = state_dict["cond_stage_model.model.transformer.resblocks.\(i).ln_2.bias"]
+    .float().numpy()
   layerNorm2s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: layer_norm_2_weight))
   layerNorm2s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: layer_norm_2_bias))
 
-  let fc1_weight = state_dict["transformer.resblocks.\(i).mlp.c_fc.weight"].numpy()
-  let fc1_bias = state_dict["transformer.resblocks.\(i).mlp.c_fc.bias"].numpy()
+  let fc1_weight = state_dict["cond_stage_model.model.transformer.resblocks.\(i).mlp.c_fc.weight"]
+    .float().numpy()
+  let fc1_bias = state_dict["cond_stage_model.model.transformer.resblocks.\(i).mlp.c_fc.bias"]
+    .float().numpy()
   fc1s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: fc1_weight))
   fc1s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: fc1_bias))
 
-  let fc2_weight = state_dict["transformer.resblocks.\(i).mlp.c_proj.weight"].numpy()
-  let fc2_bias = state_dict["transformer.resblocks.\(i).mlp.c_proj.bias"].numpy()
+  let fc2_weight = state_dict["cond_stage_model.model.transformer.resblocks.\(i).mlp.c_proj.weight"]
+    .float().numpy()
+  let fc2_bias = state_dict["cond_stage_model.model.transformer.resblocks.\(i).mlp.c_proj.bias"]
+    .float().numpy()
   fc2s[i].parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: fc2_weight))
   fc2s[i].parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: fc2_bias))
 }
 
-let final_layer_norm_weight = state_dict["ln_final.weight"].numpy()
-let final_layer_norm_bias = state_dict["ln_final.bias"].numpy()
+let final_layer_norm_weight = state_dict["cond_stage_model.model.ln_final.weight"].float().numpy()
+let final_layer_norm_bias = state_dict["cond_stage_model.model.ln_final.bias"].float().numpy()
 finalLayerNorm.parameters(for: .weight).copy(
   from: try! Tensor<Float>(numpy: final_layer_norm_weight))
 finalLayerNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: final_layer_norm_bias))
 
 let c = textModel(inputs: tokensTensor, positionTensor, casualAttentionMask)[0].as(of: Float.self)
-debugPrint(c)
-*/
-let pyX = try! Tensor<Float>(numpy: x.detach().numpy())
 
 graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
-  // $0.write("text_model", model: textModel)
-  $0.write("unconditional_c", tensor: pyX)
+  $0.write("text_model", model: textModel)
 }

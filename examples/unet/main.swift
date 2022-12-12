@@ -809,9 +809,9 @@ let t = torch.full([1], 981)
 let c = torch.randn([2, 77, 1024])
 
 let config = omegaconf.OmegaConf.load(
-  "/home/liu/workspace/stablediffusion/configs/stable-diffusion/v2-inference.yaml")
+  "/home/liu/workspace/stablediffusion/configs/stable-diffusion/v2-inference-v.yaml")
 let pl_sd = torch.load(
-  "/home/liu/workspace/stablediffusion/models/stable-diffusion-v2/v2-1_512-ema-pruned.ckpt",
+  "/home/liu/workspace/stablediffusion/models/stable-diffusion-v2/redshift-diffusion-768.ckpt",
   map_location: "cpu")
 let sd = pl_sd["state_dict"]
 let model = ldm_util.instantiate_from_config(config.model)
