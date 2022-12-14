@@ -10,9 +10,10 @@ let numpy = Python.import("numpy")
 let random = Python.import("random")
 
 let model = basicsr.archs.rrdbnet_arch.RRDBNet(
-  num_in_ch: 3, num_out_ch: 3, num_feat: 64, num_block: 23, num_grow_ch: 32, scale: 4)
+  num_in_ch: 3, num_out_ch: 3, num_feat: 64, num_block: 23, num_grow_ch: 32, scale: 2)
 let esrgan = torch.load(
-  "/home/liu/workspace/Real-ESRGAN/weights/RealESRGAN_x4plus.pth",
+  //  "/home/liu/workspace/Real-ESRGAN/weights/RealESRGAN_x4plus.pth",
+  "/home/liu/workspace/Real-ESRGAN/weights/RealESRGAN_x2plus.pth",
   map_location: "cpu")
 let state_dict = esrgan["params_ema"]
 model.load_state_dict(state_dict, strict: false)
@@ -178,17 +179,29 @@ let x = torch.randn([1, 3, 32, 32])
 let y = model(x)
 print(y)
 */
-var initImg = Tensor<Float>(.CPU, .NCHW(1, 3, 512, 512))
+var initImg = Tensor<Float>(.CPU, .NCHW(1, 12, 256, 256))
 if let image = try PNG.Data.Rectangular.decompress(
   path: "/home/liu/workspace/swift-diffusion/init_img.png")
 {
   let rgba = image.unpack(as: PNG.RGBA<UInt8>.self)
-  for y in 0..<512 {
-    for x in 0..<512 {
-      let pixel = rgba[y * 512 + x]
-      initImg[0, 0, y, x] = Float(pixel.r) / 255
-      initImg[0, 1, y, x] = Float(pixel.g) / 255
-      initImg[0, 2, y, x] = Float(pixel.b) / 255
+  for y in 0..<256 {
+    for x in 0..<256 {
+      let p0 = rgba[y * 2 * 512 + x * 2]
+      let p1 = rgba[y * 2 * 512 + x * 2 + 1]
+      let p2 = rgba[(y * 2 + 1) * 512 + x * 2]
+      let p3 = rgba[(y * 2 + 1) * 512 + x * 2 + 1]
+      initImg[0, 0, y, x] = Float(p0.r) / 255
+      initImg[0, 1, y, x] = Float(p1.r) / 255
+      initImg[0, 2, y, x] = Float(p2.r) / 255
+      initImg[0, 3, y, x] = Float(p3.r) / 255
+      initImg[0, 4, y, x] = Float(p0.g) / 255
+      initImg[0, 5, y, x] = Float(p1.g) / 255
+      initImg[0, 6, y, x] = Float(p2.g) / 255
+      initImg[0, 7, y, x] = Float(p3.g) / 255
+      initImg[0, 8, y, x] = Float(p0.b) / 255
+      initImg[0, 9, y, x] = Float(p1.b) / 255
+      initImg[0, 10, y, x] = Float(p2.b) / 255
+      initImg[0, 11, y, x] = Float(p3.b) / 255
     }
   }
 }
@@ -201,21 +214,26 @@ graph.withNoGrad {
   reader(state_dict)
   print("loaded parameters")
   let yTensor = rrdbnet(inputs: xTensor)[0].as(of: Float.self).toCPU()
+  graph.openStore("/home/liu/workspace/swift-diffusion/realesrgan_x2plus_f32.ckpt") {
+    $0.write("realesrgan_x2plus", model: rrdbnet)
+  }
   print("upsampled")
-  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 2048 * 2048)
-  for y in 0..<2048 {
-    for x in 0..<2048 {
+  let yHeight = yTensor.shape[2]
+  let yWidth = yTensor.shape[3]
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: yHeight * yWidth)
+  for y in 0..<yHeight {
+    for x in 0..<yWidth {
       let (r, g, b) = (yTensor[0, 0, y, x], yTensor[0, 1, y, x], yTensor[0, 2, y, x])
-      rgba[y * 2048 + x].r = UInt8(
+      rgba[y * yWidth + x].r = UInt8(
         min(max(Int(r * 255), 0), 255))
-      rgba[y * 2048 + x].g = UInt8(
+      rgba[y * yWidth + x].g = UInt8(
         min(max(Int(g * 255), 0), 255))
-      rgba[y * 2048 + x].b = UInt8(
+      rgba[y * yWidth + x].b = UInt8(
         min(max(Int(b * 255), 0), 255))
     }
   }
   let image = PNG.Data.Rectangular(
-    packing: rgba, size: (2048, 2048),
+    packing: rgba, size: (yHeight, yWidth),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
   print("begin compress")
   try! image.compress(path: "/home/liu/workspace/swift-diffusion/upsampler.png", level: 4)
