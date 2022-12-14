@@ -24,22 +24,26 @@ func ResidualDenseBlock(prefix: String, numberOfFeatures: Int, numberOfGrowChann
     groups: 1, filters: numberOfGrowChannels, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   let x1 = conv1(x).leakyReLU(negativeSlope: 0.2)
+  let x01 = Functional.concat(axis: 1, x, x1)
   let conv2 = Convolution(
     groups: 1, filters: numberOfGrowChannels, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
-  let x2 = conv2(Functional.concat(axis: 1, x, x1)).leakyReLU(negativeSlope: 0.2)
+  let x2 = conv2(x01).leakyReLU(negativeSlope: 0.2)
+  let x012 = Functional.concat(axis: 1, x01, x2)
   let conv3 = Convolution(
     groups: 1, filters: numberOfGrowChannels, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
-  let x3 = conv3(Functional.concat(axis: 1, x, x1, x2)).leakyReLU(negativeSlope: 0.2)
+  let x3 = conv3(x012).leakyReLU(negativeSlope: 0.2)
+  let x0123 = Functional.concat(axis: 1, x012, x3)
   let conv4 = Convolution(
     groups: 1, filters: numberOfGrowChannels, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
-  let x4 = conv4(Functional.concat(axis: 1, x, x1, x2, x3)).leakyReLU(negativeSlope: 0.2)
+  let x4 = conv4(x0123).leakyReLU(negativeSlope: 0.2)
+  let x01234 = Functional.concat(axis: 1, x0123, x4)
   let conv5 = Convolution(
     groups: 1, filters: numberOfFeatures, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
-  let x5 = conv5(Functional.concat(axis: 1, x, x1, x2, x3, x4))
+  let x5 = conv5(x01234)
   let out = 0.2 * x5 + x
   let reader: (PythonObject) -> Void = { state_dict in
     let conv1_weight = state_dict["\(prefix).conv1.weight"].float().numpy()
@@ -169,7 +173,7 @@ numpy.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-let x = torch.randn([1, 3, 512, 512])
+let x = torch.randn([1, 3, 32, 32])
 let y = model(x)
 print(y)
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
