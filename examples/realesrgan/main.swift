@@ -10,13 +10,14 @@ let numpy = Python.import("numpy")
 let random = Python.import("random")
 
 let model = basicsr.archs.rrdbnet_arch.RRDBNet(
-  num_in_ch: 3, num_out_ch: 3, num_feat: 64, num_block: 23, num_grow_ch: 32, scale: 2)
+  num_in_ch: 3, num_out_ch: 3, num_feat: 64, num_block: 23, num_grow_ch: 32, scale: 4)
 let esrgan = torch.load(
-  //  "/home/liu/workspace/Real-ESRGAN/weights/RealESRGAN_x4plus.pth",
-  "/home/liu/workspace/Real-ESRGAN/weights/RealESRGAN_x2plus.pth",
+  "/home/liu/workspace/Real-ESRGAN/weights/RealESRGAN_x4plus.pth",
+  // "/home/liu/workspace/Real-ESRGAN/weights/RealESRGAN_x2plus.pth",
   map_location: "cpu")
 let state_dict = esrgan["params_ema"]
 model.load_state_dict(state_dict, strict: false)
+print(state_dict.keys())
 
 func ResidualDenseBlock(prefix: String, numberOfFeatures: Int, numberOfGrowChannels: Int) -> (
   Model, (PythonObject) -> Void
@@ -179,11 +180,20 @@ let x = torch.randn([1, 3, 32, 32])
 let y = model(x)
 print(y)
 */
-var initImg = Tensor<Float>(.CPU, .NCHW(1, 12, 256, 256))
+var initImg = Tensor<Float>(.CPU, .NCHW(1, 3, 512, 512))
 if let image = try PNG.Data.Rectangular.decompress(
   path: "/home/liu/workspace/swift-diffusion/init_img.png")
 {
   let rgba = image.unpack(as: PNG.RGBA<UInt8>.self)
+  for y in 0..<512 {
+    for x in 0..<512 {
+      let p0 = rgba[y * 512 + x]
+      initImg[0, 0, y, x] = Float(p0.r) / 255
+      initImg[0, 1, y, x] = Float(p0.g) / 255
+      initImg[0, 2, y, x] = Float(p0.b) / 255
+    }
+  }
+  /*
   for y in 0..<256 {
     for x in 0..<256 {
       let p0 = rgba[y * 2 * 512 + x * 2]
@@ -204,6 +214,7 @@ if let image = try PNG.Data.Rectangular.decompress(
       initImg[0, 11, y, x] = Float(p3.b) / 255
     }
   }
+  */
 }
 print("loaded image")
 let (rrdbnet, reader) = RRDBNet(
@@ -214,9 +225,11 @@ graph.withNoGrad {
   reader(state_dict)
   print("loaded parameters")
   let yTensor = rrdbnet(inputs: xTensor)[0].as(of: Float.self).toCPU()
-  graph.openStore("/home/liu/workspace/swift-diffusion/realesrgan_x2plus_f32.ckpt") {
-    $0.write("realesrgan_x2plus", model: rrdbnet)
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/realesrgan_x4plus_f32.ckpt") {
+    $0.write("realesrgan_x4plus", model: rrdbnet)
   }
+  */
   print("upsampled")
   let yHeight = yTensor.shape[2]
   let yWidth = yTensor.shape[3]
