@@ -1,6 +1,7 @@
 import Foundation
 import NNC
 import NNCPythonConversion
+import PNG
 import PythonKit
 
 let basicsr = Python.import("basicsr")
@@ -167,7 +168,7 @@ func RRDBNet(
 }
 
 let graph = DynamicGraph()
-
+/*
 random.seed(42)
 numpy.random.seed(42)
 torch.manual_seed(42)
@@ -176,12 +177,46 @@ torch.cuda.manual_seed_all(42)
 let x = torch.randn([1, 3, 32, 32])
 let y = model(x)
 print(y)
-let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
+*/
+var initImg = Tensor<Float>(.CPU, .NCHW(1, 3, 512, 512))
+if let image = try PNG.Data.Rectangular.decompress(
+  path: "/home/liu/workspace/swift-diffusion/init_img.png")
+{
+  let rgba = image.unpack(as: PNG.RGBA<UInt8>.self)
+  for y in 0..<512 {
+    for x in 0..<512 {
+      let pixel = rgba[y * 512 + x]
+      initImg[0, 0, y, x] = Float(pixel.r) / 255
+      initImg[0, 1, y, x] = Float(pixel.g) / 255
+      initImg[0, 2, y, x] = Float(pixel.b) / 255
+    }
+  }
+}
+print("loaded image")
 let (rrdbnet, reader) = RRDBNet(
   numberOfOutputChannels: 3, numberOfFeatures: 64, numberOfBlocks: 23, numberOfGrowChannels: 32)
 graph.withNoGrad {
+  let xTensor = graph.variable(initImg).toGPU(0)
   rrdbnet.compile(inputs: xTensor)
   reader(state_dict)
+  print("loaded parameters")
   let yTensor = rrdbnet(inputs: xTensor)[0].as(of: Float.self).toCPU()
-  debugPrint(yTensor)
+  print("upsampled")
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 2048 * 2048)
+  for y in 0..<2048 {
+    for x in 0..<2048 {
+      let (r, g, b) = (yTensor[0, 0, y, x], yTensor[0, 1, y, x], yTensor[0, 2, y, x])
+      rgba[y * 2048 + x].r = UInt8(
+        min(max(Int(r * 255), 0), 255))
+      rgba[y * 2048 + x].g = UInt8(
+        min(max(Int(g * 255), 0), 255))
+      rgba[y * 2048 + x].b = UInt8(
+        min(max(Int(b * 255), 0), 255))
+    }
+  }
+  let image = PNG.Data.Rectangular(
+    packing: rgba, size: (2048, 2048),
+    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+  print("begin compress")
+  try! image.compress(path: "/home/liu/workspace/swift-diffusion/upsampler.png", level: 4)
 }
