@@ -155,3 +155,12 @@ swift_binary(
         "@swift-fickling//:fickling",
     ],
 )
+
+swift_binary(
+    name = "coreml",
+    srcs = ["coreml/main.swift"],
+    deps = [
+        "@ZIPFoundation",
+        "@s4nnc//nnc",
+    ],
+)
