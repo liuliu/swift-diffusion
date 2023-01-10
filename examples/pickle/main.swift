@@ -5,7 +5,7 @@ import NNC
 import ZIPFoundation
 
 public typealias UseFloatingPoint = Float16
-
+/*
 let file1 = "/home/liu/workspace/swift-diffusion/nitro_v1_f16.ckpt"
 let file2 = "/home/liu/workspace/swift-diffusion/unet.ckpt"
 
@@ -35,8 +35,8 @@ graph.openStore(file1) { store1 in
     }
   }
 }
-/*
-let filename = "/fast/Data/SD/nitroDiffusion-v1.ckpt"
+*/
+let filename = "/home/liu/workspace/swift-diffusion/jet.ckpt"
 
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 
@@ -52,7 +52,11 @@ extension Model.Parameters {
   ) throws {
     var v = 1
     for i in stride(from: tensorDescriptor.shape.count - 1, through: 0, by: -1) {
-      precondition(tensorDescriptor.strides[i] == v)
+      if !(tensorDescriptor.strides[i] == v) {
+        print(tensorDescriptor.shape)
+        print(tensorDescriptor.strides)
+        break
+      }
       v *= tensorDescriptor.shape[i]
     }
     let entry = archive["archive/data/\(tensorDescriptor.storage.name)"]!
@@ -1741,4 +1745,4 @@ try graph.withNoGrad {
     $0.write("encoder", model: encoder)
   }
 }
-*/
+

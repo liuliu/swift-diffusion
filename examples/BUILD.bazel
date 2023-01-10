@@ -160,6 +160,7 @@ swift_binary(
     name = "coreml",
     srcs = ["coreml/main.swift"],
     deps = [
+        "//:diffusion",
         "@ZIPFoundation",
         "@s4nnc//nnc",
     ],
