@@ -159,6 +159,10 @@ swift_binary(
 swift_binary(
     name = "coreml",
     srcs = ["coreml/main.swift"],
+    data = [
+        "coreml/data_layout1.json",
+        "coreml/data_layout2.json",
+    ],
     deps = [
         "//:diffusion",
         "@ZIPFoundation",

@@ -9,22 +9,57 @@ struct KeyAndRange: Codable {
   var idx: Int
   var count: Int
   var bias: Bool? = nil
-  var hexfloatc: Bool? = nil
 }
 
-// let startWidth: Int = 64
-// let startHeight: Int = 64
-// let unet = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
-
-// let c = graph.variable(.GPU(0), .CHW(2, 77, 768), of: UseFloatingPoint.self)
-// let xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
-// let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
-// unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts)), c)
-// decoder.compile(inputs: x)
-let data = try Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/coreml-stable-diffusion-v1-5_split_einsum_compiled/Unet.mlmodelc/weights/weight.bin"))
-let data1 = try Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/coreml-stable-diffusion-v1-5_split_einsum_compiled/UnetChunk1.mlmodelc/weights/weight.bin"))
-let data2 = try Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/coreml-stable-diffusion-v1-5_split_einsum_compiled/UnetChunk2.mlmodelc/model.mil"))
 let graph = DynamicGraph()
+var data1 = try Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/coreml-stable-diffusion-v1-5_split_einsum_compiled/UnetChunk1.mlmodelc/weights/weight.bin"))
+var data2 = try Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/coreml-stable-diffusion-v1-5_split_einsum_compiled/UnetChunk2.mlmodelc/weights/weight.bin"))
+let model2 = try Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/coreml-stable-diffusion-v1-5_split_einsum_compiled/UnetChunk2.mlmodelc/model.mil"))
+let jsonDecoder = JSONDecoder()
+let keyAndRange1 = try jsonDecoder.decode([KeyAndRange].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/examples/coreml/data_layout1.json")))
+let keyAndRange2 = try jsonDecoder.decode([KeyAndRange].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/examples/coreml/data_layout2.json")))
+let keys1 = Dictionary<String, KeyAndRange>(uniqueKeysWithValues: keyAndRange1.map { ($0.key, $0) })
+let keys2 = Dictionary<String, KeyAndRange>(uniqueKeysWithValues: keyAndRange2.map { ($0.key, $0) })
+graph.openStore("/home/liu/workspace/swift-diffusion/wd_v1.3_f16.ckpt") {
+  for key in $0.keys {
+    guard let tensor = $0.read(key) else { continue }
+    var f16tensor = Tensor<UseFloatingPoint>(tensor)
+    if let range1 = keys1[key] {
+      if range1.bias == true {
+        let biastensor = graph.constant(f16tensor)
+        let weighttensor = graph.constant(Tensor<UseFloatingPoint>($0.read(key.dropLast(2) + "0]")!))
+        f16tensor = (biastensor .* Functional.reciprocal(weighttensor)).rawValue.toCPU()
+      } else {
+        f16tensor = f16tensor.toCPU()
+      }
+      f16tensor.withUnsafeBytes {
+        let u8p = $0.baseAddress!.assumingMemoryBound(to: UInt8.self)
+        for i in 0..<$0.count {
+          data1[i + range1.idx * 2] = u8p[i]
+        }
+      }
+    } else if let range2 = keys2[key] {
+      if range2.bias == true {
+        let biastensor = graph.constant(f16tensor)
+        let weighttensor = graph.constant(Tensor<UseFloatingPoint>($0.read(key.dropLast(2) + "0]")!))
+        f16tensor = (biastensor .* Functional.reciprocal(weighttensor)).rawValue.toCPU()
+      } else {
+        f16tensor = f16tensor.toCPU()
+      }
+      f16tensor.withUnsafeBytes {
+        let u8p = $0.baseAddress!.assumingMemoryBound(to: UInt8.self)
+        for i in 0..<$0.count {
+          data2[i + range2.idx * 2] = u8p[i]
+        }
+      }
+    } else if key == "__unet__[t-406-1]" { // These are immediate values in model2 file.
+      f16tensor = f16tensor.toCPU()
+      print(String(format: "%a, %a, %a, %a", Double(f16tensor[0]), Double(f16tensor[1]), Double(f16tensor[2]), Double(f16tensor[3])))
+    }
+  }
+}
+try data1.write(to: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/weight1.bin"))
+try data2.write(to: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/weight2.bin"))
 /*
 var keyAndRange = [KeyAndRange]()
 graph.openStore("/home/liu/workspace/swift-diffusion/sd_v1.5_f16.ckpt") {
@@ -35,14 +70,14 @@ graph.openStore("/home/liu/workspace/swift-diffusion/sd_v1.5_f16.ckpt") {
     f16tensor.withUnsafeBytes {
       let f16p = $0.baseAddress!.assumingMemoryBound(to: Float16.self)
       let tcount = $0.count / 2
-      data.withUnsafeBytes {
+      data1.withUnsafeBytes {
         let udatap = $0.baseAddress!.assumingMemoryBound(to: Float16.self)
         let datacount = $0.count / 2
         var found = false
         for i in 0..<(datacount - tcount) {
           var flag = true
           for j in 0..<tcount {
-            if abs(udatap[i + j] - f16p[j]) > 1e-2 {
+            if abs(udatap[i + j] - f16p[j]) > 1e-3 {
               flag = false
               break
             }
@@ -65,8 +100,7 @@ graph.openStore("/home/liu/workspace/swift-diffusion/sd_v1.5_f16.ckpt") {
 let jsonEncoder = JSONEncoder()
 jsonEncoder.outputFormatting = .prettyPrinted
 let jsonData = try jsonEncoder.encode(keyAndRange)
-try jsonData.write(to: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/data_layout2.json"))
-*/
+try jsonData.write(to: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/data_layout1.json"))
 let jsonDecoder = JSONDecoder()
 let keyAndRange1 = try jsonDecoder.decode([KeyAndRange].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/data_layout1.json")))
 let keyAndRange2 = try jsonDecoder.decode([KeyAndRange].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/data_layout2.json")))
@@ -185,3 +219,4 @@ graph.openStore("/home/liu/workspace/swift-diffusion/sd_v1.5_f16.ckpt") {
     }
   }
 }
+*/
