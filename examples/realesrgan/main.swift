@@ -12,10 +12,10 @@ let random = Python.import("random")
 let model = basicsr.archs.rrdbnet_arch.RRDBNet(
   num_in_ch: 3, num_out_ch: 3, num_feat: 64, num_block: 23, num_grow_ch: 32, scale: 4)
 let esrgan = torch.load(
-  "/home/liu/workspace/Real-ESRGAN/weights/RealESRGAN_x4plus.pth",
+  "/home/liu/workspace/Real-ESRGAN/weights/4x_foolhardy_Remacri.pth",
   // "/home/liu/workspace/Real-ESRGAN/weights/RealESRGAN_x2plus.pth",
   map_location: "cpu")
-let state_dict = esrgan["params_ema"]
+let state_dict = esrgan // ["params_ema"]
 model.load_state_dict(state_dict, strict: false)
 print(state_dict.keys())
 
@@ -49,24 +49,24 @@ func ResidualDenseBlock(prefix: String, numberOfFeatures: Int, numberOfGrowChann
   let x5 = conv5(x01234)
   let out = 0.2 * x5 + x
   let reader: (PythonObject) -> Void = { state_dict in
-    let conv1_weight = state_dict["\(prefix).conv1.weight"].float().numpy()
-    let conv1_bias = state_dict["\(prefix).conv1.bias"].float().numpy()
+    let conv1_weight = state_dict["\(prefix).conv1.0.weight"].float().numpy()
+    let conv1_bias = state_dict["\(prefix).conv1.0.bias"].float().numpy()
     conv1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv1_weight))
     conv1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv1_bias))
-    let conv2_weight = state_dict["\(prefix).conv2.weight"].float().numpy()
-    let conv2_bias = state_dict["\(prefix).conv2.bias"].float().numpy()
+    let conv2_weight = state_dict["\(prefix).conv2.0.weight"].float().numpy()
+    let conv2_bias = state_dict["\(prefix).conv2.0.bias"].float().numpy()
     conv2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv2_weight))
     conv2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv2_bias))
-    let conv3_weight = state_dict["\(prefix).conv3.weight"].float().numpy()
-    let conv3_bias = state_dict["\(prefix).conv3.bias"].float().numpy()
+    let conv3_weight = state_dict["\(prefix).conv3.0.weight"].float().numpy()
+    let conv3_bias = state_dict["\(prefix).conv3.0.bias"].float().numpy()
     conv3.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv3_weight))
     conv3.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv3_bias))
-    let conv4_weight = state_dict["\(prefix).conv4.weight"].float().numpy()
-    let conv4_bias = state_dict["\(prefix).conv4.bias"].float().numpy()
+    let conv4_weight = state_dict["\(prefix).conv4.0.weight"].float().numpy()
+    let conv4_bias = state_dict["\(prefix).conv4.0.bias"].float().numpy()
     conv4.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv4_weight))
     conv4.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv4_bias))
-    let conv5_weight = state_dict["\(prefix).conv5.weight"].float().numpy()
-    let conv5_bias = state_dict["\(prefix).conv5.bias"].float().numpy()
+    let conv5_weight = state_dict["\(prefix).conv5.0.weight"].float().numpy()
+    let conv5_bias = state_dict["\(prefix).conv5.0.bias"].float().numpy()
     conv5.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv5_weight))
     conv5.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv5_bias))
   }
@@ -78,15 +78,15 @@ func RRDB(prefix: String, numberOfFeatures: Int, numberOfGrowChannels: Int) -> (
 ) {
   let x = Input()
   let (rdb1, reader1) = ResidualDenseBlock(
-    prefix: "\(prefix).rdb1", numberOfFeatures: numberOfFeatures,
+    prefix: "\(prefix).RDB1", numberOfFeatures: numberOfFeatures,
     numberOfGrowChannels: numberOfGrowChannels)
   var out = rdb1(x)
   let (rdb2, reader2) = ResidualDenseBlock(
-    prefix: "\(prefix).rdb2", numberOfFeatures: numberOfFeatures,
+    prefix: "\(prefix).RDB2", numberOfFeatures: numberOfFeatures,
     numberOfGrowChannels: numberOfGrowChannels)
   out = rdb2(out)
   let (rdb3, reader3) = ResidualDenseBlock(
-    prefix: "\(prefix).rdb3", numberOfFeatures: numberOfFeatures,
+    prefix: "\(prefix).RDB3", numberOfFeatures: numberOfFeatures,
     numberOfGrowChannels: numberOfGrowChannels)
   out = 0.2 * rdb3(out) + x
   let reader: (PythonObject) -> Void = { state_dict in
@@ -109,7 +109,7 @@ func RRDBNet(
   var readers = [(PythonObject) -> Void]()
   for i in 0..<numberOfBlocks {
     let (rrdb, reader) = RRDB(
-      prefix: "body.\(i)", numberOfFeatures: numberOfFeatures,
+      prefix: "model.1.sub.\(i)", numberOfFeatures: numberOfFeatures,
       numberOfGrowChannels: numberOfGrowChannels)
     out = rrdb(out)
     readers.append(reader)
@@ -138,31 +138,31 @@ func RRDBNet(
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = convLast(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let conv_first_weight = state_dict["conv_first.weight"].float().numpy()
-    let conv_first_bias = state_dict["conv_first.bias"].float().numpy()
+    let conv_first_weight = state_dict["model.0.weight"].float().numpy()
+    let conv_first_bias = state_dict["model.0.bias"].float().numpy()
     convFirst.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_first_weight))
     convFirst.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_first_bias))
     for reader in readers {
       reader(state_dict)
     }
-    let conv_body_weight = state_dict["conv_body.weight"].float().numpy()
-    let conv_body_bias = state_dict["conv_body.bias"].float().numpy()
+    let conv_body_weight = state_dict["model.1.sub.23.weight"].float().numpy()
+    let conv_body_bias = state_dict["model.1.sub.23.bias"].float().numpy()
     convBody.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_body_weight))
     convBody.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_body_bias))
-    let conv_up1_weight = state_dict["conv_up1.weight"].float().numpy()
-    let conv_up1_bias = state_dict["conv_up1.bias"].float().numpy()
+    let conv_up1_weight = state_dict["model.3.weight"].float().numpy()
+    let conv_up1_bias = state_dict["model.3.bias"].float().numpy()
     convUp1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_up1_weight))
     convUp1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_up1_bias))
-    let conv_up2_weight = state_dict["conv_up2.weight"].float().numpy()
-    let conv_up2_bias = state_dict["conv_up2.bias"].float().numpy()
+    let conv_up2_weight = state_dict["model.6.weight"].float().numpy()
+    let conv_up2_bias = state_dict["model.6.bias"].float().numpy()
     convUp2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_up2_weight))
     convUp2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_up2_bias))
-    let conv_hr_weight = state_dict["conv_hr.weight"].float().numpy()
-    let conv_hr_bias = state_dict["conv_hr.bias"].float().numpy()
+    let conv_hr_weight = state_dict["model.8.weight"].float().numpy()
+    let conv_hr_bias = state_dict["model.8.bias"].float().numpy()
     convHr.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_hr_weight))
     convHr.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_hr_bias))
-    let conv_last_weight = state_dict["conv_last.weight"].float().numpy()
-    let conv_last_bias = state_dict["conv_last.bias"].float().numpy()
+    let conv_last_weight = state_dict["model.10.weight"].float().numpy()
+    let conv_last_bias = state_dict["model.10.bias"].float().numpy()
     convLast.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_last_weight))
     convLast.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_last_bias))
   }
@@ -180,7 +180,7 @@ let x = torch.randn([1, 3, 32, 32])
 let y = model(x)
 print(y)
 */
-var initImg = Tensor<Float>(.CPU, .NCHW(1, 3, 512, 512))
+var initImg = Tensor<Float16>(.CPU, .NCHW(1, 3, 512, 512))
 if let image = try PNG.Data.Rectangular.decompress(
   path: "/home/liu/workspace/swift-diffusion/init_img.png")
 {
@@ -188,9 +188,9 @@ if let image = try PNG.Data.Rectangular.decompress(
   for y in 0..<512 {
     for x in 0..<512 {
       let p0 = rgba[y * 512 + x]
-      initImg[0, 0, y, x] = Float(p0.r) / 255
-      initImg[0, 1, y, x] = Float(p0.g) / 255
-      initImg[0, 2, y, x] = Float(p0.b) / 255
+      initImg[0, 0, y, x] = Float16(p0.r) / 255
+      initImg[0, 1, y, x] = Float16(p0.g) / 255
+      initImg[0, 2, y, x] = Float16(p0.b) / 255
     }
   }
   /*
@@ -222,14 +222,15 @@ let (rrdbnet, reader) = RRDBNet(
 graph.withNoGrad {
   let xTensor = graph.variable(initImg).toGPU(0)
   rrdbnet.compile(inputs: xTensor)
-  reader(state_dict)
+  graph.openStore("/home/liu/workspace/swift-diffusion/remacri_x4_f32.ckpt") {
+    $0.read("realesrgan_x4plus", model: rrdbnet)
+  }
+  // reader(state_dict)
   print("loaded parameters")
-  let yTensor = rrdbnet(inputs: xTensor)[0].as(of: Float.self).toCPU()
-  /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/realesrgan_x4plus_f32.ckpt") {
+  let yTensor = rrdbnet(inputs: xTensor)[0].as(of: Float16.self).toCPU()
+  graph.openStore("/home/liu/workspace/swift-diffusion/remacri_4x_f16.ckpt") {
     $0.write("realesrgan_x4plus", model: rrdbnet)
   }
-  */
   print("upsampled")
   let yHeight = yTensor.shape[2]
   let yWidth = yTensor.shape[3]

@@ -20,6 +20,13 @@ let keyAndRange1 = try jsonDecoder.decode([KeyAndRange].self, from: Data(content
 let keyAndRange2 = try jsonDecoder.decode([KeyAndRange].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/examples/coreml/data_layout2.json")))
 let keys1 = Dictionary<String, KeyAndRange>(uniqueKeysWithValues: keyAndRange1.map { ($0.key, $0) })
 let keys2 = Dictionary<String, KeyAndRange>(uniqueKeysWithValues: keyAndRange2.map { ($0.key, $0) })
+for kr in keyAndRange1 {
+  print("\"\(kr.key)\": TensorNameAndBlobOffset(name: \"\(kr.key)\", offset: \(kr.idx * 2), isFirstChunk: true, isLayerNormBias: \(kr.bias ?? false)),")
+}
+for kr in keyAndRange2 {
+  print("\"\(kr.key)\": TensorNameAndBlobOffset(name: \"\(kr.key)\", offset: \(kr.idx * 2), isFirstChunk: false, isLayerNormBias: \(kr.bias ?? false)),")
+}
+/*
 graph.openStore("/home/liu/workspace/swift-diffusion/wd_v1.3_f16.ckpt") {
   for key in $0.keys {
     guard let tensor = $0.read(key) else { continue }
@@ -35,7 +42,7 @@ graph.openStore("/home/liu/workspace/swift-diffusion/wd_v1.3_f16.ckpt") {
       f16tensor.withUnsafeBytes {
         let u8p = $0.baseAddress!.assumingMemoryBound(to: UInt8.self)
         for i in 0..<$0.count {
-          data1[i + range1.idx * 2] = u8p[i]
+          data1[i + range1.idx * 2] = 0 // u8p[i]
         }
       }
     } else if let range2 = keys2[key] {
@@ -49,7 +56,7 @@ graph.openStore("/home/liu/workspace/swift-diffusion/wd_v1.3_f16.ckpt") {
       f16tensor.withUnsafeBytes {
         let u8p = $0.baseAddress!.assumingMemoryBound(to: UInt8.self)
         for i in 0..<$0.count {
-          data2[i + range2.idx * 2] = u8p[i]
+          data2[i + range2.idx * 2] = 0 // u8p[i]
         }
       }
     } else if key == "__unet__[t-406-1]" { // These are immediate values in model2 file.
@@ -60,6 +67,7 @@ graph.openStore("/home/liu/workspace/swift-diffusion/wd_v1.3_f16.ckpt") {
 }
 try data1.write(to: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/weight1.bin"))
 try data2.write(to: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/weight2.bin"))
+*/
 /*
 var keyAndRange = [KeyAndRange]()
 graph.openStore("/home/liu/workspace/swift-diffusion/sd_v1.5_f16.ckpt") {
