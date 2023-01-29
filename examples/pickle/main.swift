@@ -36,7 +36,7 @@ graph.openStore(file1) { store1 in
   }
 }
 */
-let filename = "/home/liu/workspace/swift-diffusion/jet.ckpt"
+let filename = "/home/liu/workspace/swift-diffusion/hades-8500.pt"
 
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 
@@ -131,6 +131,9 @@ interpreter.intercept(module: "UNPICKLER", function: "persistent_load") { module
     name: name, size: size, dataType: global.function == "HalfStorage" ? .Float16 : .Float32)
   return [storage]
 }
+interpreter.intercept(module: "torch.nn.modules.container", function: "ParameterDict") { module, function, _ in
+  return [Interpreter.Dictionary(.unordered)]
+}
 interpreter.intercept(module: "torch._utils", function: "_rebuild_tensor_v2") {
   module, function, args in
   guard args.count >= 5, let storage = args[0] as? Storage, let storageOffset = args[1] as? Int,
@@ -142,11 +145,31 @@ interpreter.intercept(module: "torch._utils", function: "_rebuild_tensor_v2") {
     storage: storage, storageOffset: storageOffset, shape: shape, strides: strides)
   return [tensorDescriptor]
 }
+interpreter.intercept(module: "torch._utils", function: "_rebuild_parameter") { _, _, args in
+  guard let tensorDescriptor = args.first as? TensorDescriptor else { return [nil] }
+  return [tensorDescriptor]
+}
 interpreter.intercept(module: nil, function: nil) { module, function, args in
   return [nil]
 }
 while try interpreter.step() {}
 let model = (interpreter.rootObject as? Interpreter.Dictionary)!
+print(model.dictionary)
+let stringToToken = (model["string_to_param"] as? Interpreter.Dictionary)!
+let parameters = (stringToToken["_parameters"] as? Interpreter.Dictionary)!
+print(parameters.dictionary)
+let token = stringToToken["*"] as! TensorDescriptor
+// let token = model["<birb-style>"] as! TensorDescriptor
+print(token)
+let tensor = try token.inflate(from: archive, of: Float16.self)
+
+let graph = DynamicGraph()
+graph.openStore("/home/liu/workspace/swift-diffusion/birb_style_ti_f16.ckpt") {
+  $0.write("string_to_param", tensor: tensor)
+}
+
+fatalError()
+
 let state_dict = (model["state_dict"] as? Interpreter.Dictionary)!
 
 var renameVAE = [String: Any]()
@@ -1557,8 +1580,6 @@ let (
   UseFloatingPoint.self,
   vocabularySize: 49408, maxLength: 77, embeddingSize: 768, numLayers: 12, numHeads: 12,
   batchSize: 1, intermediateSize: 3072)
-
-let graph = DynamicGraph()
 
 let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
