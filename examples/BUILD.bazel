@@ -169,3 +169,13 @@ swift_binary(
         "@s4nnc//nnc",
     ],
 )
+
+swift_binary(
+    name = "randn",
+    srcs = ["randn/main.swift"],
+    data = [],
+    deps = [
+        "//:diffusion",
+        "@s4nnc//nnc",
+    ],
+)

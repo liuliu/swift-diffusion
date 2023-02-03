@@ -6,8 +6,8 @@ import ZIPFoundation
 
 public typealias UseFloatingPoint = Float16
 /*
-let file1 = "/home/liu/workspace/swift-diffusion/nitro_v1_f16.ckpt"
-let file2 = "/home/liu/workspace/swift-diffusion/unet.ckpt"
+let file1 = "/home/liu/workspace/swift-diffusion/clip_vit_l14_f16.ckpt"
+let file2 = "/home/liu/workspace/swift-diffusion/text_model.ckpt"
 
 let graph = DynamicGraph()
 
@@ -29,14 +29,14 @@ graph.openStore(file1) { store1 in
           print(
             "\(key) loc \(i), v1 \(tensor1.shape) \(tensor1r[i]), v2 \(tensor2.shape) \(tensor2r[i])"
           )
-          break
+          // break
         }
       }
     }
   }
 }
 */
-let filename = "/home/liu/workspace/swift-diffusion/hades-8500.pt"
+let filename = "/home/liu/workspace/swift-diffusion/EmWat69.pt"
 
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 
@@ -153,24 +153,26 @@ interpreter.intercept(module: nil, function: nil) { module, function, args in
   return [nil]
 }
 while try interpreter.step() {}
+let graph = DynamicGraph()
 let model = (interpreter.rootObject as? Interpreter.Dictionary)!
-print(model.dictionary)
+
+print((model["string_to_token"] as! Interpreter.Dictionary).dictionary)
 let stringToToken = (model["string_to_param"] as? Interpreter.Dictionary)!
-let parameters = (stringToToken["_parameters"] as? Interpreter.Dictionary)!
-print(parameters.dictionary)
+// let parameters = (stringToToken["_parameters"] as? Interpreter.Dictionary)!
+// print(parameters.dictionary)
 let token = stringToToken["*"] as! TensorDescriptor
 // let token = model["<birb-style>"] as! TensorDescriptor
 print(token)
 let tensor = try token.inflate(from: archive, of: Float16.self)
+debugPrint(tensor)
 
-let graph = DynamicGraph()
-graph.openStore("/home/liu/workspace/swift-diffusion/birb_style_ti_f16.ckpt") {
+graph.openStore("/home/liu/workspace/swift-diffusion/textual_inversion.ckpt") {
   $0.write("string_to_param", tensor: tensor)
 }
-
 fatalError()
 
-let state_dict = (model["state_dict"] as? Interpreter.Dictionary)!
+
+let state_dict = (model["state_dict"] as? Interpreter.Dictionary) ?? model
 
 var renameVAE = [String: Any]()
 state_dict.forEach { key, value in
