@@ -36,7 +36,7 @@ graph.openStore(file1) { store1 in
   }
 }
 */
-let filename = "/home/liu/workspace/swift-diffusion/EmWat69.pt"
+let filename = "/home/liu/workspace/swift-diffusion/instruct-pix2pix-00-22000.ckpt"
 
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 
@@ -155,7 +155,7 @@ interpreter.intercept(module: nil, function: nil) { module, function, args in
 while try interpreter.step() {}
 let graph = DynamicGraph()
 let model = (interpreter.rootObject as? Interpreter.Dictionary)!
-
+/*
 print((model["string_to_token"] as! Interpreter.Dictionary).dictionary)
 let stringToToken = (model["string_to_param"] as? Interpreter.Dictionary)!
 // let parameters = (stringToToken["_parameters"] as? Interpreter.Dictionary)!
@@ -169,8 +169,7 @@ debugPrint(tensor)
 graph.openStore("/home/liu/workspace/swift-diffusion/textual_inversion.ckpt") {
   $0.write("string_to_param", tensor: tensor)
 }
-fatalError()
-
+*/
 
 let state_dict = (model["state_dict"] as? Interpreter.Dictionary) ?? model
 
