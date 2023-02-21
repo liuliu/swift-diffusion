@@ -743,6 +743,12 @@ func InputBlocks(
   return (reader, passLayers, out)
 }
 
+func HintNet() -> ((PythonObject) -> Void, Model) {
+  let hint = Input()
+  let (inputHintReader, inputHintBlocks) = InputHintBlocks(modelChannel: 320, hint: hint)
+  return (inputHintReader, Model([hint], [inputHintBlocks]))
+}
+
 func ControlNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let hint = Input()
@@ -751,11 +757,10 @@ func ControlNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   let (fc0, fc2, timeEmbed) = TimeEmbed(modelChannels: 320)
   let emb = timeEmbed(t_emb)
   let attentionRes = Set([4, 2, 1])
-  let (inputHintReader, inputHintBlocks) = InputHintBlocks(modelChannel: 320, hint: hint)
   let (inputReader, inputs, inputBlocks) = InputBlocks(
     channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
     startHeight: 64,
-    startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: x, hint: inputHintBlocks, emb: emb, c: c)
+    startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: x, hint: hint, emb: emb, c: c)
   var out = inputBlocks
   let (middleReader, middleBlock) = MiddleBlock(
     channels: 1280, numHeads: 8, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
@@ -785,7 +790,6 @@ func ControlNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
     fc0.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_0_bias))
     fc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_2_weight))
     fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_2_bias))
-    inputHintReader(state_dict)
     inputReader(state_dict)
     middleReader(state_dict)
     for i in 0..<zeroConvs.count {
@@ -831,14 +835,19 @@ let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let hintTensor = graph.variable(try! Tensor<Float>(numpy: hint.numpy())).toGPU(0)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
 let (reader, controlnet) = ControlNet(batchSize: 2)
+let (hintReader, hintnet) = HintNet()
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 graph.withNoGrad {
-  let _ = controlnet(inputs: xTensor, hintTensor, t_emb, cTensor)
+  var guidance = hintnet(inputs: hintTensor)[0].as(of: Float.self)
+  let _ = controlnet(inputs: xTensor, guidance, t_emb, cTensor)
+  hintReader(state_dict)
   reader(state_dict)
-  let attnOut = controlnet(inputs: xTensor, hintTensor, t_emb, cTensor)[12].as(of: Float.self)
+  guidance = hintnet(inputs: hintTensor)[0].as(of: Float.self)
+  let attnOut = controlnet(inputs: xTensor, guidance, t_emb, cTensor)[12].as(of: Float.self)
   let attnOutCPU = attnOut.toCPU()
   debugPrint(attnOutCPU)
   graph.openStore("/home/liu/workspace/swift-diffusion/controlnet.ckpt") {
+    $0.write("hintnet", model: hintnet)
     $0.write("controlnet", model: controlnet)
   }
 }

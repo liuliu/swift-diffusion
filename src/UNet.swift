@@ -315,14 +315,18 @@ func OutputBlocks(
   return out
 }
 
-public func UNet(batchSize: Int, startWidth: Int, startHeight: Int) -> Model {
+public func UNet(batchSize: Int, startWidth: Int, startHeight: Int, control: Bool = false) -> Model {
   let x = Input()
   let t_emb = Input()
   let c = Input()
+  var controls = [Model.IO]()
+  if control {
+    controls = (0..<13).map { _ in Input() }
+  }
   let timeEmbed = TimeEmbed(modelChannels: 320)
   let emb = timeEmbed(t_emb)
   let attentionRes = Set([4, 2, 1])
-  let (inputs, inputBlocks) = InputBlocks(
+  var (inputs, inputBlocks) = InputBlocks(
     channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
     startHeight: startHeight,
     startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
@@ -333,6 +337,12 @@ public func UNet(batchSize: Int, startWidth: Int, startHeight: Int) -> Model {
     x: out,
     emb: emb, c: c)
   out = middleBlock
+  if control {
+    out = out + controls[12]
+    for i in 0..<inputs.count {
+      inputs[i] = inputs[i] + controls[i]
+    }
+  }
   let outputBlocks = OutputBlocks(
     channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
     startHeight: startHeight,
@@ -346,5 +356,6 @@ public func UNet(batchSize: Int, startWidth: Int, startHeight: Int) -> Model {
     groups: 1, filters: 4, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = outConv2d(out)
-  return Model([x, t_emb, c], [out])
+  controls.insert(contentsOf: [x, t_emb, c], at: 0)
+  return Model(controls, [out])
 }
