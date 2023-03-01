@@ -95,8 +95,8 @@ DynamicGraph.memoryEfficient = true
 
 let unconditionalGuidanceScale: Float = 7.5
 let scaleFactor: Float = 0.18215
-let startWidth: Int = 64
-let startHeight: Int = 64
+var startWidth: Int = 64
+var startHeight: Int = 64
 let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 30)
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
@@ -140,10 +140,18 @@ for i in 0..<76 {
   }
 }
 
-let unet = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
-let decoder = Decoder(
-  channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
-  startHeight: startHeight)
+let unet = ModelBuilder {
+  let startWidth = $0[0].shape[3]
+  let startHeight = $0[0].shape[2]
+  return UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
+}
+let decoder = ModelBuilder {
+  let startWidth = $0[0].shape[3]
+  let startHeight = $0[0].shape[2]
+  return Decoder(
+    channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
+    startHeight: startHeight)
+}
 
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 
@@ -211,6 +219,50 @@ graph.withNoGrad {
       x = x + sigmaUp * noise
     }
     */
+    // Below is the DPM++ 2M Karras sampling implementation.
+    let denoised = x + cOut * et
+    let h = log(sigmas[i]) - log(sigmas[i + 1])
+    if let oldDenoised = oldDenoised, i < model.steps - 1 {
+      let hLast = log(sigmas[i - 1]) - log(sigmas[i])
+      let r = (h / hLast) / 2
+      let denoisedD = (1 + r) * denoised - r * oldDenoised
+      let w = sigmas[i + 1] / sigmas[i]
+      x = w * x - (w - 1) * denoisedD
+    } else if i == model.steps - 1 {
+      x = denoised
+    } else {
+      let w = sigmas[i + 1] / sigmas[i]
+      x = w * x - (w - 1) * denoised
+    }
+    oldDenoised = denoised
+  }
+  startWidth = 96
+  startHeight = 96
+  x = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+  x.randn(std: 1, mean: 0)
+  xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+  x = sigmas[0] * x
+  oldDenoised = nil
+  for i in 0..<model.steps {
+    let sigma = sigmas[i]
+    let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
+    let ts = timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
+      .toGPU(0)
+    let t = graph.variable(Tensor<UseFloatingPoint>(from: ts))
+    let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
+    let cOut = -sigma
+    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
+    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
+    var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
+    var etUncond = graph.variable(
+      .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+    var etCond = graph.variable(
+      .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
+    etUncond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
+      et[0..<1, 0..<4, 0..<startHeight, 0..<startWidth]
+    etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
+      et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
+    et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
     // Below is the DPM++ 2M Karras sampling implementation.
     let denoised = x + cOut * et
     let h = log(sigmas[i]) - log(sigmas[i + 1])
