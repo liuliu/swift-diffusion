@@ -1,6 +1,9 @@
 import Diffusion
 import Foundation
 import NNC
+import ZIPFoundation
+import Fickling
+import Collections
 
 public struct Storage {
   var name: String
@@ -65,8 +68,84 @@ public final class SafeTensors {
   }
 }
 
-let safeTensors = SafeTensors(url: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/lucyCyberpunk_35Epochs.safetensors"))!
+let filename = "/home/liu/workspace/swift-diffusion/lucyCyberpunk_35Epochs.safetensors"
+/*
+let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
+let entry = archive["archive/data.pkl"]!
+var data = Data()
+let _ = try archive.extract(entry) { data.append($0) }
+let interpreter = Interpreter.from(data: data)
+interpreter.intercept(module: "UNPICKLER", function: "persistent_load") { module, function, args in
+  guard args.count >= 5, let global = args[1] as? Interpreter.GlobalObject,
+    let name = args[2] as? String, let size = args[4] as? Int
+  else { return [nil] }
+  guard global.function == "HalfStorage" || global.function == "FloatStorage" else { return [nil] }
+  let storage = Storage(
+    name: name, size: size, dataType: global.function == "HalfStorage" ? .Float16 : .Float32)
+  return [storage]
+}
+interpreter.intercept(module: "torch.nn.modules.container", function: "ParameterDict") { module, function, _ in
+  return [Interpreter.Dictionary(.unordered)]
+}
+interpreter.intercept(module: "torch._utils", function: "_rebuild_tensor_v2") {
+  module, function, args in
+  guard args.count >= 5, let storage = args[0] as? Storage, let storageOffset = args[1] as? Int,
+    let shape = args[2] as? [Int],
+    let strides = args[3] as? [Int]
+  else { return [nil] }
+  precondition(storageOffset == 0)
+  let tensorDescriptor = TensorDescriptor(
+    storage: storage, storageOffset: storageOffset, shape: shape, strides: strides)
+  return [tensorDescriptor]
+}
+interpreter.intercept(module: "torch._utils", function: "_rebuild_parameter") { _, _, args in
+  guard let tensorDescriptor = args.first as? TensorDescriptor else { return [nil] }
+  return [tensorDescriptor]
+}
+interpreter.intercept(module: nil, function: nil) { module, function, args in
+  return [nil]
+}
+while try interpreter.step() {}
+let model = (interpreter.rootObject as? Interpreter.Dictionary)!
+model.forEach { key, value in
+  print(key)
+}
+*/
+let safeTensors = SafeTensors(url: URL(fileURLWithPath: filename))!
 
-print(safeTensors.states.keys)
-print(safeTensors.states["lora_te_text_model_encoder_layers_7_self_attn_out_proj.lora_up.weight"])
-print(safeTensors.states["lora_te_text_model_encoder_layers_7_self_attn_out_proj.lora_down.weight"])
+let unetDiffusersMap: [(String, String)] = [("input_blocks.1.0.", "down_blocks.0.resnets.0."), ("input_blocks.1.1.", "down_blocks.0.attentions.0."), ("input_blocks.2.0.", "down_blocks.0.resnets.1."), ("input_blocks.2.1.", "down_blocks.0.attentions.1."), ("output_blocks.0.0.", "up_blocks.0.resnets.0."), ("output_blocks.1.0.", "up_blocks.0.resnets.1."), ("output_blocks.2.0.", "up_blocks.0.resnets.2."), ("input_blocks.3.0.op.", "down_blocks.0.downsamplers.0.conv."), ("output_blocks.2.1.", "up_blocks.0.upsamplers.0."), ("input_blocks.4.0.", "down_blocks.1.resnets.0."), ("input_blocks.4.1.", "down_blocks.1.attentions.0."), ("input_blocks.5.0.", "down_blocks.1.resnets.1."), ("input_blocks.5.1.", "down_blocks.1.attentions.1."), ("output_blocks.3.0.", "up_blocks.1.resnets.0."), ("output_blocks.3.1.", "up_blocks.1.attentions.0."), ("output_blocks.4.0.", "up_blocks.1.resnets.1."), ("output_blocks.4.1.", "up_blocks.1.attentions.1."), ("output_blocks.5.0.", "up_blocks.1.resnets.2."), ("output_blocks.5.1.", "up_blocks.1.attentions.2."), ("input_blocks.6.0.op.", "down_blocks.1.downsamplers.0.conv."), ("output_blocks.5.2.", "up_blocks.1.upsamplers.0."), ("input_blocks.7.0.", "down_blocks.2.resnets.0."), ("input_blocks.7.1.", "down_blocks.2.attentions.0."), ("input_blocks.8.0.", "down_blocks.2.resnets.1."), ("input_blocks.8.1.", "down_blocks.2.attentions.1."), ("output_blocks.6.0.", "up_blocks.2.resnets.0."), ("output_blocks.6.1.", "up_blocks.2.attentions.0."), ("output_blocks.7.0.", "up_blocks.2.resnets.1."), ("output_blocks.7.1.", "up_blocks.2.attentions.1."), ("output_blocks.8.0.", "up_blocks.2.resnets.2."), ("output_blocks.8.1.", "up_blocks.2.attentions.2."), ("input_blocks.9.0.op.", "down_blocks.2.downsamplers.0.conv."), ("output_blocks.8.2.", "up_blocks.2.upsamplers.0."), ("input_blocks.10.0.", "down_blocks.3.resnets.0."), ("input_blocks.11.0.", "down_blocks.3.resnets.1."), ("output_blocks.9.0.", "up_blocks.3.resnets.0."), ("output_blocks.9.1.", "up_blocks.3.attentions.0."), ("output_blocks.10.0.", "up_blocks.3.resnets.1."), ("output_blocks.10.1.", "up_blocks.3.attentions.1."), ("output_blocks.11.0.", "up_blocks.3.resnets.2."), ("output_blocks.11.1.", "up_blocks.3.attentions.2."), ("middle_block.1.", "mid_block.attentions.0."), ("middle_block.0.", "mid_block.resnets.0."), ("middle_block.2.", "mid_block.resnets.1.")]
+
+let vaeDiffusersMap: [(String, String)] = [("nin_shortcut", "conv_shortcut"), ("norm_out", "conv_norm_out"), ("mid.attn_1.", "mid_block.attentions.0."), ("encoder.down.0.block.0.", "encoder.down_blocks.0.resnets.0."), ("encoder.down.0.block.1.", "encoder.down_blocks.0.resnets.1."), ("down.0.downsample.", "down_blocks.0.downsamplers.0."), ("up.3.upsample.", "up_blocks.0.upsamplers.0."), ("decoder.up.3.block.0.", "decoder.up_blocks.0.resnets.0."), ("decoder.up.3.block.1.", "decoder.up_blocks.0.resnets.1."), ("decoder.up.3.block.2.", "decoder.up_blocks.0.resnets.2."), ("encoder.down.1.block.0.", "encoder.down_blocks.1.resnets.0."), ("encoder.down.1.block.1.", "encoder.down_blocks.1.resnets.1."), ("down.1.downsample.", "down_blocks.1.downsamplers.0."), ("up.2.upsample.", "up_blocks.1.upsamplers.0."), ("decoder.up.2.block.0.", "decoder.up_blocks.1.resnets.0."), ("decoder.up.2.block.1.", "decoder.up_blocks.1.resnets.1."), ("decoder.up.2.block.2.", "decoder.up_blocks.1.resnets.2."), ("encoder.down.2.block.0.", "encoder.down_blocks.2.resnets.0."), ("encoder.down.2.block.1.", "encoder.down_blocks.2.resnets.1."), ("down.2.downsample.", "down_blocks.2.downsamplers.0."), ("up.1.upsample.", "up_blocks.2.upsamplers.0."), ("decoder.up.1.block.0.", "decoder.up_blocks.2.resnets.0."), ("decoder.up.1.block.1.", "decoder.up_blocks.2.resnets.1."), ("decoder.up.1.block.2.", "decoder.up_blocks.2.resnets.2."), ("encoder.down.3.block.0.", "encoder.down_blocks.3.resnets.0."), ("encoder.down.3.block.1.", "encoder.down_blocks.3.resnets.1."), ("decoder.up.0.block.0.", "decoder.up_blocks.3.resnets.0."), ("decoder.up.0.block.1.", "decoder.up_blocks.3.resnets.1."), ("decoder.up.0.block.2.", "decoder.up_blocks.3.resnets.2."), ("mid.block_1.", "mid_block.resnets.0."), ("mid.block_2.", "mid_block.resnets.1.")]
+
+let jsonDecoder = JSONDecoder()
+var unetMap = try jsonDecoder.decode([String].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/unet.json")))
+for i in stride(from: 0, to: unetMap.count, by: 2) {
+  // Replacing to diffuser terminology, remove first two, then join with _ except the last part.
+  for namePairs in unetDiffusersMap {
+    if unetMap[i].contains(namePairs.0) {
+      unetMap[i] = unetMap[i].replacingOccurrences(of: namePairs.0, with: namePairs.1)
+      break
+    }
+  }
+  let parts = unetMap[i].components(separatedBy: ".")
+  unetMap[i] = parts[2..<(parts.count - 1)].joined(separator: "_") + "." + parts[parts.count - 1]
+}
+var textModelMap = try jsonDecoder.decode([String].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/text_model.json")))
+for i in stride(from: 0, to: textModelMap.count, by: 2) {
+  let parts = textModelMap[i].components(separatedBy: ".")
+  textModelMap[i] = parts[2..<(parts.count - 1)].joined(separator: "_") + "." + parts[parts.count - 1]
+}
+let keys = safeTensors.states.keys
+var keysSet = Set(keys)
+for key in keys {
+  let parts = key.components(separatedBy: "_")
+  let newParts = String(parts[2..<parts.count].joined(separator: "_")).components(separatedBy: ".")
+  let newKey = newParts[0..<newParts.count - 2].joined(separator: ".") + ".weight"
+  if unetMap.contains(newKey) {
+    keysSet.remove(key)
+  }
+  if textModelMap.contains(newKey) {
+    keysSet.remove(key)
+  }
+}
+print(keysSet)

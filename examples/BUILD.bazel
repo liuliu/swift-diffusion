@@ -218,7 +218,9 @@ swift_binary(
         "//:diffusion",
         "@SwiftNumerics//:Numerics",
         "@SwiftPNG//:PNG",
+        "@ZIPFoundation",
         "@ccv//lib:ccv",
         "@s4nnc//nnc",
+        "@swift-fickling//:fickling",
     ],
 )
