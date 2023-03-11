@@ -160,8 +160,20 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
   textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore(workDir + "/sd-v1.4.ckpt") {
-    $0.read("text_model", model: textModel)
+  graph.openStore(workDir + "/lora.ckpt") { lora in
+    let keys = Set(lora.keys)
+    graph.openStore(workDir + "/sd-v1.4.ckpt") { store in
+      store.read("text_model", model: textModel) { name, _, _, _ in
+        if keys.contains(name + "__up__") {
+          let original = graph.variable(Tensor<UseFloatingPoint>(from: store.read(name)!)).toGPU(0)
+          let up = graph.variable(Tensor<UseFloatingPoint>(lora.read(name + "__up__")!)).toGPU(0)
+          let down = graph.variable(Tensor<UseFloatingPoint>(lora.read(name + "__down__")!)).toGPU(0)
+          let final = original + 0.6 * (up * down)
+          return .final(final.rawValue)
+        }
+        return .continue(name)
+      }
+    }
   }
   let c: DynamicGraph.AnyTensor = textModel(
     inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
@@ -174,13 +186,35 @@ graph.withNoGrad {
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
   unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts)), c)
   decoder.compile(inputs: x)
-  graph.openStore(workDir + "/sd-v1.4.ckpt") {
-    $0.read("unet", model: unet)
-    $0.read("decoder", model: decoder)
+  graph.openStore(workDir + "/lora.ckpt") { lora in
+    let keys = Set(lora.keys)
+    graph.openStore(workDir + "/sd-v1.4.ckpt") { store in
+      store.read("unet", model: unet) { name, _, _, _ in
+        if keys.contains(name + "__up__") {
+          let original = graph.variable(Tensor<UseFloatingPoint>(from: store.read(name)!)).toGPU(0)
+          let up: DynamicGraph.Tensor<UseFloatingPoint>
+          let down: DynamicGraph.Tensor<UseFloatingPoint>
+          let result: DynamicGraph.Tensor<UseFloatingPoint>
+          if original.shape.count == 4 {
+            let loraUp = Tensor<UseFloatingPoint>(lora.read(name + "__up__")!)
+            up = graph.variable(loraUp.reshaped(.NC(loraUp.shape[0], loraUp.shape[1] * loraUp.shape[2] * loraUp.shape[3]))).toGPU(0)
+            let loraDown = Tensor<UseFloatingPoint>(lora.read(name + "__down__")!)
+            down = graph.variable(loraDown.reshaped(.NC(loraDown.shape[0], loraDown.shape[1] * loraDown.shape[2] * loraDown.shape[3]))).toGPU(0)
+            result = original + 0.6 * (up * down).reshaped(format: .NCHW, shape: original.shape)
+          } else {
+            up = graph.variable(Tensor<UseFloatingPoint>(lora.read(name + "__up__")!)).toGPU(0)
+            down = graph.variable(Tensor<UseFloatingPoint>(lora.read(name + "__down__")!)).toGPU(0)
+            result = original + 0.6 * (up * down)
+          }
+          return .final(result.rawValue)
+        }
+        return .continue(name)
+      }
+      store.read("decoder", model: decoder)
+    }
   }
   var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil
   let startTime = Date()
-  DynamicGraph.setProfiler(true)
   // Now do DPM++ 2M Karras sampling. (DPM++ 2S a Karras requires two denoising per step, not ideal for my use case).
   x = sigmas[0] * x
   for i in 0..<model.steps {
@@ -236,6 +270,7 @@ graph.withNoGrad {
     }
     oldDenoised = denoised
   }
+  /*
   startWidth = 96
   startHeight = 96
   x = graph.variable(.GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
@@ -280,6 +315,7 @@ graph.withNoGrad {
     }
     oldDenoised = denoised
   }
+  */
   let z = 1.0 / scaleFactor * x
   let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: UseFloatingPoint.self))
     .toCPU()

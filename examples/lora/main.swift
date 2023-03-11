@@ -66,6 +66,32 @@ public final class SafeTensors {
     self.states = states
     bufferStart = 8 + Int(headerSize)
   }
+  public func with<T>(_ tensorDescriptor: TensorDescriptor, block: (AnyTensor) throws -> T) throws
+    -> T
+  {
+    // Don't subrange data, otherwise it will materialize the data into memory. Accessing the underlying
+    // bytes directly, this way, it is just the mmap bytes, and we won't cause spike in memory usage.
+    return try data.withUnsafeMutableBytes {
+      guard let address = $0.baseAddress else { fatalError() }
+      let tensor: AnyTensor
+      if tensorDescriptor.storage.dataType == .Float16 {
+        tensor = Tensor<Float16>(
+          .CPU, format: .NCHW, shape: TensorShape(tensorDescriptor.shape),
+          unsafeMutablePointer: (address + bufferStart + tensorDescriptor.storageOffset)
+            .assumingMemoryBound(
+              to: Float16.self), bindLifetimeOf: self
+        )
+      } else {
+        tensor = Tensor<Float>(
+          .CPU, format: .NCHW, shape: TensorShape(tensorDescriptor.shape),
+          unsafeMutablePointer: (address + bufferStart + tensorDescriptor.storageOffset)
+            .assumingMemoryBound(
+              to: Float.self), bindLifetimeOf: self
+        )
+      }
+      return try block(tensor)
+    }
+  }
 }
 
 let filename = "/home/liu/workspace/swift-diffusion/lucyCyberpunk_35Epochs.safetensors"
@@ -148,4 +174,62 @@ for key in keys {
     keysSet.remove(key)
   }
 }
-print(keysSet)
+var unetMapCount = [String: Int]()
+for i in stride(from: 0, to: unetMap.count, by: 2) {
+  unetMapCount[unetMap[i]] = unetMapCount[unetMap[i], default: 0] + 1
+}
+for key in unetMapCount.keys {
+  if unetMapCount[key] ?? 0 <= 1 {
+    unetMapCount[key] = nil
+  }
+}
+var textModelMapCount = [String: Int]()
+for i in stride(from: 0, to: textModelMap.count, by: 2) {
+  textModelMapCount[textModelMap[i]] = textModelMapCount[textModelMap[i], default: 0] + 1
+}
+for key in textModelMapCount.keys {
+  if textModelMapCount[key] ?? 0 <= 1 {
+    textModelMapCount[key] = nil
+  }
+}
+let graph = DynamicGraph()
+try graph.openStore("/home/liu/workspace/swift-diffusion/lora.ckpt") { store in
+  for (key, descriptor) in safeTensors.states {
+    let parts = key.components(separatedBy: "_")
+    let newParts = String(parts[2..<parts.count].joined(separator: "_")).components(separatedBy: ".")
+    let newKey = newParts[0..<newParts.count - 2].joined(separator: ".") + ".weight"
+    if let index = unetMap.firstIndex(of: newKey) {
+      if key.hasSuffix("up.weight") {
+        try safeTensors.with(descriptor) {
+          let f16 = Tensor<Float16>(from: $0)
+          if unetMapCount[newKey] ?? 0 >= 2 {
+            store.write("__unet__[\(unetMap[index + 1])]__up__", tensor: f16[0..<(f16.shape[0] / 2), 0..<f16.shape[1]].copied())
+            store.write("__unet__[\(unetMap[index + 5])]__up__", tensor: f16[(f16.shape[0] / 2)..<f16.shape[0], 0..<f16.shape[1]].copied())
+          } else {
+            store.write("__unet__[\(unetMap[index + 1])]__up__", tensor: f16)
+          }
+        }
+      } else if key.hasSuffix("down.weight") {
+        try safeTensors.with(descriptor) {
+          let f16 = Tensor<Float16>(from: $0)
+          store.write("__unet__[\(unetMap[index + 1])]__down__", tensor: f16)
+          if unetMapCount[newKey] ?? 0 >= 2 {
+            store.write("__unet__[\(unetMap[index + 5])]__down__", tensor: f16)
+          }
+        }
+      }
+    } else if let index = textModelMap.firstIndex(of: newKey) {
+      if key.hasSuffix("up.weight") {
+        try safeTensors.with(descriptor) {
+          let f16 = Tensor<Float16>(from: $0)
+          store.write("__text_model__[\(textModelMap[index + 1])]__up__", tensor: f16)
+        }
+      } else if key.hasSuffix("down.weight") {
+        try safeTensors.with(descriptor) {
+          let f16 = Tensor<Float16>(from: $0)
+          store.write("__text_model__[\(textModelMap[index + 1])]__down__", tensor: f16)
+        }
+      }
+    }
+  }
+}
