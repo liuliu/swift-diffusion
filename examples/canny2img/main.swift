@@ -96,10 +96,10 @@ let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
 
 let graph = DynamicGraph()
 
-let textModel = CLIPTextModel(
+let textModel = OpenCLIPTextModel(
   UseFloatingPoint.self,
-  vocabularySize: 49408, maxLength: 77, embeddingSize: 768, numLayers: 12, numHeads: 12,
-  batchSize: 2, intermediateSize: 3072)
+  vocabularySize: 49408, maxLength: 77, embeddingSize: 1024, numLayers: 23, numHeads: 16,
+  batchSize: 2, intermediateSize: 4096)
 
 let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
@@ -124,8 +124,8 @@ for i in 0..<model.steps {
   ts.append(
     timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0))
 }
-let unet = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight, control: true)
-let controlnet = ControlNet(batchSize: 2)
+let unet = UNetv2(batchSize: 2, startWidth: startWidth, startHeight: startHeight, control: true)
+let controlnet = ControlNetv2(batchSize: 2)
 let hintnet = HintNet()
 let encoder = Encoder(
   channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
@@ -141,18 +141,18 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
   textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore(workDir + "/sd-v1.4.ckpt") {
+  graph.openStore("/fast/Data/SD/swift-diffusion/open_clip_vit_h14_f32.ckpt") {
     $0.read("text_model", model: textModel)
   }
   let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
     of: UseFloatingPoint.self
-  ).reshaped(.CHW(2, 77, 768))
+  ).reshaped(.CHW(2, 77, 1024))
   let noise = graph.variable(
     .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   noise.randn(std: 1, mean: 0)
   let hint = graph.variable(hintImg.toGPU(0))
   hintnet.compile(inputs: hint)
-  graph.openStore(workDir + "/controlnet_15_canny.ckpt") {
+  graph.openStore(workDir + "/controlnet_21_scribble.ckpt") {
     $0.read("hintnet", model: hintnet)
   }
   let guidance = hintnet(inputs: hint)[0].as(of: UseFloatingPoint.self)
@@ -160,10 +160,10 @@ graph.withNoGrad {
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   let ts0 = graph.variable(Tensor<UseFloatingPoint>(from: ts[0]))
   controlnet.compile(inputs: xIn, guidance, ts0, c)
-  graph.openStore(workDir + "/controlnet_15_canny.ckpt") {
+  graph.openStore(workDir + "/controlnet_21_scribble.ckpt") {
     $0.read("controlnet", model: controlnet)
   }
-  graph.openStore(workDir + "/controlnet_canny_1x_f16.ckpt") {
+  graph.openStore(workDir + "/controlnet_scribble_2x_f16.ckpt") {
     $0.write("hintnet", model: hintnet)
     $0.write("controlnet", model: controlnet)
   }
@@ -173,8 +173,10 @@ graph.withNoGrad {
   decoder.compile(inputs: x)
   let initImg = graph.variable(initImg.toGPU(0))
   encoder.compile(inputs: initImg)
-  graph.openStore(workDir + "/sd-v1.4.ckpt") {
+  graph.openStore("/fast/Data/SD/swift-diffusion/sd_v2.1_f32.ckpt") {
     $0.read("unet", model: unet)
+  }
+  graph.openStore("/fast/Data/SD/swift-diffusion/vae_ft_mse_840000_f32.ckpt") {
     $0.read("decoder", model: decoder)
     $0.read("encoder", model: encoder)
   }

@@ -315,6 +315,123 @@ func OutputBlocks(
   return out
 }
 
+func MiddleBlock(
+  channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
+  x: Model.IO, emb: Model.IO, c: Model.IO
+) -> Model.IO {
+  precondition(channels % numHeadChannels == 0)
+  let numHeads = channels / numHeadChannels
+  let k = numHeadChannels
+  let resBlock1 = ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
+  var out = resBlock1(x, emb)
+  let transformer = SpatialTransformer(
+    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, t: embeddingSize,
+    intermediateSize: channels * 4)
+  out = transformer(out, c)
+  let resBlock2 = ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
+  out = resBlock2(out, emb)
+  return out
+}
+
+func InputBlocks(
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO
+) -> ([Model.IO], Model.IO) {
+  let conv2d = Convolution(
+    groups: 1, filters: 320, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  var out = conv2d(x)
+  var layerStart = 1
+  var height = startHeight
+  var width = startWidth
+  var previousChannel = channels[0]
+  var ds = 1
+  var passLayers = [out]
+  for (i, channel) in channels.enumerated() {
+    let attentionBlock = attentionRes.contains(ds)
+    for _ in 0..<numRepeat {
+      let inputLayer = BlockLayer(
+        prefix: "input_blocks",
+        layerStart: layerStart, skipConnection: previousChannel != channel,
+        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels, batchSize: batchSize,
+        height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
+      previousChannel = channel
+      if attentionBlock {
+        out = inputLayer(out, emb, c)
+      } else {
+        out = inputLayer(out, emb)
+      }
+      passLayers.append(out)
+      layerStart += 1
+    }
+    if i != channels.count - 1 {
+      let downsample = Convolution(
+        groups: 1, filters: channel, filterSize: [3, 3],
+        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [0, 0])))
+      out = downsample(out)
+      passLayers.append(out)
+      height = height / 2
+      width = width / 2
+      layerStart += 1
+      ds *= 2
+    }
+  }
+  return (passLayers, out)
+}
+
+func OutputBlocks(
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO,
+  inputs: [Model.IO]
+) -> Model.IO {
+  var layerStart = 0
+  var height = startHeight
+  var width = startWidth
+  var ds = 1
+  var heights = [height]
+  var widths = [width]
+  var dss = [ds]
+  for _ in 0..<channels.count - 1 {
+    height = height / 2
+    width = width / 2
+    ds *= 2
+    heights.append(height)
+    widths.append(width)
+    dss.append(ds)
+  }
+  var out = x
+  var inputIdx = inputs.count - 1
+  for (i, channel) in channels.enumerated().reversed() {
+    let height = heights[i]
+    let width = widths[i]
+    let ds = dss[i]
+    let attentionBlock = attentionRes.contains(ds)
+    for j in 0..<(numRepeat + 1) {
+      out = Concat(axis: 1)(out, inputs[inputIdx])
+      inputIdx -= 1
+      let outputLayer = BlockLayer(
+        prefix: "output_blocks",
+        layerStart: layerStart, skipConnection: true,
+        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels, batchSize: batchSize,
+        height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
+      if attentionBlock {
+        out = outputLayer(out, emb, c)
+      } else {
+        out = outputLayer(out, emb)
+      }
+      if i > 0 && j == numRepeat {
+        out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
+        let conv2d = Convolution(
+          groups: 1, filters: channel, filterSize: [3, 3],
+          hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+        out = conv2d(out)
+      }
+      layerStart += 1
+    }
+  }
+  return out
+}
+
 public func UNet(batchSize: Int, startWidth: Int, startHeight: Int, control: Bool = false) -> Model {
   let x = Input()
   let t_emb = Input()
@@ -345,6 +462,51 @@ public func UNet(batchSize: Int, startWidth: Int, startHeight: Int, control: Boo
   }
   let outputBlocks = OutputBlocks(
     channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    startHeight: startHeight,
+    startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
+    inputs: inputs)
+  out = outputBlocks
+  let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  out = outNorm(out)
+  out = out.swish()
+  let outConv2d = Convolution(
+    groups: 1, filters: 4, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = outConv2d(out)
+  controls.insert(contentsOf: [x, t_emb, c], at: 0)
+  return Model(controls, [out])
+}
+
+public func UNetv2(batchSize: Int, startWidth: Int, startHeight: Int, control: Bool = false) -> Model {
+  let x = Input()
+  let t_emb = Input()
+  let c = Input()
+  var controls = [Model.IO]()
+  if control {
+    controls = (0..<13).map { _ in Input() }
+  }
+  let timeEmbed = TimeEmbed(modelChannels: 320)
+  let emb = timeEmbed(t_emb)
+  let attentionRes = Set([4, 2, 1])
+  var (inputs, inputBlocks) = InputBlocks(
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: startHeight,
+    startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
+  var out = inputBlocks
+  let middleBlock = MiddleBlock(
+    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: startHeight / 8,
+    width: startWidth / 8, embeddingSize: 77,
+    x: out,
+    emb: emb, c: c)
+  out = middleBlock
+  if control {
+    out = out + controls[12]
+    for i in 0..<inputs.count {
+      inputs[i] = inputs[i] + controls[i]
+    }
+  }
+  let outputBlocks = OutputBlocks(
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: startHeight,
     startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
     inputs: inputs)

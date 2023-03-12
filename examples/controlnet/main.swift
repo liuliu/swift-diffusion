@@ -401,11 +401,12 @@ func BlockLayer(
 }
 
 func MiddleBlock(
-  channels: Int, numHeads: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
+  channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
   x: Model.IO, emb: Model.IO, c: Model.IO
 ) -> ((PythonObject) -> Void, Model.IO) {
-  precondition(channels % numHeads == 0)
-  let k = channels / numHeads
+  precondition(channels % numHeadChannels == 0)
+  let numHeads = channels / numHeadChannels
+  let k = numHeadChannels
   let (inLayerNorm1, inLayerConv2d1, embLayer1, outLayerNorm1, outLayerConv2d1, _, resBlock1) =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   var out = resBlock1(x, emb)
@@ -679,7 +680,7 @@ func InputHintBlocks(modelChannel: Int, hint: Model.IO) -> ((PythonObject) -> Vo
 }
 
 func InputBlocks(
-  channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int, startWidth: Int,
   embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, hint: Model.IO, emb: Model.IO, c: Model.IO
 ) -> ((PythonObject) -> Void, [(Model.IO, Int)], Model.IO) {
   let conv2d = Convolution(
@@ -699,7 +700,7 @@ func InputBlocks(
       let (reader, inputLayer) = BlockLayer(
         prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
-        attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels, batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       previousChannel = channel
       if attentionBlock {
@@ -758,12 +759,12 @@ func ControlNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   let emb = timeEmbed(t_emb)
   let attentionRes = Set([4, 2, 1])
   let (inputReader, inputs, inputBlocks) = InputBlocks(
-    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: 64,
     startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: x, hint: hint, emb: emb, c: c)
   var out = inputBlocks
   let (middleReader, middleBlock) = MiddleBlock(
-    channels: 1280, numHeads: 8, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
+    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
     x: out,
     emb: emb, c: c)
   out = middleBlock
@@ -814,12 +815,12 @@ torch.cuda.manual_seed_all(42)
 let x = torch.randn([2, 4, 64, 64])
 let hint = torch.randn([2, 3, 512, 512])
 let t = torch.full([1], 981)
-let c = torch.randn([2, 77, 768])
+let c = torch.randn([2, 77, 1024])
 
 let model = cldm_model.create_model(
-  "/home/liu/workspace/ControlNet/models/cldm_v15.yaml").cpu()
+  "/home/liu/workspace/ControlNet/models/cldm_v21.yaml").cpu()
 model.load_state_dict(cldm_model.load_state_dict(
-  "/home/liu/workspace/ControlNet/models/control_sd15_canny.pth",
+  "/home/liu/workspace/ControlNet/models/scribble-sd21.ckpt",
   location: "cpu"))
 let state_dict = model.control_model.state_dict()
 let ret = model.control_model(x, hint: hint, timesteps: t, context: c)
