@@ -160,16 +160,16 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
   textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore(workDir + "/lora.ckpt") { lora in
+  graph.openStore(workDir + "/moxin_v1.0_lora_f16.ckpt") { lora in
     let keys = Set(lora.keys)
-    graph.openStore(workDir + "/sd-v1.4.ckpt") { store in
+    graph.openStore(workDir + "/sd-v1.5.ckpt") { store in
       store.read("text_model", model: textModel) { name, _, _, _ in
         if keys.contains(name + "__up__") {
           let original = graph.variable(Tensor<UseFloatingPoint>(from: store.read(name)!)).toGPU(0)
           let up = graph.variable(Tensor<UseFloatingPoint>(lora.read(name + "__up__")!)).toGPU(0)
           let down = graph.variable(Tensor<UseFloatingPoint>(lora.read(name + "__down__")!)).toGPU(0)
-          let final = original + 0.6 * (up * down)
-          return .final(final.rawValue)
+          let final = original + 0.8 * (up * down)
+          return .final(final.rawValue.toCPU())
         }
         return .continue(name)
       }
@@ -186,9 +186,9 @@ graph.withNoGrad {
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
   unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts)), c)
   decoder.compile(inputs: x)
-  graph.openStore(workDir + "/lora.ckpt") { lora in
+  graph.openStore(workDir + "/moxin_v1.0_lora_f16.ckpt") { lora in
     let keys = Set(lora.keys)
-    graph.openStore(workDir + "/sd-v1.4.ckpt") { store in
+    graph.openStore(workDir + "/sd-v1.5.ckpt") { store in
       store.read("unet", model: unet) { name, _, _, _ in
         if keys.contains(name + "__up__") {
           let original = graph.variable(Tensor<UseFloatingPoint>(from: store.read(name)!)).toGPU(0)
@@ -200,11 +200,11 @@ graph.withNoGrad {
             up = graph.variable(loraUp.reshaped(.NC(loraUp.shape[0], loraUp.shape[1] * loraUp.shape[2] * loraUp.shape[3]))).toGPU(0)
             let loraDown = Tensor<UseFloatingPoint>(lora.read(name + "__down__")!)
             down = graph.variable(loraDown.reshaped(.NC(loraDown.shape[0], loraDown.shape[1] * loraDown.shape[2] * loraDown.shape[3]))).toGPU(0)
-            result = original + 0.6 * (up * down).reshaped(format: .NCHW, shape: original.shape)
+            result = original + 0.8 * (up * down).reshaped(format: .NCHW, shape: original.shape)
           } else {
             up = graph.variable(Tensor<UseFloatingPoint>(lora.read(name + "__up__")!)).toGPU(0)
             down = graph.variable(Tensor<UseFloatingPoint>(lora.read(name + "__down__")!)).toGPU(0)
-            result = original + 0.6 * (up * down)
+            result = original + 0.8 * (up * down)
           }
           return .final(result.rawValue)
         }

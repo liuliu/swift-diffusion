@@ -9,6 +9,7 @@ public struct Storage {
   var name: String
   var size: Int
   var dataType: DataType
+  var BF16: Bool
 }
 
 public struct TensorDescriptor {
@@ -46,7 +47,7 @@ public final class SafeTensors {
       guard !(shape.contains { $0 <= 0 }) else { continue }
       guard
         dtype == "f32" || dtype == "f16" || dtype == "float16" || dtype == "float32"
-          || dtype == "float" || dtype == "half"
+          || dtype == "float" || dtype == "half" || dtype == "bf16"
       else { continue }
       let dataType: DataType =
         dtype == "f32" || dtype == "float32" || dtype == "float" ? .Float32 : .Float16
@@ -58,7 +59,7 @@ public final class SafeTensors {
       }
       strides.reverse()
       let tensorDescriptor = TensorDescriptor(
-        storage: Storage(name: key, size: offsetEnd - offsetStart, dataType: dataType),
+        storage: Storage(name: key, size: offsetEnd - offsetStart, dataType: dataType, BF16: dtype == "bf16"),
         storageOffset: offsetStart, shape: shape, strides: strides)
       states[key] = tensorDescriptor
     }
@@ -75,12 +76,27 @@ public final class SafeTensors {
       guard let address = $0.baseAddress else { fatalError() }
       let tensor: AnyTensor
       if tensorDescriptor.storage.dataType == .Float16 {
-        tensor = Tensor<Float16>(
-          .CPU, format: .NCHW, shape: TensorShape(tensorDescriptor.shape),
-          unsafeMutablePointer: (address + bufferStart + tensorDescriptor.storageOffset)
-            .assumingMemoryBound(
-              to: Float16.self), bindLifetimeOf: self
-        )
+        if tensorDescriptor.storage.BF16 {
+          let count = tensorDescriptor.strides[0] * tensorDescriptor.shape[0]
+          let u16 = UnsafeMutablePointer<UInt16>.allocate(capacity: count * 2)
+          let bf16 = (address + bufferStart + tensorDescriptor.storageOffset).assumingMemoryBound(to: UInt16.self)
+          for i in 0..<count {
+            u16[i * 2] = 0
+            u16[i * 2 + 1] = bf16[i]
+          }
+          tensor = Tensor<Float>(
+            .CPU, format: .NCHW, shape: TensorShape(tensorDescriptor.shape),
+            unsafeMutablePointer: UnsafeMutableRawPointer(u16).assumingMemoryBound(to: Float.self), bindLifetimeOf: self
+          ).copied()
+          u16.deallocate()
+        } else {
+          tensor = Tensor<Float16>(
+            .CPU, format: .NCHW, shape: TensorShape(tensorDescriptor.shape),
+            unsafeMutablePointer: (address + bufferStart + tensorDescriptor.storageOffset)
+              .assumingMemoryBound(
+                to: Float16.self), bindLifetimeOf: self
+          )
+        }
       } else {
         tensor = Tensor<Float>(
           .CPU, format: .NCHW, shape: TensorShape(tensorDescriptor.shape),
@@ -94,7 +110,7 @@ public final class SafeTensors {
   }
 }
 
-let filename = "/home/liu/workspace/swift-diffusion/lucyCyberpunk_35Epochs.safetensors"
+let filename = "/home/liu/workspace/swift-diffusion/openjourneyLora_v1.safetensors"
 /*
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 let entry = archive["archive/data.pkl"]!
@@ -174,6 +190,7 @@ for key in keys {
     keysSet.remove(key)
   }
 }
+print(keysSet)
 var unetMapCount = [String: Int]()
 for i in stride(from: 0, to: unetMap.count, by: 2) {
   unetMapCount[unetMap[i]] = unetMapCount[unetMap[i], default: 0] + 1
