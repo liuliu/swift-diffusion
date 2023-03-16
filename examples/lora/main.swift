@@ -110,7 +110,7 @@ public final class SafeTensors {
   }
 }
 
-let filename = "/home/liu/workspace/swift-diffusion/openjourneyLora_v1.safetensors"
+let filename = "/home/liu/workspace/swift-diffusion/to8sHighKeyLORASD15SD2_sd21768.safetensors"
 /*
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 let entry = archive["archive/data.pkl"]!
@@ -172,7 +172,7 @@ for i in stride(from: 0, to: unetMap.count, by: 2) {
   let parts = unetMap[i].components(separatedBy: ".")
   unetMap[i] = parts[2..<(parts.count - 1)].joined(separator: "_") + "." + parts[parts.count - 1]
 }
-var textModelMap = try jsonDecoder.decode([String].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/text_model.json")))
+var textModelMap = try jsonDecoder.decode([String].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/open_clip_text_model_1.json")))
 for i in stride(from: 0, to: textModelMap.count, by: 2) {
   let parts = textModelMap[i].components(separatedBy: ".")
   textModelMap[i] = parts[2..<(parts.count - 1)].joined(separator: "_") + "." + parts[parts.count - 1]
