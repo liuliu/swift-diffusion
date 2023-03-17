@@ -56,6 +56,17 @@ swift_binary(
 )
 
 swift_binary(
+    name = "t2i-adapter",
+    srcs = ["t2i-adapter/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "decoder",
     srcs = ["decoder/main.swift"],
     deps = [
