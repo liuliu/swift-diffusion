@@ -38,12 +38,15 @@ public final class SafeTensors {
     var states = [String: TensorDescriptor]()
     for (key, value) in jsonDict {
       guard let value = value as? [String: Any], let offsets = value["data_offsets"] as? [Int],
-        let dtype = (value["dtype"] as? String)?.lowercased(), let shape = value["shape"] as? [Int],
-        offsets.count == 2 && shape.count > 0
+        let dtype = (value["dtype"] as? String)?.lowercased(), var shape = value["shape"] as? [Int],
+        offsets.count == 2 && shape.count >= 0
       else { continue }
       let offsetStart = offsets[0]
       let offsetEnd = offsets[1]
       guard offsetEnd > offsetStart && offsetEnd <= data.count else { continue }
+      if shape.count == 0 {
+        shape = [1]
+      }
       guard !(shape.contains { $0 <= 0 }) else { continue }
       guard
         dtype == "f32" || dtype == "f16" || dtype == "float16" || dtype == "float32"
@@ -110,7 +113,7 @@ public final class SafeTensors {
   }
 }
 
-let filename = "/home/liu/workspace/swift-diffusion/to8sHighKeyLORASD15SD2_sd21768.safetensors"
+let filename = "/home/liu/workspace/swift-diffusion/adamsArtworkStyle_v01.safetensors"
 /*
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 let entry = archive["archive/data.pkl"]!
@@ -172,7 +175,7 @@ for i in stride(from: 0, to: unetMap.count, by: 2) {
   let parts = unetMap[i].components(separatedBy: ".")
   unetMap[i] = parts[2..<(parts.count - 1)].joined(separator: "_") + "." + parts[parts.count - 1]
 }
-var textModelMap = try jsonDecoder.decode([String].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/open_clip_text_model_1.json")))
+var textModelMap = try jsonDecoder.decode([String].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/text_model.json")))
 for i in stride(from: 0, to: textModelMap.count, by: 2) {
   let parts = textModelMap[i].components(separatedBy: ".")
   textModelMap[i] = parts[2..<(parts.count - 1)].joined(separator: "_") + "." + parts[parts.count - 1]
@@ -217,8 +220,16 @@ try graph.openStore("/home/liu/workspace/swift-diffusion/lora.ckpt") { store in
     let newKey = newParts[0..<newParts.count - 2].joined(separator: ".") + ".weight"
     if let index = unetMap.firstIndex(of: newKey) {
       if key.hasSuffix("up.weight") {
+        let scalar = try safeTensors.states[String(key.prefix(upTo: key.index(key.endIndex, offsetBy: -14))) + "alpha"].map {
+          return try safeTensors.with($0) {
+            return Tensor<Float32>(from: $0)[0]
+          }
+        }
         try safeTensors.with(descriptor) {
-          let f16 = Tensor<Float16>(from: $0)
+          var f16 = Tensor<Float16>(from: $0)
+          if let scalar = scalar, abs(scalar - Float(f16.shape[1])) > 1e-5 {
+            f16 = ((scalar / Float(f16.shape[1])) * graph.variable(f16)).rawValue
+          }
           if unetMapCount[newKey] ?? 0 >= 2 {
             store.write("__unet__[\(unetMap[index + 1])]__up__", tensor: f16[0..<(f16.shape[0] / 2), 0..<f16.shape[1]].copied())
             store.write("__unet__[\(unetMap[index + 5])]__up__", tensor: f16[(f16.shape[0] / 2)..<f16.shape[0], 0..<f16.shape[1]].copied())
@@ -237,8 +248,16 @@ try graph.openStore("/home/liu/workspace/swift-diffusion/lora.ckpt") { store in
       }
     } else if let index = textModelMap.firstIndex(of: newKey) {
       if key.hasSuffix("up.weight") {
+        let scalar = try safeTensors.states[String(key.prefix(upTo: key.index(key.endIndex, offsetBy: -14))) + "alpha"].map {
+          return try safeTensors.with($0) {
+            return Tensor<Float32>(from: $0)[0]
+          }
+        }
         try safeTensors.with(descriptor) {
-          let f16 = Tensor<Float16>(from: $0)
+          var f16 = Tensor<Float16>(from: $0)
+          if let scalar = scalar, abs(scalar - Float(f16.shape[1])) > 1e-5 {
+            f16 = ((scalar / Float(f16.shape[1])) * graph.variable(f16)).rawValue
+          }
           store.write("__text_model__[\(textModelMap[index + 1])]__up__", tensor: f16)
         }
       } else if key.hasSuffix("down.weight") {
