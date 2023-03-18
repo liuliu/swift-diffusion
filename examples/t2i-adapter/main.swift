@@ -49,7 +49,8 @@ func Adapter(channels: [Int], numRepeat: Int) -> ((PythonObject) -> Void, Model)
   var outs = [Model.IO]()
   for (i, channel) in channels.enumerated() {
     for j in 0..<numRepeat {
-      let (skipModel, inLayerConv2d, outLayerConv2d, resnetBlock) = ResnetBlock(outChannels: channel, inConv: previousChannel != channel)
+      let (skipModel, inLayerConv2d, outLayerConv2d, resnetBlock) = ResnetBlock(
+        outChannels: channel, inConv: previousChannel != channel)
       previousChannel = channel
       out = resnetBlock(out)
       let reader: (PythonObject) -> Void = { state_dict in
@@ -107,9 +108,12 @@ func ResnetBlockLight(outChannels: Int) -> (
   )
 }
 
-func Extractor(prefix: String, channel: Int, innerChannel: Int, numRepeat: Int, downsample: Bool) -> ((PythonObject) -> Void, Model) {
+func Extractor(prefix: String, channel: Int, innerChannel: Int, numRepeat: Int, downsample: Bool)
+  -> ((PythonObject) -> Void, Model)
+{
   let x = Input()
-  let inConv = Convolution(groups: 1, filters: innerChannel, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let inConv = Convolution(
+    groups: 1, filters: innerChannel, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   var out = inConv(x)
   var readers = [(PythonObject) -> Void]()
   for i in 0..<numRepeat {
@@ -127,7 +131,8 @@ func Extractor(prefix: String, channel: Int, innerChannel: Int, numRepeat: Int, 
     }
     readers.append(reader)
   }
-  let outConv = Convolution(groups: 1, filters: channel, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let outConv = Convolution(
+    groups: 1, filters: channel, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = outConv(out)
   if downsample {
     let downsample = AveragePool(filterSize: [2, 2], hint: Hint(stride: [2, 2]))
@@ -155,7 +160,9 @@ func AdapterLight(channels: [Int], numRepeat: Int) -> ((PythonObject) -> Void, M
   var out: Model.IO = x
   var outs = [Model.IO]()
   for (i, channel) in channels.enumerated() {
-    let (reader, extractor) = Extractor(prefix: "\(i)", channel: channel, innerChannel: channel / 4, numRepeat: numRepeat, downsample: i != 0)
+    let (reader, extractor) = Extractor(
+      prefix: "\(i)", channel: channel, innerChannel: channel / 4, numRepeat: numRepeat,
+      downsample: i != 0)
     out = extractor(out)
     outs.append(out)
     readers.append(reader)
@@ -246,14 +253,16 @@ func CLIPResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int) 
   return (reader, Model([x], [out]))
 }
 
-func StyleAdapter(width: Int, outputDim: Int, layers: Int, heads: Int, tokens: Int, batchSize: Int) -> ((PythonObject) -> Void, Model)
+func StyleAdapter(width: Int, outputDim: Int, layers: Int, heads: Int, tokens: Int, batchSize: Int)
+  -> ((PythonObject) -> Void, Model)
 {
   let x = Input()
   let lnPre = LayerNorm(epsilon: 1e-5, axis: [2])
   var out = lnPre(x)
   var readers = [(PythonObject) -> Void]()
   for i in 0..<layers {
-    let (reader, block) = CLIPResidualAttentionBlock(prefix: "transformer_layes.\(i)", k: width / heads, h: heads, b: batchSize, t: 257 + tokens)
+    let (reader, block) = CLIPResidualAttentionBlock(
+      prefix: "transformer_layes.\(i)", k: width / heads, h: heads, b: batchSize, t: 257 + tokens)
     out = block(out.reshaped([batchSize, 257 + tokens, width]))
     readers.append(reader)
   }
@@ -295,21 +304,26 @@ let hint = torch.randn([2, 3, 512, 512])
 // let adapter = ldm_modules_encoders_adapter.Adapter(cin: 64, channels: [320, 640, 1280, 1280], nums_rb: 2, ksize: 1, sk: true, use_conv: false).to(torch.device("cpu"))
 // let adapterLight = ldm_modules_encoders_adapter.Adapter_light(cin: 64 * 3, channels: [320, 640, 1280, 1280], nums_rb: 4).to(torch.device("cpu"))
 let style = torch.randn([1, 257, 1024])
-let styleAdapter = ldm_modules_encoders_adapter.StyleAdapter(width: 1024, context_dim: 768, num_head: 8, n_layes: 3, num_token: 8).to(torch.device("cpu"))
-styleAdapter.load_state_dict(torch.load("/home/liu/workspace/T2I-Adapter/models/t2iadapter_style_sd14v1.pth"))
+let styleAdapter = ldm_modules_encoders_adapter.StyleAdapter(
+  width: 1024, context_dim: 768, num_head: 8, n_layes: 3, num_token: 8
+).to(torch.device("cpu"))
+styleAdapter.load_state_dict(
+  torch.load("/home/liu/workspace/T2I-Adapter/models/t2iadapter_style_sd14v1.pth"))
 let state_dict = styleAdapter.state_dict()
 print(state_dict.keys())
 let ret = styleAdapter(style)
 print(ret)
 
-let styleEmbed = try Tensor<Float>(numpy: state_dict["style_embedding"].type(torch.float).cpu().numpy())
+let styleEmbed = try Tensor<Float>(
+  numpy: state_dict["style_embedding"].type(torch.float).cpu().numpy())
 
 let graph = DynamicGraph()
 let hintTensor = graph.variable(try! Tensor<Float>(numpy: hint.numpy())).toGPU(0)
 let styleTensor = graph.variable(try! Tensor<Float>(numpy: style.numpy())).toGPU(0)
 // let (reader, adapternet) = Adapter(channels: [320, 640, 1280, 1280], numRepeat: 2)
 // let (reader, adapternet) = AdapterLight(channels: [320, 640, 1280, 1280], numRepeat: 4)
-let (reader, styleadapternet) = StyleAdapter(width: 1024, outputDim: 768, layers: 3, heads: 8, tokens: 8, batchSize: 1)
+let (reader, styleadapternet) = StyleAdapter(
+  width: 1024, outputDim: 768, layers: 3, heads: 8, tokens: 8, batchSize: 1)
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 graph.withNoGrad {
   // let hintIn = hintTensor.reshaped(format: .NCHW, shape: [2, 3, 64, 8, 64, 8]).permuted(0, 1, 3, 5, 2, 4).copied().reshaped(.NCHW(2, 64 * 3, 64, 64))

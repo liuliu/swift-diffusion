@@ -86,41 +86,41 @@ load("@rules_python//python:pip.bzl", "pip_install")
 new_git_repository(
     name = "SwiftArgumentParser",
     build_file = "swift-argument-parser.BUILD",
-    commit = "82905286cc3f0fa8adc4674bf49437cab65a8373",
+    commit = "9f39744e025c7d377987f30b03770805dcb0bcd1",
     remote = "https://github.com/apple/swift-argument-parser.git",
-    shallow_since = "1647436700 -0500",
+    shallow_since = "1661571047 -0500",
 )
 
 new_git_repository(
     name = "SwiftSystem",
     build_file = "swift-system.BUILD",
-    commit = "836bc4557b74fe6d2660218d56e3ce96aff76574",
+    commit = "025bcb1165deab2e20d4eaba79967ce73013f496",
     remote = "https://github.com/apple/swift-system.git",
-    shallow_since = "1638472952 -0800",
+    shallow_since = "1654977448 -0700",
 )
 
 new_git_repository(
     name = "SwiftToolsSupportCore",
     build_file = "swift-tools-support-core.BUILD",
-    commit = "b7667f3e266af621e5cc9c77e74cacd8e8c00cb4",
+    commit = "4f07be3dc201f6e2ee85b6942d0c220a16926811",
     remote = "https://github.com/apple/swift-tools-support-core.git",
-    shallow_since = "1643831290 -0800",
+    shallow_since = "1659981427 -0700",
 )
 
 new_git_repository(
     name = "SwiftSyntax",
     build_file = "swift-syntax.BUILD",
-    commit = "0b6c22b97f8e9320bca62e82cdbee601cf37ad3f",
+    commit = "72d3da66b085c2299dd287c2be3b92b5ebd226de",
     remote = "https://github.com/apple/swift-syntax.git",
-    shallow_since = "1647591231 +0100",
+    shallow_since = "1664965455 +0200",
 )
 
 new_git_repository(
     name = "SwiftFormat",
     build_file = "swift-format.BUILD",
-    commit = "e6b8c60c7671066d229e30efa1e31acf57be412e",
+    commit = "5f184220d032a019a63df457cdea4b9c8241e911",
     remote = "https://github.com/apple/swift-format.git",
-    shallow_since = "1647972246 -0700",
+    shallow_since = "1665415355 -0700",
 )
 
 load("@s4nnc//:deps.bzl", "s4nnc_extra_deps")
