@@ -218,7 +218,8 @@ func MiddleBlock(
 
 func InputBlocks(
   channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
-  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO
+  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO,
+  adapters: [Model.IO]
 ) -> ([Model.IO], Model.IO) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
@@ -232,7 +233,7 @@ func InputBlocks(
   var passLayers = [out]
   for (i, channel) in channels.enumerated() {
     let attentionBlock = attentionRes.contains(ds)
-    for _ in 0..<numRepeat {
+    for j in 0..<numRepeat {
       let inputLayer = BlockLayer(
         prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
@@ -243,6 +244,9 @@ func InputBlocks(
         out = inputLayer(out, emb, c)
       } else {
         out = inputLayer(out, emb)
+      }
+      if j == numRepeat - 1 && adapters.count == channels.count {
+        out = out + adapters[i]
       }
       passLayers.append(out)
       layerStart += 1
@@ -334,8 +338,10 @@ func MiddleBlock(
 }
 
 func InputBlocks(
-  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int, startWidth: Int,
-  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
+  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO,
+  adapters: [Model.IO]
 ) -> ([Model.IO], Model.IO) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
@@ -349,17 +355,21 @@ func InputBlocks(
   var passLayers = [out]
   for (i, channel) in channels.enumerated() {
     let attentionBlock = attentionRes.contains(ds)
-    for _ in 0..<numRepeat {
+    for j in 0..<numRepeat {
       let inputLayer = BlockLayer(
         prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
-        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels,
+        batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       previousChannel = channel
       if attentionBlock {
         out = inputLayer(out, emb, c)
       } else {
         out = inputLayer(out, emb)
+      }
+      if j == numRepeat - 1 && adapters.count == channels.count {
+        out = out + adapters[i]
       }
       passLayers.append(out)
       layerStart += 1
@@ -380,7 +390,8 @@ func InputBlocks(
 }
 
 func OutputBlocks(
-  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
   embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, emb: Model.IO, c: Model.IO,
   inputs: [Model.IO]
 ) -> Model.IO {
@@ -412,7 +423,8 @@ func OutputBlocks(
       let outputLayer = BlockLayer(
         prefix: "output_blocks",
         layerStart: layerStart, skipConnection: true,
-        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels,
+        batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       if attentionBlock {
         out = outputLayer(out, emb, c)
@@ -432,7 +444,9 @@ func OutputBlocks(
   return out
 }
 
-public func UNet(batchSize: Int, startWidth: Int, startHeight: Int, control: Bool = false) -> Model {
+public func UNet(
+  batchSize: Int, startWidth: Int, startHeight: Int, control: Bool = false, adapter: Bool = false
+) -> Model {
   let x = Input()
   let t_emb = Input()
   let c = Input()
@@ -440,13 +454,18 @@ public func UNet(batchSize: Int, startWidth: Int, startHeight: Int, control: Boo
   if control {
     controls = (0..<13).map { _ in Input() }
   }
+  var adapters = [Model.IO]()
+  if adapter {
+    adapters = (0..<4).map { _ in Input() }
+  }
   let timeEmbed = TimeEmbed(modelChannels: 320)
   let emb = timeEmbed(t_emb)
   let attentionRes = Set([4, 2, 1])
   var (inputs, inputBlocks) = InputBlocks(
     channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
     startHeight: startHeight,
-    startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
+    startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c,
+    adapters: adapters)
   var out = inputBlocks
   let middleBlock = MiddleBlock(
     channels: 1280, numHeads: 8, batchSize: batchSize, height: startHeight / 8,
@@ -474,10 +493,13 @@ public func UNet(batchSize: Int, startWidth: Int, startHeight: Int, control: Boo
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = outConv2d(out)
   controls.insert(contentsOf: [x, t_emb, c], at: 0)
+  controls.append(contentsOf: adapters)
   return Model(controls, [out])
 }
 
-public func UNetv2(batchSize: Int, startWidth: Int, startHeight: Int, control: Bool = false) -> Model {
+public func UNetv2(
+  batchSize: Int, startWidth: Int, startHeight: Int, control: Bool = false, adapter: Bool = false
+) -> Model {
   let x = Input()
   let t_emb = Input()
   let c = Input()
@@ -485,13 +507,18 @@ public func UNetv2(batchSize: Int, startWidth: Int, startHeight: Int, control: B
   if control {
     controls = (0..<13).map { _ in Input() }
   }
+  var adapters = [Model.IO]()
+  if adapter {
+    adapters = (0..<4).map { _ in Input() }
+  }
   let timeEmbed = TimeEmbed(modelChannels: 320)
   let emb = timeEmbed(t_emb)
   let attentionRes = Set([4, 2, 1])
   var (inputs, inputBlocks) = InputBlocks(
     channels: [320, 640, 1280, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: startHeight,
-    startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
+    startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c,
+    adapters: adapters)
   var out = inputBlocks
   let middleBlock = MiddleBlock(
     channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: startHeight / 8,
@@ -519,5 +546,6 @@ public func UNetv2(batchSize: Int, startWidth: Int, startHeight: Int, control: B
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = outConv2d(out)
   controls.insert(contentsOf: [x, t_emb, c], at: 0)
+  controls.append(contentsOf: adapters)
   return Model(controls, [out])
 }
