@@ -112,9 +112,14 @@ func Extractor(prefix: String, channel: Int, innerChannel: Int, numRepeat: Int, 
   -> ((PythonObject) -> Void, Model)
 {
   let x = Input()
+  var out: Model.IO = x
+  if downsample {
+    let downsample = AveragePool(filterSize: [2, 2], hint: Hint(stride: [2, 2]))
+    out = downsample(out)
+  }
   let inConv = Convolution(
     groups: 1, filters: innerChannel, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  var out = inConv(x)
+  out = inConv(out)
   var readers = [(PythonObject) -> Void]()
   for i in 0..<numRepeat {
     let (inLayerConv2d, outLayerConv2d, resnetBlock) = ResnetBlockLight(outChannels: innerChannel)
@@ -134,10 +139,6 @@ func Extractor(prefix: String, channel: Int, innerChannel: Int, numRepeat: Int, 
   let outConv = Convolution(
     groups: 1, filters: channel, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = outConv(out)
-  if downsample {
-    let downsample = AveragePool(filterSize: [2, 2], hint: Hint(stride: [2, 2]))
-    out = downsample(out)
-  }
   let reader: (PythonObject) -> Void = { state_dict in
     let in_conv_weight = state_dict["body.\(prefix).in_conv.weight"].numpy()
     let in_conv_bias = state_dict["body.\(prefix).in_conv.bias"].numpy()
@@ -299,22 +300,24 @@ numpy.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-let hint = torch.randn([2, 1, 512, 512])
+let hint = torch.randn([2, 3, 512, 512])
 
-let adapter = ldm_modules_encoders_adapter.Adapter(
-  cin: 64, channels: [320, 640, 1280, 1280], nums_rb: 2, ksize: 1, sk: true, use_conv: false
+// let adapter = ldm_modules_encoders_adapter.Adapter(
+//   cin: 64, channels: [320, 640, 1280, 1280], nums_rb: 2, ksize: 1, sk: true, use_conv: false
+// ).to(torch.device("cpu"))
+let adapterLight = ldm_modules_encoders_adapter.Adapter_light(
+  cin: 64 * 3, channels: [320, 640, 1280, 1280], nums_rb: 4
 ).to(torch.device("cpu"))
-// let adapterLight = ldm_modules_encoders_adapter.Adapter_light(cin: 64 * 3, channels: [320, 640, 1280, 1280], nums_rb: 4).to(torch.device("cpu"))
 // let style = torch.randn([1, 257, 1024])
 // let styleAdapter = ldm_modules_encoders_adapter.StyleAdapter(
 //   width: 1024, context_dim: 768, num_head: 8, n_layes: 3, num_token: 8
 // ).to(torch.device("cpu"))
-adapter.load_state_dict(
-  torch.load("/home/liu/workspace/T2I-Adapter/models/t2iadapter_canny_sd15v2.pth"))
-let state_dict = adapter.state_dict()
+adapterLight.load_state_dict(
+  torch.load("/home/liu/workspace/T2I-Adapter/models/t2iadapter_color_sd14v1.pth"))
+let state_dict = adapterLight.state_dict()
 print(state_dict.keys())
-let ret = adapter(hint)
-print(ret[3])
+let ret = adapterLight(hint)
+// print(ret[1])
 
 // let styleEmbed = try Tensor<Float>(
 //   numpy: state_dict["style_embedding"].type(torch.float).cpu().numpy())
@@ -322,19 +325,19 @@ print(ret[3])
 let graph = DynamicGraph()
 let hintTensor = graph.variable(try! Tensor<Float>(numpy: hint.numpy())).toGPU(0)
 // let styleTensor = graph.variable(try! Tensor<Float>(numpy: style.numpy())).toGPU(0)
-let (reader, adapternet) = Adapter(channels: [320, 640, 1280, 1280], numRepeat: 2)
-// let (reader, adapternet) = AdapterLight(channels: [320, 640, 1280, 1280], numRepeat: 4)
+// let (reader, adapternet) = Adapter(channels: [320, 640, 1280, 1280], numRepeat: 2)
+let (reader, adapternet) = AdapterLight(channels: [320, 640, 1280, 1280], numRepeat: 4)
 // let (reader, styleadapternet) = StyleAdapter(
 //   width: 1024, outputDim: 768, layers: 3, heads: 8, tokens: 8, batchSize: 1)
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 graph.withNoGrad {
-  let hintIn = hintTensor.reshaped(format: .NCHW, shape: [2, 1, 64, 8, 64, 8]).permuted(
+  let hintIn = hintTensor.reshaped(format: .NCHW, shape: [2, 3, 64, 8, 64, 8]).permuted(
     0, 1, 3, 5, 2, 4
-  ).copied().reshaped(.NCHW(2, 64, 64, 64))
+  ).copied().reshaped(.NCHW(2, 64 * 3, 64, 64))
   var controls = adapternet(inputs: hintIn).map { $0.as(of: Float.self) }
   reader(state_dict)
   controls = adapternet(inputs: hintIn).map { $0.as(of: Float.self) }
-  debugPrint(controls[3])
+  debugPrint(controls[1])
   // let styleEmbedTensor = graph.variable(styleEmbed).toGPU(0)
   // var styleAll = graph.variable(.GPU(0), .CHW(1, 257 + 8, 1024), of: Float.self)
   // styleAll[0..<1, 0..<257, 0..<1024] = styleTensor

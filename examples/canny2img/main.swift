@@ -135,7 +135,8 @@ let encoder = Encoder(
 let decoder = Decoder(
   channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
   startHeight: startHeight)
-let adapternet = Adapter(channels: [320, 640, 1280, 1280], numRepeat: 2)
+// let adapternet = Adapter(channels: [320, 640, 1280, 1280], numRepeat: 2)
+let adapternet = AdapterLight(channels: [320, 640, 1280, 1280], numRepeat: 4)
 
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 
@@ -158,13 +159,13 @@ graph.withNoGrad {
     0, 1, 3, 5, 2, 4
   ).copied().reshaped(.NCHW(1, 64, startHeight, startWidth))
   adapternet.compile(inputs: hintIn)
-  graph.openStore(workDir + "/t2iadapter_canny_1.x_f32.ckpt") {
+  graph.openStore(workDir + "/t2iadapter_color_1.x_f32.ckpt") {
     $0.read("adapter", model: adapternet)
   }
   let adapters = adapternet(inputs: hintIn).map { $0.as(of: UseFloatingPoint.self) }
-  // graph.openStore(workDir + "/t2iadapter_sketch_1.x_f16.ckpt") {
-  //   $0.write("adapter", model: adapternet)
-  // }
+  graph.openStore(workDir + "/t2iadapter_color_1.x_f16.ckpt") {
+    $0.write("adapter", model: adapternet)
+  }
   /*
   let hint = graph.variable(hintImg.toGPU(0))
   hintnet.compile(inputs: hint)
