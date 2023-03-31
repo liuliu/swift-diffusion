@@ -317,7 +317,7 @@ adapterLight.load_state_dict(
 let state_dict = adapterLight.state_dict()
 print(state_dict.keys())
 let ret = adapterLight(hint)
-// print(ret[1])
+print(ret[3])
 
 // let styleEmbed = try Tensor<Float>(
 //   numpy: state_dict["style_embedding"].type(torch.float).cpu().numpy())
@@ -337,7 +337,7 @@ graph.withNoGrad {
   var controls = adapternet(inputs: hintIn).map { $0.as(of: Float.self) }
   reader(state_dict)
   controls = adapternet(inputs: hintIn).map { $0.as(of: Float.self) }
-  debugPrint(controls[1])
+  debugPrint(controls[3])
   // let styleEmbedTensor = graph.variable(styleEmbed).toGPU(0)
   // var styleAll = graph.variable(.GPU(0), .CHW(1, 257 + 8, 1024), of: Float.self)
   // styleAll[0..<1, 0..<257, 0..<1024] = styleTensor

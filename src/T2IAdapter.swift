@@ -69,9 +69,14 @@ func Extractor(prefix: String, channel: Int, innerChannel: Int, numRepeat: Int, 
   -> Model
 {
   let x = Input()
+  var out: Model.IO = x
+  if downsample {
+    let downsample = AveragePool(filterSize: [2, 2], hint: Hint(stride: [2, 2]))
+    out = downsample(out)
+  }
   let inConv = Convolution(
     groups: 1, filters: innerChannel, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  var out = inConv(x)
+  out = inConv(out)
   for _ in 0..<numRepeat {
     let resnetBlock = ResnetBlockLight(outChannels: innerChannel)
     out = resnetBlock(out)
@@ -79,10 +84,6 @@ func Extractor(prefix: String, channel: Int, innerChannel: Int, numRepeat: Int, 
   let outConv = Convolution(
     groups: 1, filters: channel, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = outConv(out)
-  if downsample {
-    let downsample = AveragePool(filterSize: [2, 2], hint: Hint(stride: [2, 2]))
-    out = downsample(out)
-  }
   return Model([x], [out])
 }
 
