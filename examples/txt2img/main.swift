@@ -190,7 +190,7 @@ func uniPBhUpdate(
   let xt_ = Functional.add(
     left: x, right: m0, leftScalar: sigmat / sigmas0, rightScalar: -alphat * hPhi1)
   if let D1 = D1 {
-    let xt = Functional.add(left: xt_, right: D1, leftScalar: 1, rightScalar: alphat * Bh * rhosP)
+    let xt = Functional.add(left: xt_, right: D1, leftScalar: 1, rightScalar: -alphat * Bh * rhosP)
     return xt
   } else {
     return xt_
