@@ -101,12 +101,16 @@ let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
 // This is for Karras scheduler (used in DPM++ 2M Karras)
-let sigmas = model.karrasSigmas(sigmasForTimesteps[0]...sigmasForTimesteps[999])
+// let sigmas = model.karrasSigmas(sigmasForTimesteps[0]...sigmasForTimesteps[999])
 // This is for Euler Ancestral
 // let sigmas = model.fixedStepSigmas(
 //   sigmasForTimesteps[0]...sigmasForTimesteps[999], sigmas: sigmasForTimesteps)
 let tokenizer = CLIPTokenizer(
   vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
+
+let alphas = alphasCumprod.map { $0.squareRoot() }
+let sigmas = alphasCumprod.map { (1 - $0).squareRoot() }
+let lambdas = zip(alphas, sigmas).map { log($0) - log($1) }
 
 let workDir = CommandLine.arguments[1]
 let text =
@@ -155,11 +159,103 @@ let decoder = ModelBuilder {
 
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 
+func uniPBhUpdate(
+  mt: DynamicGraph.Tensor<UseFloatingPoint>, prevTimestep t: Int,
+  sample x: DynamicGraph.Tensor<UseFloatingPoint>, timestepList: [Int],
+  outputList: [DynamicGraph.Tensor<UseFloatingPoint>], lambdas: [Float], alphas: [Float],
+  sigmas: [Float]
+) -> DynamicGraph.Tensor<UseFloatingPoint> {
+  let s0 = timestepList[timestepList.count - 1]
+  let m0 = outputList[outputList.count - 1]
+  let lambdat = lambdas[t]
+  let lambdas0 = lambdas[s0]
+  let alphat = alphas[t]
+  let sigmat = sigmas[t]
+  let sigmas0 = sigmas[s0]
+  let h = lambdat - lambdas0
+  let D1: DynamicGraph.Tensor<UseFloatingPoint>?
+  if timestepList.count >= 2 && outputList.count >= 2 {
+    let si = timestepList[timestepList.count - 2]
+    let mi = outputList[outputList.count - 2]
+    let lambdasi = lambdas[si]
+    let rk = (lambdasi - lambdas0) / h
+    D1 = (mi - m0) / rk
+  } else {
+    D1 = nil
+  }
+  let hh = -h
+  let hPhi1 = exp(hh) - 1
+  let Bh = hPhi1
+  let rhosP: Float = 0.5
+  let xt_ = Functional.add(
+    left: x, right: m0, leftScalar: sigmat / sigmas0, rightScalar: -alphat * hPhi1)
+  if let D1 = D1 {
+    let xt = Functional.add(left: xt_, right: D1, leftScalar: 1, rightScalar: alphat * Bh * rhosP)
+    return xt
+  } else {
+    return xt_
+  }
+}
+
+func uniCBhUpdate(
+  mt: DynamicGraph.Tensor<UseFloatingPoint>, timestep t: Int,
+  lastSample x: DynamicGraph.Tensor<UseFloatingPoint>, timestepList: [Int],
+  outputList: [DynamicGraph.Tensor<UseFloatingPoint>], lambdas: [Float], alphas: [Float],
+  sigmas: [Float]
+) -> DynamicGraph.Tensor<UseFloatingPoint> {
+  let s0 = timestepList[timestepList.count - 1]
+  let m0 = outputList[outputList.count - 1]
+  let lambdat = lambdas[t]
+  let lambdas0 = lambdas[s0]
+  let alphat = alphas[t]
+  let sigmat = sigmas[t]
+  let sigmas0 = sigmas[s0]
+  let h = lambdat - lambdas0
+  let hh = -h
+  let hPhi1 = exp(hh) - 1
+  let hPhik = hPhi1 / hh - 1
+  let Bh = hPhi1
+  let D1: DynamicGraph.Tensor<UseFloatingPoint>?
+  let rhosC0: Float
+  let rhosC1: Float
+  if timestepList.count >= 2 && outputList.count >= 2 {
+    let si = timestepList[timestepList.count - 2]
+    let mi = outputList[outputList.count - 2]
+    let lambdasi = lambdas[si]
+    let rk = (lambdasi - lambdas0) / h
+    D1 = (mi - m0) / rk
+    let b0 = hPhik / Bh
+    let b1 = (hPhik / hh - 0.5) * 2 / Bh
+    rhosC0 = (b0 - b1) / (1 - rk)
+    rhosC1 = b0 - rhosC0
+  } else {
+    D1 = nil
+    rhosC0 = 0.5
+    rhosC1 = 0.5
+  }
+  print("rhos_c \(rhosC0), rhos_c \(rhosC1)")
+  let xt_ = Functional.add(
+    left: x, right: m0, leftScalar: sigmat / sigmas0, rightScalar: -alphat * hPhi1)
+  let D1t = mt - m0
+  let D1s: DynamicGraph.Tensor<UseFloatingPoint>
+  if let D1 = D1 {
+    D1s = Functional.add(left: D1, right: D1t, leftScalar: rhosC0, rightScalar: rhosC1)
+  } else {
+    D1s = rhosC1 * D1t
+  }
+  let xt = Functional.add(left: xt_, right: D1s, leftScalar: 1, rightScalar: -alphat * Bh)
+  return xt
+}
+
 graph.withNoGrad {
   let tokensTensorGPU = tokensTensor.toGPU(0)
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
   textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
+  graph.openStore("/fast/Data/SD/swift-diffusion/sd-v1.5.ckpt") { store in
+    store.read("text_model", model: textModel)
+  }
+  /*
   graph.openStore(workDir + "/moxin_v1.0_lora_f16.ckpt") { lora in
     let keys = Set(lora.keys)
     graph.openStore(workDir + "/sd-v1.5.ckpt") { store in
@@ -175,6 +271,7 @@ graph.withNoGrad {
       }
     }
   }
+  */
   let c: DynamicGraph.AnyTensor = textModel(
     inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
       of: UseFloatingPoint.self
@@ -186,6 +283,11 @@ graph.withNoGrad {
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
   unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts)), c)
   decoder.compile(inputs: x)
+  graph.openStore("/fast/Data/SD/swift-diffusion/sd-v1.5.ckpt") { store in
+    store.read("unet", model: unet)
+    store.read("decoder", model: decoder)
+  }
+  /*
   graph.openStore(workDir + "/moxin_v1.0_lora_f16.ckpt") { lora in
     let keys = Set(lora.keys)
     graph.openStore(workDir + "/sd-v1.5.ckpt") { store in
@@ -213,20 +315,25 @@ graph.withNoGrad {
       store.read("decoder", model: decoder)
     }
   }
-  var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil
+  */
+  // var oldDenoised: DynamicGraph.Tensor<UseFloatingPoint>? = nil
+  var timestepList = [Int]()
+  var outputList = [DynamicGraph.Tensor<UseFloatingPoint>]()
   let startTime = Date()
+  var lastSample: DynamicGraph.Tensor<UseFloatingPoint>? = nil
   // Now do DPM++ 2M Karras sampling. (DPM++ 2S a Karras requires two denoising per step, not ideal for my use case).
-  x = sigmas[0] * x
+  // x = sigmas[0] * x
   for i in 0..<model.steps {
-    let sigma = sigmas[i]
-    let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
+    // let sigma = sigmas[i]
+    // let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
+    let timestep = model.timesteps - model.timesteps / model.steps * i - 1
     let ts = timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
       .toGPU(0)
     let t = graph.variable(Tensor<UseFloatingPoint>(from: ts))
-    let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
-    let cOut = -sigma
-    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
-    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
+    // let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
+    // let cOut = -sigma
+    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x  // cIn * x
+    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x  // cIn * x
     var et = unet(inputs: xIn, t, c)[0].as(of: UseFloatingPoint.self)
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
@@ -237,6 +344,33 @@ graph.withNoGrad {
     etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
       et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
+    // UniPC sampler.
+    let mt = Functional.add(
+      left: x, right: et, leftScalar: 1.0 / alphas[timestep],
+      rightScalar: -sigmas[timestep] / alphas[timestep])
+    let useCorrector = lastSample != nil
+    if useCorrector, let lastSample = lastSample {
+      x = uniCBhUpdate(
+        mt: mt, timestep: timestep, lastSample: lastSample, timestepList: timestepList,
+        outputList: outputList, lambdas: lambdas, alphas: alphas, sigmas: sigmas)
+    }
+    if timestepList.count < 2 {
+      timestepList.append(timestep)
+    } else {
+      timestepList[0] = timestepList[1]
+      timestepList[1] = timestep
+    }
+    if outputList.count < 2 {
+      outputList.append(mt)
+    } else {
+      outputList[0] = outputList[1]
+      outputList[1] = mt
+    }
+    let prevTimestep = max(0, model.timesteps - model.timesteps / model.steps * (i + 1) - 1)
+    lastSample = x
+    x = uniPBhUpdate(
+      mt: mt, prevTimestep: prevTimestep, sample: x, timestepList: timestepList,
+      outputList: outputList, lambdas: lambdas, alphas: alphas, sigmas: sigmas)
     /* // Below is the Euler ancestral sampling implementation.
     let sigmaUp = min(
       sigmas[i + 1],
@@ -253,7 +387,7 @@ graph.withNoGrad {
       x = x + sigmaUp * noise
     }
     */
-    // Below is the DPM++ 2M Karras sampling implementation.
+    /* // Below is the DPM++ 2M Karras sampling implementation.
     let denoised = x + cOut * et
     let h = log(sigmas[i]) - log(sigmas[i + 1])
     if let oldDenoised = oldDenoised, i < model.steps - 1 {
@@ -268,7 +402,7 @@ graph.withNoGrad {
       let w = sigmas[i + 1] / sigmas[i]
       x = w * x - (w - 1) * denoised
     }
-    oldDenoised = denoised
+    oldDenoised = denoised */
   }
   /*
   startWidth = 96
