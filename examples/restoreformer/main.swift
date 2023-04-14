@@ -394,7 +394,7 @@ func RestoreFormer(
   return (reader, Model([x, embedding], [out]))
 }
 
-var initImg = Tensor<Float>(.CPU, .NCHW(1, 3, 512, 512))
+var initImg = Tensor<Float16>(.CPU, .NCHW(1, 3, 512, 512))
 if let image = try PNG.Data.Rectangular.decompress(
   path: "/home/liu/workspace/GFPGAN/inputs/cropped_faces/Adele_crop.png")
 {
@@ -402,9 +402,9 @@ if let image = try PNG.Data.Rectangular.decompress(
   for y in 0..<512 {
     for x in 0..<512 {
       let pixel = rgba[y * 512 + x]
-      initImg[0, 0, y, x] = Float(pixel.r) / 255 * 2 - 1
-      initImg[0, 1, y, x] = Float(pixel.g) / 255 * 2 - 1
-      initImg[0, 2, y, x] = Float(pixel.b) / 255 * 2 - 1
+      initImg[0, 0, y, x] = Float16(Float(pixel.r) / 255 * 2 - 1)
+      initImg[0, 1, y, x] = Float16(Float(pixel.g) / 255 * 2 - 1)
+      initImg[0, 2, y, x] = Float16(Float(pixel.b) / 255 * 2 - 1)
     }
   }
 }
@@ -422,9 +422,26 @@ graph.withNoGrad {
   reader(state_dict)
   let result = restoreFormer(inputs: croppedFaceTensor, embeddingTensor)[0].as(of: Float.self)
   debugPrint(result)
-  let restoreImg = restoreFormer(inputs: graph.variable(initImg).toGPU(0), embeddingTensor)[0].as(
-    of: Float.self
+  graph.openStore("/home/liu/workspace/swift-diffusion/restoreformer_v1.0.ckpt") {
+    $0.write("embedding", variable: embeddingTensor)
+    $0.write("restoreformer", model: restoreFormer)
+  }
+  let (_, restoreFormerf16) = RestoreFormer(
+    nEmbed: 1024, embedDim: 256, ch: 64, chMult: [1, 2, 2, 4, 4, 8], zChannels: 256, numHeads: 8,
+    numResBlocks: 2)
+  let embeddingTensorf16 = DynamicGraph.Tensor<Float16>(from: embeddingTensor)
+  let initImgTensor = graph.variable(initImg).toGPU(0)
+  restoreFormerf16.compile(inputs: initImgTensor, embeddingTensorf16)
+  graph.openStore("/home/liu/workspace/swift-diffusion/restoreformer_v1.0.ckpt") {
+    $0.read("restoreformer", model: restoreFormerf16)
+  }
+  let restoreImg = restoreFormerf16(inputs: initImgTensor, embeddingTensorf16)[0].as(
+    of: Float16.self
   ).toCPU()
+  graph.openStore("/home/liu/workspace/swift-diffusion/restoreformer_v1.0_f16.ckpt") {
+    $0.write("embedding", variable: embeddingTensorf16)
+    $0.write("restoreformer", model: restoreFormerf16)
+  }
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 512 * 512)
   for y in 0..<512 {
     for x in 0..<512 {
