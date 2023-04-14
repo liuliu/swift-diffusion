@@ -3,9 +3,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 git_repository(
     name = "s4nnc",
-    commit = "7861c230e48e72ec0752c7845a99288b8c286c6d",
+    commit = "afedfd44d91c891d2ef89a0d4b3377ef976b8b41",
     remote = "https://github.com/liuliu/s4nnc.git",
-    shallow_since = "1679025289 -0400",
+    shallow_since = "1681419377 -0400",
 )
 
 load("@s4nnc//:deps.bzl", "s4nnc_deps")
@@ -102,9 +102,9 @@ new_git_repository(
 new_git_repository(
     name = "SwiftToolsSupportCore",
     build_file = "swift-tools-support-core.BUILD",
-    commit = "4f07be3dc201f6e2ee85b6942d0c220a16926811",
+    commit = "286b48b1d73388e1d49b2bb33aabf995838104e3",
     remote = "https://github.com/apple/swift-tools-support-core.git",
-    shallow_since = "1659981427 -0700",
+    shallow_since = "1670947584 -0800",
 )
 
 new_git_repository(

@@ -1,5 +1,12 @@
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 
+config_setting(
+    name = "linux_build",
+    constraint_values = [
+        "@platforms//os:linux",
+    ],
+)
+
 cc_library(
     name = "TSCclibc",
     srcs = glob(["Sources/TSCclibc/*.c"]),
@@ -9,6 +16,10 @@ cc_library(
     includes = [
         "Sources/TSCclibc/include/",
     ],
+    local_defines = select({
+        ":linux_build": ["_GNU_SOURCE"],
+        "//conditions:default": [],
+    }),
     tags = ["swift_module=TSCclibc"],
 )
 
