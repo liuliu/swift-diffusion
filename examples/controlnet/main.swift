@@ -401,12 +401,11 @@ func BlockLayer(
 }
 
 func MiddleBlock(
-  channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
+  channels: Int, numHeads: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
   x: Model.IO, emb: Model.IO, c: Model.IO
 ) -> ((PythonObject) -> Void, Model.IO) {
-  precondition(channels % numHeadChannels == 0)
-  let numHeads = channels / numHeadChannels
-  let k = numHeadChannels
+  precondition(channels % numHeads == 0)
+  let k = channels / numHeads
   let (inLayerNorm1, inLayerConv2d1, embLayer1, outLayerNorm1, outLayerConv2d1, _, resBlock1) =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   var out = resBlock1(x, emb)
@@ -645,43 +644,52 @@ func InputHintBlocks(modelChannel: Int, hint: Model.IO) -> ((PythonObject) -> Vo
   let reader: (PythonObject) -> Void = { state_dict in
     let input_hint_block_0_weight = state_dict["input_hint_block.0.weight"].numpy()
     let input_hint_block_0_bias = state_dict["input_hint_block.0.bias"].numpy()
-    conv2d0.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_hint_block_0_weight))
+    conv2d0.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: input_hint_block_0_weight))
     conv2d0.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_hint_block_0_bias))
     let input_hint_block_2_weight = state_dict["input_hint_block.2.weight"].numpy()
     let input_hint_block_2_bias = state_dict["input_hint_block.2.bias"].numpy()
-    conv2d1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_hint_block_2_weight))
+    conv2d1.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: input_hint_block_2_weight))
     conv2d1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_hint_block_2_bias))
     let input_hint_block_4_weight = state_dict["input_hint_block.4.weight"].numpy()
     let input_hint_block_4_bias = state_dict["input_hint_block.4.bias"].numpy()
-    conv2d2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_hint_block_4_weight))
+    conv2d2.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: input_hint_block_4_weight))
     conv2d2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_hint_block_4_bias))
     let input_hint_block_6_weight = state_dict["input_hint_block.6.weight"].numpy()
     let input_hint_block_6_bias = state_dict["input_hint_block.6.bias"].numpy()
-    conv2d3.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_hint_block_6_weight))
+    conv2d3.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: input_hint_block_6_weight))
     conv2d3.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_hint_block_6_bias))
     let input_hint_block_8_weight = state_dict["input_hint_block.8.weight"].numpy()
     let input_hint_block_8_bias = state_dict["input_hint_block.8.bias"].numpy()
-    conv2d4.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_hint_block_8_weight))
+    conv2d4.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: input_hint_block_8_weight))
     conv2d4.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_hint_block_8_bias))
     let input_hint_block_10_weight = state_dict["input_hint_block.10.weight"].numpy()
     let input_hint_block_10_bias = state_dict["input_hint_block.10.bias"].numpy()
-    conv2d5.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_hint_block_10_weight))
+    conv2d5.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: input_hint_block_10_weight))
     conv2d5.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_hint_block_10_bias))
     let input_hint_block_12_weight = state_dict["input_hint_block.12.weight"].numpy()
     let input_hint_block_12_bias = state_dict["input_hint_block.12.bias"].numpy()
-    conv2d6.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_hint_block_12_weight))
+    conv2d6.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: input_hint_block_12_weight))
     conv2d6.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_hint_block_12_bias))
     let input_hint_block_14_weight = state_dict["input_hint_block.14.weight"].numpy()
     let input_hint_block_14_bias = state_dict["input_hint_block.14.bias"].numpy()
-    conv2d7.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_hint_block_14_weight))
+    conv2d7.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: input_hint_block_14_weight))
     conv2d7.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_hint_block_14_bias))
   }
   return (reader, out)
 }
 
 func InputBlocks(
-  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int, startWidth: Int,
-  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, hint: Model.IO, emb: Model.IO, c: Model.IO
+  channels: [Int], numRepeat: Int, numHeads: Int, batchSize: Int, startHeight: Int, startWidth: Int,
+  embeddingSize: Int, attentionRes: Set<Int>, x: Model.IO, hint: Model.IO, emb: Model.IO,
+  c: Model.IO
 ) -> ((PythonObject) -> Void, [(Model.IO, Int)], Model.IO) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
@@ -700,7 +708,7 @@ func InputBlocks(
       let (reader, inputLayer) = BlockLayer(
         prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
-        attentionBlock: attentionBlock, channels: channel, numHeads: channel / numHeadChannels, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeads: numHeads, batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       previousChannel = channel
       if attentionBlock {
@@ -759,12 +767,12 @@ func ControlNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   let emb = timeEmbed(t_emb)
   let attentionRes = Set([4, 2, 1])
   let (inputReader, inputs, inputBlocks) = InputBlocks(
-    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    channels: [320, 640, 1280, 1280], numRepeat: 2, numHeads: 8, batchSize: batchSize,
     startHeight: 64,
     startWidth: 64, embeddingSize: 77, attentionRes: attentionRes, x: x, hint: hint, emb: emb, c: c)
   var out = inputBlocks
   let (middleReader, middleBlock) = MiddleBlock(
-    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
+    channels: 1280, numHeads: 8, batchSize: batchSize, height: 8, width: 8, embeddingSize: 77,
     x: out,
     emb: emb, c: c)
   out = middleBlock
@@ -773,14 +781,14 @@ func ControlNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   for i in 0..<inputs.count {
     let channel = inputs[i].1
     let zeroConv = Convolution(
-        groups: 1, filters: channel, filterSize: [1, 1],
-        hint: Hint(stride: [1, 1]))
+      groups: 1, filters: channel, filterSize: [1, 1],
+      hint: Hint(stride: [1, 1]))
     outputs.append(zeroConv(inputs[i].0))
     zeroConvs.append(zeroConv)
   }
   let middleBlockOut = Convolution(
-        groups: 1, filters: 1280, filterSize: [1, 1],
-        hint: Hint(stride: [1, 1]))
+    groups: 1, filters: 1280, filterSize: [1, 1],
+    hint: Hint(stride: [1, 1]))
   outputs.append(middleBlockOut(out))
   let reader: (PythonObject) -> Void = { state_dict in
     let time_embed_0_weight = state_dict["time_embed.0.weight"].numpy()
@@ -801,8 +809,10 @@ func ControlNet(batchSize: Int) -> ((PythonObject) -> Void, Model) {
     }
     let middle_block_out_0_weight = state_dict["middle_block_out.0.weight"].numpy()
     let middle_block_out_0_bias = state_dict["middle_block_out.0.bias"].numpy()
-    middleBlockOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: middle_block_out_0_weight))
-    middleBlockOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: middle_block_out_0_bias))
+    middleBlockOut.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: middle_block_out_0_weight))
+    middleBlockOut.parameters(for: .bias).copy(
+      from: try! Tensor<Float>(numpy: middle_block_out_0_bias))
   }
   return (reader, Model([x, hint, t_emb, c], outputs))
 }
@@ -815,13 +825,15 @@ torch.cuda.manual_seed_all(42)
 let x = torch.randn([2, 4, 64, 64])
 let hint = torch.randn([2, 3, 512, 512])
 let t = torch.full([1], 981)
-let c = torch.randn([2, 77, 1024])
+let c = torch.randn([2, 77, 768])
 
 let model = cldm_model.create_model(
-  "/home/liu/workspace/ControlNet/models/cldm_v21.yaml").cpu()
-model.load_state_dict(cldm_model.load_state_dict(
-  "/home/liu/workspace/ControlNet/models/scribble-sd21.ckpt",
-  location: "cpu"))
+  "/home/liu/workspace/ControlNet/models/cldm_v15.yaml"
+).cpu()
+model.load_state_dict(
+  torch.load(
+    "/home/liu/workspace/ControlNet/models/control_v11p_sd15_mlsd.pth",
+    map_location: "cpu"), strict: false)
 let state_dict = model.control_model.state_dict()
 let ret = model.control_model(x, hint: hint, timesteps: t, context: c)
 // print(state_dict.keys())

@@ -126,7 +126,7 @@ for i in 0..<model.steps {
   ts.append(
     timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0))
 }
-let unet = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight, adapter: true)
+let unet = UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight, control: true)
 let controlnet = ControlNet(batchSize: 2)
 let hintnet = HintNet()
 let encoder = Encoder(
@@ -136,7 +136,7 @@ let decoder = Decoder(
   channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
   startHeight: startHeight)
 // let adapternet = Adapter(channels: [320, 640, 1280, 1280], numRepeat: 2)
-let adapternet = AdapterLight(channels: [320, 640, 1280, 1280], numRepeat: 4)
+// let adapternet = AdapterLight(channels: [320, 640, 1280, 1280], numRepeat: 4)
 
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 
@@ -154,6 +154,7 @@ graph.withNoGrad {
   let noise = graph.variable(
     .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   noise.randn(std: 1, mean: 0)
+  /*
   let hint = graph.variable(hintImg[0..<1, 0..<1, 0..<startHeight * 8, 0..<startWidth * 8].toGPU(0))
   let hintIn = hint.reshaped(format: .NCHW, shape: [1, 1, startHeight, 8, startWidth, 8]).permuted(
     0, 1, 3, 5, 2, 4
@@ -166,29 +167,26 @@ graph.withNoGrad {
   graph.openStore(workDir + "/t2iadapter_color_1.x_f16.ckpt") {
     $0.write("adapter", model: adapternet)
   }
-  /*
+  */
   let hint = graph.variable(hintImg.toGPU(0))
   hintnet.compile(inputs: hint)
-  graph.openStore("/fast/Data/SD/swift-diffusion/controlnet_canny_1.x_f16.ckpt") {
+  graph.openStore(workDir + "/controlnet_mlsd_1.x_v1.1_f32.ckpt") {
     $0.read("hintnet", model: hintnet)
   }
   let guidance = hintnet(inputs: hint)[0].as(of: UseFloatingPoint.self)
-  */
   var x = noise
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, startHeight, startWidth), of: UseFloatingPoint.self)
   let ts0 = graph.variable(Tensor<UseFloatingPoint>(from: ts[0]))
-  /*
   controlnet.compile(inputs: xIn, guidance, ts0, c)
-  graph.openStore("/fast/Data/SD/swift-diffusion/controlnet_canny_1.x_f16.ckpt") {
+  graph.openStore(workDir + "/controlnet_mlsd_1.x_v1.1_f32.ckpt") {
     $0.read("controlnet", model: controlnet)
   }
-  graph.openStore(workDir + "/controlnet_scribble_2x_f16.ckpt") {
+  graph.openStore(workDir + "/controlnet_mlsd_1.x_v1.1_f16.ckpt") {
     $0.write("hintnet", model: hintnet)
     $0.write("controlnet", model: controlnet)
   }
   var controls = controlnet(inputs: xIn, guidance, ts0, c).map { $0.as(of: UseFloatingPoint.self) }
-  */
-  var controls = adapters
+  // var controls = adapters
   controls.insert(contentsOf: [xIn, ts0, c], at: 0)
   unet.compile(inputs: controls)
   decoder.compile(inputs: x)
@@ -223,8 +221,8 @@ graph.withNoGrad {
     let t = graph.variable(Tensor<UseFloatingPoint>(from: ts[i]))
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x
-    // var controls = controlnet(inputs: xIn, guidance, t, c).map { $0.as(of: UseFloatingPoint.self) }
-    var controls = adapters
+    var controls = controlnet(inputs: xIn, guidance, t, c).map { $0.as(of: UseFloatingPoint.self) }
+    // var controls = adapters
     controls.insert(contentsOf: [t, c], at: 0)
     var et = unet(inputs: xIn, controls)[0].as(of: UseFloatingPoint.self)
     var etUncond = graph.variable(
