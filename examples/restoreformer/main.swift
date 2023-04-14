@@ -394,6 +394,21 @@ func RestoreFormer(
   return (reader, Model([x, embedding], [out]))
 }
 
+var initImg = Tensor<Float>(.CPU, .NCHW(1, 3, 512, 512))
+if let image = try PNG.Data.Rectangular.decompress(
+  path: "/home/liu/workspace/GFPGAN/inputs/cropped_faces/Adele_crop.png")
+{
+  let rgba = image.unpack(as: PNG.RGBA<UInt8>.self)
+  for y in 0..<512 {
+    for x in 0..<512 {
+      let pixel = rgba[y * 512 + x]
+      initImg[0, 0, y, x] = Float(pixel.r) / 255 * 2 - 1
+      initImg[0, 1, y, x] = Float(pixel.g) / 255 * 2 - 1
+      initImg[0, 2, y, x] = Float(pixel.b) / 255 * 2 - 1
+    }
+  }
+}
+
 let graph = DynamicGraph()
 let croppedFaceTensor = graph.variable(try! Tensor<Float>(numpy: croppedFace.numpy())).toGPU(0)
 graph.workspaceSize = 1_024 * 1_024 * 1_024
@@ -407,4 +422,23 @@ graph.withNoGrad {
   reader(state_dict)
   let result = restoreFormer(inputs: croppedFaceTensor, embeddingTensor)[0].as(of: Float.self)
   debugPrint(result)
+  let restoreImg = restoreFormer(inputs: graph.variable(initImg).toGPU(0), embeddingTensor)[0].as(
+    of: Float.self
+  ).toCPU()
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 512 * 512)
+  for y in 0..<512 {
+    for x in 0..<512 {
+      let (r, g, b) = (restoreImg[0, 0, y, x], restoreImg[0, 1, y, x], restoreImg[0, 2, y, x])
+      rgba[y * 512 + x].r = UInt8(
+        min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
+      rgba[y * 512 + x].g = UInt8(
+        min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
+      rgba[y * 512 + x].b = UInt8(
+        min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
+    }
+  }
+  let image = PNG.Data.Rectangular(
+    packing: rgba, size: (512, 512),
+    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+  try! image.compress(path: "/home/liu/workspace/swift-diffusion/restoreformer.png", level: 4)
 }
