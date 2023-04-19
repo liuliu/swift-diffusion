@@ -124,6 +124,18 @@ swift_binary(
 )
 
 swift_binary(
+    name = "parsenet",
+    srcs = ["parsenet/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "diffusion",
     srcs = ["diffusion/main.swift"],
     deps = [
