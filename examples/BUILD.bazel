@@ -263,7 +263,12 @@ swift_binary(
 swift_binary(
     name = "kandinsky",
     srcs = ["kandinsky/main.swift"],
+    data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+    ],
     deps = [
+        "//:diffusion",
         "@PythonKit",
         "@SwiftNumerics//:Numerics",
         "@SwiftPNG//:PNG",
