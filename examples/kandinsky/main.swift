@@ -21,7 +21,8 @@ let model = kandinsky2.get_kandinsky2(
 let state_dict = model.text_encoder.state_dict()
 print(model.clip_model.text_projection.shape)
 let prior_state_dict = model.prior.state_dict()
-print(prior_state_dict.keys())
+let model_state_dict = model.model.state_dict()
+print(model_state_dict.keys())
 
 func XLMRobertaTextEmbedding(
   prefix: String, vocabularySize: Int, maxLength: Int, tokenTypes: Int, embeddingSize: Int
@@ -298,6 +299,341 @@ func DiffusionMapping(numberOfLayers: Int, k: Int, h: Int, b: Int, t: Int) -> (
   return (reader, Model([x, casualAttentionMask], [out]))
 }
 
+func ResBlock(
+  prefix: String, batchSize: Int, outChannels: Int, up: Bool, down: Bool, skipConnection: Bool
+) -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  let emb = Input()
+  let norm1 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  var out = norm1(x).swish()
+  var xhd: Model.IO = x
+  if up {
+    let hup = Upsample(.nearest, widthScale: 2, heightScale: 2)
+    out = hup(out)
+    let xup = Upsample(.nearest, widthScale: 2, heightScale: 2)
+    xhd = xup(x)
+  } else if down {
+    let hdown = AveragePool(filterSize: [2, 2], hint: Hint(stride: [2, 2]))
+    out = hdown(out)
+    let xdown = AveragePool(filterSize: [2, 2], hint: Hint(stride: [2, 2]))
+    xhd = xdown(x)
+  }
+  let conv1 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = conv1(out)
+  let embLayer = Dense(count: 2 * outChannels)
+  let embOut = embLayer(emb.swish())
+  let embScale = embOut.reshaped(
+    [batchSize, outChannels, 1, 1], offset: [0, 0, 0, 0], strides: [outChannels * 2, 1, 1, 1])
+  let embShift = embOut.reshaped(
+    [batchSize, outChannels, 1, 1], offset: [0, outChannels, 0, 0],
+    strides: [outChannels * 2, 1, 1, 1])
+  let norm2 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  out = norm2(out) .* (1 + embScale) + embShift
+  let conv2 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = conv2(out.swish())
+  var skipConv: Model?
+  if skipConnection {
+    let conv = Convolution(groups: 1, filters: outChannels, filterSize: [1, 1])
+    xhd = conv(xhd)
+    skipConv = conv
+  } else {
+    skipConv = nil
+  }
+  out = xhd + out
+  let reader: (PythonObject) -> Void = { state_dict in
+    let in_layers_0_weight = state_dict["\(prefix).in_layers.0.weight"].type(torch.float).cpu()
+      .numpy()
+    let in_layers_0_bias = state_dict["\(prefix).in_layers.0.bias"].type(torch.float).cpu().numpy()
+    norm1.weight.copy(from: try! Tensor<Float>(numpy: in_layers_0_weight))
+    norm1.bias.copy(from: try! Tensor<Float>(numpy: in_layers_0_bias))
+    let in_layers_2_weight = state_dict["\(prefix).in_layers.2.weight"].type(torch.float).cpu()
+      .numpy()
+    let in_layers_2_bias = state_dict["\(prefix).in_layers.2.bias"].type(torch.float).cpu().numpy()
+    conv1.weight.copy(from: try! Tensor<Float>(numpy: in_layers_2_weight))
+    conv1.bias.copy(from: try! Tensor<Float>(numpy: in_layers_2_bias))
+    let emb_layers_1_weight = state_dict["\(prefix).emb_layers.1.weight"].type(torch.float).cpu()
+      .numpy()
+    let emb_layers_1_bias = state_dict["\(prefix).emb_layers.1.bias"].type(torch.float).cpu()
+      .numpy()
+    embLayer.weight.copy(from: try! Tensor<Float>(numpy: emb_layers_1_weight))
+    embLayer.bias.copy(from: try! Tensor<Float>(numpy: emb_layers_1_bias))
+    let out_layers_0_weight = state_dict["\(prefix).out_layers.0.weight"].type(torch.float).cpu()
+      .numpy()
+    let out_layers_0_bias = state_dict["\(prefix).out_layers.0.bias"].type(torch.float).cpu()
+      .numpy()
+    norm2.weight.copy(from: try! Tensor<Float>(numpy: out_layers_0_weight))
+    norm2.bias.copy(from: try! Tensor<Float>(numpy: out_layers_0_bias))
+    let out_layers_3_weight = state_dict["\(prefix).out_layers.3.weight"].type(torch.float).cpu()
+      .numpy()
+    let out_layers_3_bias = state_dict["\(prefix).out_layers.3.bias"].type(torch.float).cpu()
+      .numpy()
+    conv2.weight.copy(from: try! Tensor<Float>(numpy: out_layers_3_weight))
+    conv2.bias.copy(from: try! Tensor<Float>(numpy: out_layers_3_bias))
+    if let skipConv = skipConv {
+      let skip_connection_weight = state_dict["\(prefix).skip_connection.weight"].type(torch.float)
+        .cpu().numpy()
+      let skip_connection_bias = state_dict["\(prefix).skip_connection.bias"].type(torch.float)
+        .cpu().numpy()
+      skipConv.weight.copy(from: try! Tensor<Float>(numpy: skip_connection_weight))
+      skipConv.bias.copy(from: try! Tensor<Float>(numpy: skip_connection_bias))
+    }
+  }
+  return (reader, Model([x, emb], [out]))
+}
+
+func AttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int, height: Int, width: Int) -> (
+  (PythonObject) -> Void, Model
+) {
+  let hw = height * width
+  let x = Input()
+  let encoderOut = Input()
+  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  var out = norm(x).reshaped([b, k * h, hw]).transposed(1, 2)
+  let toencoderkeys = Dense(count: k * h)
+  let toencodervalues = Dense(count: k * h)
+  let encoderIn = encoderOut
+  let encoderkeys = toencoderkeys(encoderIn).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  let encodervalues = toencodervalues(encoderIn).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  let tokeys = Dense(count: k * h)
+  let toqueries = Dense(count: k * h)
+  let tovalues = Dense(count: k * h)
+  let keys = tokeys(out).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(out)).reshaped([b, hw, h, k])
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(out).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, Functional.concat(axis: 2, encoderkeys, keys))
+  dot = dot.reshaped([b * h * hw, t + hw])
+  dot = dot.softmax()
+  dot = dot.reshaped([b, h, hw, t + hw])
+  out = dot * Functional.concat(axis: 2, encodervalues, values)
+  out = out.reshaped([b, h, hw, k]).transposed(2, 3).reshaped([b, k * h, height, width])
+  let projOut = Convolution(groups: 1, filters: k * h, filterSize: [1, 1])
+  out = projOut(out) + x
+  let reader: (PythonObject) -> Void = { state_dict in
+    let norm_weight = state_dict["\(prefix).norm.weight"].type(torch.float).cpu().numpy()
+    let norm_bias = state_dict["\(prefix).norm.bias"].type(torch.float).cpu().numpy()
+    norm.weight.copy(from: try! Tensor<Float>(numpy: norm_weight))
+    norm.bias.copy(from: try! Tensor<Float>(numpy: norm_bias))
+    let encoder_kv_weight = state_dict["\(prefix).encoder_kv.weight"].type(torch.float).cpu()
+    let encoder_kv_weight_view = encoder_kv_weight.view(h, k * 2, -1)
+    let (encoder_k_weight, encoder_v_weight) = torch[dynamicMember: "split"](
+      encoder_kv_weight_view, k, dim: 1
+    ).tuple2
+    let encoder_kv_bias = state_dict["\(prefix).encoder_kv.bias"].type(torch.float).cpu()
+    let encoder_kv_bias_view = encoder_kv_bias.view(h, k * 2)
+    let (encoder_k_bias, encoder_v_bias) = torch[dynamicMember: "split"](
+      encoder_kv_bias_view, k, dim: 1
+    )
+    .tuple2
+    toencoderkeys.weight.copy(from: try! Tensor<Float>(numpy: encoder_k_weight.numpy()))
+    toencoderkeys.bias.copy(from: try! Tensor<Float>(numpy: encoder_k_bias.numpy()))
+    toencodervalues.weight.copy(from: try! Tensor<Float>(numpy: encoder_v_weight.numpy()))
+    toencodervalues.bias.copy(from: try! Tensor<Float>(numpy: encoder_v_bias.numpy()))
+    let qkv_weight = state_dict["\(prefix).qkv.weight"].type(torch.float).cpu()
+    let qkv_weight_view = qkv_weight.view(h, k * 3, -1)
+    let (q_weight, k_weight, v_weight) = torch[dynamicMember: "split"](
+      qkv_weight_view, k, dim: 1
+    ).tuple3
+    let qkv_bias = state_dict["\(prefix).qkv.bias"].type(torch.float).cpu()
+    let qkv_bias_view = qkv_bias.view(h, k * 3)
+    let (q_bias, k_bias, v_bias) = torch[dynamicMember: "split"](qkv_bias_view, k, dim: 1)
+      .tuple3
+    toqueries.weight.copy(from: try! Tensor<Float>(numpy: q_weight.numpy()))
+    toqueries.bias.copy(from: try! Tensor<Float>(numpy: q_bias.numpy()))
+    tokeys.weight.copy(from: try! Tensor<Float>(numpy: k_weight.numpy()))
+    tokeys.bias.copy(from: try! Tensor<Float>(numpy: k_bias.numpy()))
+    tovalues.weight.copy(from: try! Tensor<Float>(numpy: v_weight.numpy()))
+    tovalues.bias.copy(from: try! Tensor<Float>(numpy: v_bias.numpy()))
+    let proj_out_weight = state_dict["\(prefix).proj_out.weight"].type(torch.float).cpu()
+      .numpy()
+    let proj_out_bias = state_dict["\(prefix).proj_out.bias"].type(torch.float).cpu()
+      .numpy()
+    projOut.weight.copy(from: try! Tensor<Float>(numpy: proj_out_weight))
+    projOut.bias.copy(from: try! Tensor<Float>(numpy: proj_out_bias))
+  }
+  return (reader, Model([x, encoderOut], [out]))
+}
+
+func InputBlocks(
+  prefix: String, batchSize: Int, channels: Int, channelMult: [Int], numResBlocks: Int,
+  numHeadChannels: Int, t: Int, startHeight: Int, startWidth: Int, attentionResolutions: Set<Int>,
+  x: Model.IO, emb: Model.IO, xfOut: Model.IO
+) -> ((PythonObject) -> Void, Model.IO, [Model.IO]) {
+  var readers = [(PythonObject) -> Void]()
+  let convIn = Convolution(
+    groups: 1, filters: channels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  var out = convIn(x)
+  var i = 1
+  var lastCh = channels
+  var ds = 1
+  var height = startHeight
+  var width = startWidth
+  var hs = [Model.IO]()
+  hs.append(out)
+  for (level, mult) in channelMult.enumerated() {
+    let ch = channels * mult
+    for _ in 0..<numResBlocks {
+      let (reader, resBlock) = ResBlock(
+        prefix: "\(prefix).\(i).0", batchSize: batchSize, outChannels: ch, up: false, down: false,
+        skipConnection: ch != lastCh)
+      out = resBlock(out, emb)
+      readers.append(reader)
+      lastCh = ch
+      if attentionResolutions.contains(ds) {
+        let (reader, attentionBlock) = AttentionBlock(
+          prefix: "\(prefix).\(i).1", k: numHeadChannels, h: ch / numHeadChannels, b: batchSize,
+          t: t, height: height, width: width)
+        out = attentionBlock(out, xfOut)
+        readers.append(reader)
+      }
+      hs.append(out)
+      i += 1
+    }
+    if level != channelMult.count - 1 {
+      let (reader, resBlock) = ResBlock(
+        prefix: "\(prefix).\(i).0", batchSize: batchSize, outChannels: ch, up: false, down: true,
+        skipConnection: false)
+      out = resBlock(out, emb)
+      readers.append(reader)
+      hs.append(out)
+      i += 1
+      ds *= 2
+      height /= 2
+      width /= 2
+    }
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    let input_blocks_0_0_weight = state_dict["\(prefix).0.0.weight"].type(torch.float).cpu().numpy()
+    let input_blocks_0_0_bias = state_dict["\(prefix).0.0.bias"].type(torch.float).cpu().numpy()
+    convIn.weight.copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_weight))
+    convIn.bias.copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_bias))
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
+  return (reader, out, hs)
+}
+
+func OutputBlocks(
+  prefix: String, batchSize: Int, channels: Int, channelMult: [Int], numResBlocks: Int,
+  numHeadChannels: Int, t: Int, startHeight: Int, startWidth: Int, attentionResolutions: Set<Int>,
+  x: Model.IO, emb: Model.IO, xfOut: Model.IO, hs: [Model.IO]
+) -> ((PythonObject) -> Void, Model.IO) {
+  var readers = [(PythonObject) -> Void]()
+  var out: Model.IO = x
+  var i = 0
+  var ds = 1
+  var height = startHeight
+  var width = startWidth
+  for _ in 1..<channelMult.count {
+    ds *= 2
+    height /= 2
+    width /= 2
+  }
+  for (level, mult) in channelMult.enumerated().reversed() {
+    let ch = channels * mult
+    for j in 0..<(numResBlocks + 1) {
+      out = Functional.concat(axis: 1, out, hs[hs.count - 1 - i])
+      let (reader, resBlock) = ResBlock(
+        prefix: "\(prefix).\(i).0", batchSize: batchSize, outChannels: ch, up: false, down: false,
+        skipConnection: true)
+      out = resBlock(out, emb)
+      readers.append(reader)
+      if attentionResolutions.contains(ds) {
+        let (reader, attentionBlock) = AttentionBlock(
+          prefix: "\(prefix).\(i).1", k: numHeadChannels, h: ch / numHeadChannels, b: batchSize,
+          t: t, height: height, width: width)
+        out = attentionBlock(out, xfOut)
+        readers.append(reader)
+      }
+      if level > 0 && j == numResBlocks {
+        let (reader, resBlock) = ResBlock(
+          prefix: "\(prefix).\(i).2", batchSize: batchSize, outChannels: ch, up: true, down: false,
+          skipConnection: false)
+        out = resBlock(out, emb)
+        readers.append(reader)
+        ds /= 2
+        height *= 2
+        width *= 2
+      }
+      i += 1
+    }
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
+  return (reader, out)
+}
+
+func UNet(
+  batchSize: Int, channels: Int, outChannels: Int, channelMult: [Int], numResBlocks: Int,
+  numHeadChannels: Int, t: Int, startHeight: Int, startWidth: Int, attentionResolutions: Set<Int>
+) -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  let emb = Input()
+  let xfOut = Input()
+  let (inputBlocksReader, inputBlocksOut, hs) = InputBlocks(
+    prefix: "input_blocks", batchSize: batchSize, channels: channels, channelMult: channelMult,
+    numResBlocks: numResBlocks, numHeadChannels: numHeadChannels, t: t, startHeight: startHeight,
+    startWidth: startWidth, attentionResolutions: attentionResolutions, x: x, emb: emb, xfOut: xfOut
+  )
+  let ch = channelMult[channelMult.count - 1] * channels
+  var out = inputBlocksOut
+  let (middleBlockReader1, middleResBlock1) = ResBlock(
+    prefix: "middle_block.0", batchSize: batchSize, outChannels: ch, up: false, down: false,
+    skipConnection: false)
+  out = middleResBlock1(out, emb)
+  var height = startHeight
+  var width = startWidth
+  for _ in 1..<channelMult.count {
+    height /= 2
+    width /= 2
+  }
+  let (middleBlockReader2, middleAttentionBlock2) = AttentionBlock(
+    prefix: "middle_block.1", k: numHeadChannels, h: ch / numHeadChannels, b: batchSize, t: t,
+    height: height, width: width)
+  out = middleAttentionBlock2(out, xfOut)
+  let (middleBlockReader3, middleResBlock3) = ResBlock(
+    prefix: "middle_block.2", batchSize: batchSize, outChannels: ch, up: false, down: false,
+    skipConnection: false)
+  out = middleResBlock3(out, emb)
+  let (outputBlocksReader, outputBlocksOut) = OutputBlocks(
+    prefix: "output_blocks", batchSize: batchSize, channels: channels, channelMult: channelMult,
+    numResBlocks: numResBlocks, numHeadChannels: numHeadChannels, t: t, startHeight: startHeight,
+    startWidth: startWidth, attentionResolutions: attentionResolutions, x: out, emb: emb,
+    xfOut: xfOut, hs: hs)
+  out = outputBlocksOut
+  let normOut = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  out = normOut(out).swish()
+  let convOut = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = convOut(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    inputBlocksReader(state_dict)
+    middleBlockReader1(state_dict)
+    middleBlockReader2(state_dict)
+    middleBlockReader3(state_dict)
+    outputBlocksReader(state_dict)
+    let out_0_weight = state_dict["out.0.weight"].type(torch.float).cpu().numpy()
+    let out_0_bias = state_dict["out.0.bias"].type(torch.float).cpu().numpy()
+    normOut.weight.copy(from: try! Tensor<Float>(numpy: out_0_weight))
+    normOut.bias.copy(from: try! Tensor<Float>(numpy: out_0_bias))
+    let out_2_weight = state_dict["out.2.weight"].type(torch.float).cpu().numpy()
+    let out_2_bias = state_dict["out.2.bias"].type(torch.float).cpu().numpy()
+    convOut.weight.copy(from: try! Tensor<Float>(numpy: out_2_weight))
+    convOut.bias.copy(from: try! Tensor<Float>(numpy: out_2_bias))
+  }
+  return (reader, Model([x, emb, xfOut], [out]))
+}
+
 let dmInput = torch.randn([2, 81, 2048])
 var dmMask: PythonObject? = nil
 let graph = DynamicGraph()
@@ -428,10 +764,51 @@ graph.withNoGrad {
 }
 
 torch.cuda.set_device(0)
+/*
 let dmMask2 = torch.cat([dmMask!, dmMask!])
 let result = model.prior.model.transformer(
   dmInput.to(torch.float16).cuda(), mask: dmMask2.to(torch.float16).cuda())
 print(result)
+*/
+var h = torch.randn([2, 4, 96, 96]).type(torch.float16).cuda()
+let hInput = h
+let emb = torch.randn([2, 768 * 2]).type(torch.float).cuda()
+let xfOut = torch.randn([2, 768, 87]).type(torch.float16).cuda()
+model.model.eval()
+torch.set_grad_enabled(false)
+var hs = [PythonObject]()
+for module in model.model.input_blocks {
+  h = module(h, emb, xfOut)
+  hs.append(h)
+}
+h = model.model.middle_block(h, emb, xfOut)
+for module in model.model.output_blocks {
+  h = torch.cat([h, hs.popLast()!], dim: 1)
+  h = module(h, emb, xfOut)
+}
+h = model.model.out(h.type(torch.float))
+torch.set_grad_enabled(true)
+print("h \(h), h.shape \(h.shape)")
+
+graph.withNoGrad {
+  let (reader, unet) = UNet(
+    batchSize: 2, channels: 384, outChannels: 8, channelMult: [1, 2, 3, 4], numResBlocks: 3,
+    numHeadChannels: 64, t: 87, startHeight: 96, startWidth: 96,
+    attentionResolutions: Set([2, 4, 8]))
+  let hInputGPU = graph.variable(
+    try! Tensor<Float>(numpy: hInput.detach().type(torch.float).cpu().numpy())
+  ).toGPU(1)
+  let embGPU = graph.variable(
+    try! Tensor<Float>(numpy: emb.detach().type(torch.float).cpu().numpy())
+  ).toGPU(1)
+  let xfOutGPU = graph.variable(
+    try! Tensor<Float>(numpy: xfOut.detach().type(torch.float).cpu().numpy())
+  ).toGPU(1).permuted(0, 2, 1).copied()
+  unet.compile(inputs: hInputGPU, embGPU, xfOutGPU)
+  reader(model_state_dict)
+  let result = unet(inputs: hInputGPU, embGPU, xfOutGPU)[0].as(of: Float.self)
+  debugPrint(result)
+}
 /*
 let images = model.generate_text2img(
   prompt, num_steps: 100, batch_size: 1, guidance_scale: 4, h: 768, w: 768,
