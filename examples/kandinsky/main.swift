@@ -2,14 +2,42 @@ import Diffusion
 import Foundation
 import NNC
 import NNCPythonConversion
+import PNG
 import PythonKit
 
 public struct DiffusionModel {
+  public var linearStart: Float
+  public var linearEnd: Float
   public var timesteps: Int
   public var steps: Int
 }
 
 extension DiffusionModel {
+  public var betas: [Float] {  // Linear for now.
+    var betas = [Float]()
+    let start = linearStart
+    let length = linearEnd - start
+    for i in 0..<timesteps {
+      let beta = start + Float(i) * length / Float(timesteps - 1)
+      betas.append(beta)
+    }
+    return betas
+  }
+  public var alphasCumprod: [Float] {
+    var cumprod: Float = 1
+    return betas.map {
+      cumprod *= 1 - $0
+      return cumprod
+    }
+  }
+}
+
+public struct CLIPDiffusionModel {
+  public var timesteps: Int
+  public var steps: Int
+}
+
+extension CLIPDiffusionModel {
   public var betas: [Float] {  // Cosine based.
     var betas = [Float]()
     for i in 0..<timesteps {
@@ -46,7 +74,6 @@ let prompt = "red cat, 4k photo"
 let model = kandinsky2.get_kandinsky2(
   "cuda", task_type: "text2img", model_version: "2.1", use_flash_attention: false)
 let state_dict = model.text_encoder.state_dict()
-print(model.clip_model.text_projection.shape)
 let prior_state_dict = model.prior.state_dict()
 let model_state_dict = model.model.state_dict()
 let movq_state_dict = model.image_encoder.state_dict()
@@ -305,21 +332,21 @@ func timeEmbedding(timestep: Int, batchSize: Int, embeddingSize: Int, maxPeriod:
   return embedding
 }
 
-func timestepEmbedding() -> ((PythonObject) -> Void, Model) {
+func timestepEmbedding(prefix: String, channels: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
-  let dense1 = Dense(count: 2048)
+  let dense1 = Dense(count: channels)
   var out = dense1(x).swish()
-  let dense2 = Dense(count: 2048)
+  let dense2 = Dense(count: channels)
   out = dense2(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let time_embed_0_weight = state_dict["model.time_embed.0.weight"].type(torch.float).cpu()
+    let time_embed_0_weight = state_dict["\(prefix).0.weight"].type(torch.float).cpu()
       .numpy()
-    let time_embed_0_bias = state_dict["model.time_embed.0.bias"].type(torch.float).cpu().numpy()
+    let time_embed_0_bias = state_dict["\(prefix).0.bias"].type(torch.float).cpu().numpy()
     dense1.weight.copy(from: try! Tensor<Float>(numpy: time_embed_0_weight))
     dense1.bias.copy(from: try! Tensor<Float>(numpy: time_embed_0_bias))
-    let time_embed_2_weight = state_dict["model.time_embed.2.weight"].type(torch.float).cpu()
+    let time_embed_2_weight = state_dict["\(prefix).2.weight"].type(torch.float).cpu()
       .numpy()
-    let time_embed_2_bias = state_dict["model.time_embed.2.bias"].type(torch.float).cpu().numpy()
+    let time_embed_2_bias = state_dict["\(prefix).2.bias"].type(torch.float).cpu().numpy()
     dense2.weight.copy(from: try! Tensor<Float>(numpy: time_embed_2_weight))
     dense2.bias.copy(from: try! Tensor<Float>(numpy: time_embed_2_bias))
   }
@@ -925,7 +952,7 @@ func MOVQDecoder(
 let dmInput = torch.randn([2, 81, 2048])
 var dmMask: PythonObject? = nil
 let graph = DynamicGraph()
-let diffusion = DiffusionModel(timesteps: 1_000, steps: 30)
+let diffusion = CLIPDiffusionModel(timesteps: 1_000, steps: 30)
 let alphasCumprod = diffusion.alphasCumprod
 var newBetas = [Double]()
 var lastAlphasCumprod: Float = 1.0
@@ -942,6 +969,7 @@ var posteriorVariance = [Double]()
 var posteriorLogVarianceClipped = [Double]()
 var posteriorMeanCoef1 = [Double]()
 var posteriorMeanCoef2 = [Double]()
+DynamicGraph.setSeed(0)
 for i in 0..<newAlphasCumprod.count {
   let alphasCumProdPrev = i > 0 ? newAlphasCumprod[i - 1] : 1
   posteriorVariance.append(newBetas[i] * (1 - alphasCumProdPrev) / (1 - newAlphasCumprod[i]))
@@ -959,7 +987,11 @@ for i in 0..<newAlphasCumprod.count {
 }
 torch.cuda.set_device(0)
 let noise = torch.randn([2, 768]).type(torch.float16).cuda()
+let zeroImgEmb = model.create_zero_img_emb(1).detach().type(torch.float).cpu().numpy()
 model.prior.noise = noise
+var fullEmb1: DynamicGraph.Tensor<Float>? = nil
+var poolEmb1: DynamicGraph.Tensor<Float>? = nil
+var imageEmb1: DynamicGraph.Tensor<Float>? = nil
 graph.withNoGrad {
   let (reader, textEncoder) = XLMRobertaTextEmbedding(
     prefix: "model.transformer.embeddings", vocabularySize: 250_002, maxLength: 514, tokenTypes: 1,
@@ -1009,8 +1041,35 @@ graph.withNoGrad {
   let attentionMaskGPU = attentionMask.toGPU(1)
   layer.compile(inputs: embeddings, attentionMaskGPU)
   layerReader(state_dict)
-  let output = layer(inputs: embeddings, attentionMaskGPU)[0].as(of: Float.self)
-  debugPrint(output.reshaped(.CHW(2, 77, 1024)))
+  let textEncoderEmb = layer(inputs: embeddings, attentionMaskGPU)[0].as(of: Float.self).reshaped(
+    .CHW(2, 77, 1024))
+  fullEmb1 = textEncoderEmb
+  let poolingMask = graph.variable(.CPU, .CHW(2, 1, 77), of: Float.self)
+  let weightPoolingMask = graph.variable(.CPU, .CHW(2, 1, 1), of: Float.self)
+  poolingMask.full(0)
+  for i in 0..<8 {
+    poolingMask[0, 0, i] = 1
+  }
+  weightPoolingMask[0, 0, 0] = 1 / 8
+  for i in 0..<2 {
+    poolingMask[1, 0, i] = 1
+  }
+  weightPoolingMask[1, 0, 0] = 1 / 2
+  let poolEmb = weightPoolingMask.toGPU(1) .* (poolingMask.toGPU(1) * textEncoderEmb)
+  let linearTransformation = Dense(count: 768)
+  linearTransformation.compile(inputs: poolEmb)
+  let LinearTransformation_weight = state_dict["model.LinearTransformation.weight"].type(
+    torch.float
+  ).cpu()
+    .numpy()
+  linearTransformation.weight.copy(from: try! Tensor<Float>(numpy: LinearTransformation_weight))
+  let LinearTransformation_bias = state_dict["model.LinearTransformation.bias"].type(torch.float)
+    .cpu()
+    .numpy()
+  linearTransformation.bias.copy(from: try! Tensor<Float>(numpy: LinearTransformation_bias))
+  let poolEmbOut = linearTransformation(inputs: poolEmb)[0].as(of: Float.self)
+  debugPrint(poolEmbOut)
+  poolEmb1 = poolEmbOut
 
   let tokenizer = CLIPTokenizer(
     vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
@@ -1065,7 +1124,7 @@ graph.withNoGrad {
   let textEncProj = Dense(count: 2048)
   let textEmbProj = Dense(count: 2048)
   let clipImgProj = Dense(count: 2048)
-  let (timeEmbedReader, timeEmbed) = timestepEmbedding()
+  let (timeEmbedReader, timeEmbed) = timestepEmbedding(prefix: "model.time_embed", channels: 2048)
   var xIn = graph.variable(.GPU(1), .NC(2, 768), of: Float.self)
   textEncProj.compile(inputs: textEnc)
   let text_enc_proj_weight = prior_state_dict["model.text_enc_proj.weight"].type(torch.float).cpu()
@@ -1110,6 +1169,10 @@ graph.withNoGrad {
     .numpy()
   let positionalEmbedding = graph.variable(try! Tensor<Float>(numpy: positional_embedding)).toGPU(1)
     .reshaped(.NC(81, 2048))
+  let clip_std = model.prior.clip_std.type(torch.float).cpu().numpy()
+  let clipStd = graph.variable(try! Tensor<Float>(numpy: clip_std)).toGPU(1)
+  let clip_mean = model.prior.clip_mean.type(torch.float).cpu().numpy()
+  let clipMean = graph.variable(try! Tensor<Float>(numpy: clip_mean)).toGPU(1)
   var positionalEmbeddingGPU = graph.variable(.GPU(1), .NC(2 * 81, 2048), of: Float.self)
   positionalEmbeddingGPU[0..<81, 0..<2048] = positionalEmbedding
   positionalEmbeddingGPU[81..<(81 * 2), 0..<2048] = positionalEmbedding
@@ -1137,9 +1200,10 @@ graph.withNoGrad {
   diffusionMappingReader(prior_state_dict)
   let noiseGPU = graph.variable(try! Tensor<Float>(numpy: noise.type(torch.float).cpu().numpy()))
     .toGPU(1)
-  xIn[0..<1, 0..<768] = noiseGPU[0..<1, 0..<768]
-  xIn[1..<2, 0..<768] = noiseGPU[0..<1, 0..<768]
+  var x = noiseGPU[0..<1, 0..<768]
   for (i, timestep) in [0, 250, 500, 749, 999].enumerated().reversed() {
+    xIn[0..<1, 0..<768] = x
+    xIn[1..<2, 0..<768] = x
     let timesteps = graph.variable(
       timeEmbedding(timestep: timestep, batchSize: 1, embeddingSize: 2048, maxPeriod: 10_000).toGPU(
         1))
@@ -1152,8 +1216,27 @@ graph.withNoGrad {
     let input = dmInputTensorGPU + positionalEmbeddingGPU
     let result = diffusionMapping(inputs: input, dmCasualAttentionMaskGPU)[0].as(
       of: Float.self)
-    debugPrint(result)
+    let condEps = result[0..<1, 0..<1, 0..<768].reshaped(.NC(1, 768))
+    let uncondEps = result[1..<2, 0..<1, 0..<768].reshaped(.NC(1, 768))
+    let eps = (uncondEps + 4 * (condEps - uncondEps)).clamped(-10...10)
+    let posteriorMean = Functional.add(
+      left: eps, right: x, leftScalar: Float(posteriorMeanCoef1[i]),
+      rightScalar: Float(posteriorMeanCoef2[i]))
+    noiseGPU.randn()
+    if i > 0 {
+      x = Functional.add(
+        left: posteriorMean, right: noiseGPU[0..<1, 0..<768],
+        rightScalar: Float(exp(0.5 * posteriorLogVarianceClipped[i])))
+    } else {
+      x = posteriorMean
+    }
   }
+  let imageEmbGPU = x .* clipStd + clipMean
+  let zeroImgEmbGPU = graph.variable(try! Tensor<Float>(numpy: zeroImgEmb)).toGPU(1)
+  var imageEmb = graph.variable(.GPU(1), .NC(2, 768), of: Float.self)
+  imageEmb[0..<1, 0..<768] = imageEmbGPU
+  imageEmb[1..<2, 0..<768] = zeroImgEmbGPU
+  imageEmb1 = imageEmb.reshaped(.CHW(2, 1, 768))
 }
 
 /*
@@ -1164,11 +1247,106 @@ print(result)
 */
 
 torch.cuda.set_device(0)
-let hInput = torch.randn([2, 4, 96, 96]).type(torch.float16).cuda()
+let hInput = torch.randn([1, 4, 96, 96]).type(torch.float16).cuda()
 let emb = torch.randn([2, 768 * 2]).type(torch.float).cuda()
 let xfOut = torch.randn([2, 768, 87]).type(torch.float16).cuda()
 
+let diffusionModel = DiffusionModel(
+  linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 50)
+let mAlphasCumprod = diffusionModel.alphasCumprod
+var mNewBetas = [Double]()
+var mLastAlphasCumprod: Float = 1.0
+let mTimesteps: [Int] = (0..<100).map {
+  return (999 * $0 + 45) / 99
+}
+for i in mTimesteps {
+  mNewBetas.append(1 - Double(mAlphasCumprod[i] / mLastAlphasCumprod))
+  mLastAlphasCumprod = mAlphasCumprod[i]
+}
+var mCumprod: Double = 1
+let mNewAlphasCumprod = mNewBetas.map {
+  mCumprod *= 1 - $0
+  return mCumprod
+}
+var mPosteriorVariance = [Double]()
+var mPosteriorLogVarianceClipped = [Double]()
+var mPosteriorMeanCoef1 = [Double]()
+var mPosteriorMeanCoef2 = [Double]()
+for i in 0..<mNewAlphasCumprod.count {
+  let alphasCumProdPrev = i > 0 ? mNewAlphasCumprod[i - 1] : 1
+  mPosteriorVariance.append(mNewBetas[i] * (1 - alphasCumProdPrev) / (1 - mNewAlphasCumprod[i]))
+  if i == 0 {
+    mPosteriorLogVarianceClipped.append(
+      log(mNewBetas[i + 1] * (1 - mNewAlphasCumprod[i]) / (1 - mNewAlphasCumprod[i + 1])))
+  } else {
+    mPosteriorLogVarianceClipped.append(
+      log(mNewBetas[i] * (1 - mNewAlphasCumprod[i - 1]) / (1 - mNewAlphasCumprod[i])))
+  }
+  mPosteriorMeanCoef1.append(
+    mNewBetas[i] * alphasCumProdPrev.squareRoot() / (1 - mNewAlphasCumprod[i]))
+  mPosteriorMeanCoef2.append(
+    (1 - alphasCumProdPrev) * (1 - mNewBetas[i]).squareRoot() / (1 - mNewAlphasCumprod[i]))
+}
+
+var image: DynamicGraph.Tensor<Float>? = nil
 graph.withNoGrad {
+  guard let fullEmb1 = fullEmb1, let poolEmb1 = poolEmb1, let imageEmb1 = imageEmb1 else { return }
+  let clipToSeq = Dense(count: 10 * 768)
+  let projN = Dense(count: 384 * 4)
+  let lnModelN = LayerNorm(epsilon: 1e-5, axis: [2])
+  let imgLayer = Dense(count: 384 * 4)
+  let toModelDimN = Dense(count: 768)
+  clipToSeq.compile(inputs: imageEmb1)
+  let clip_to_seq_weight = model_state_dict["clip_to_seq.weight"].type(torch.float).cpu()
+    .numpy()
+  clipToSeq.weight.copy(from: try! Tensor<Float>(numpy: clip_to_seq_weight))
+  let clip_to_seq_bias = model_state_dict["clip_to_seq.bias"].type(torch.float).cpu()
+    .numpy()
+  clipToSeq.bias.copy(from: try! Tensor<Float>(numpy: clip_to_seq_bias))
+  let clipSeq = clipToSeq(inputs: imageEmb1)[0].as(of: Float.self).reshaped(.CHW(2, 10, 768))
+  projN.compile(inputs: poolEmb1)
+  let proj_n_weight = model_state_dict["proj_n.weight"].type(torch.float).cpu()
+    .numpy()
+  projN.weight.copy(from: try! Tensor<Float>(numpy: proj_n_weight))
+  let proj_n_bias = model_state_dict["proj_n.bias"].type(torch.float).cpu()
+    .numpy()
+  projN.bias.copy(from: try! Tensor<Float>(numpy: proj_n_bias))
+  var xfProj = projN(inputs: poolEmb1)[0].as(of: Float.self)
+  lnModelN.compile(inputs: xfProj)
+  let ln_model_n_weight = model_state_dict["ln_model_n.weight"].type(torch.float).cpu()
+    .numpy()
+  lnModelN.weight.copy(from: try! Tensor<Float>(numpy: ln_model_n_weight))
+  let ln_model_n_bias = model_state_dict["ln_model_n.bias"].type(torch.float).cpu()
+    .numpy()
+  lnModelN.bias.copy(from: try! Tensor<Float>(numpy: ln_model_n_bias))
+  xfProj = lnModelN(inputs: xfProj)[0].as(of: Float.self)
+  imgLayer.compile(inputs: imageEmb1)
+  let img_layer_weight = model_state_dict["img_layer.weight"].type(torch.float).cpu()
+    .numpy()
+  imgLayer.weight.copy(from: try! Tensor<Float>(numpy: img_layer_weight))
+  let img_layer_bias = model_state_dict["img_layer.bias"].type(torch.float).cpu()
+    .numpy()
+  imgLayer.bias.copy(from: try! Tensor<Float>(numpy: img_layer_bias))
+  xfProj = xfProj + imgLayer(inputs: imageEmb1)[0].as(of: Float.self)
+  toModelDimN.compile(inputs: fullEmb1)
+  let to_model_dim_n_weight = model_state_dict["to_model_dim_n.weight"].type(torch.float).cpu()
+    .numpy()
+  toModelDimN.weight.copy(from: try! Tensor<Float>(numpy: to_model_dim_n_weight))
+  let to_model_dim_n_bias = model_state_dict["to_model_dim_n.bias"].type(torch.float).cpu()
+    .numpy()
+  toModelDimN.bias.copy(from: try! Tensor<Float>(numpy: to_model_dim_n_bias))
+  let dimNFullEmb = toModelDimN(inputs: fullEmb1)[0].as(of: Float.self)
+  var xfOutGPU = graph.variable(.GPU(1), .CHW(2, 87, 768), of: Float.self)
+  xfOutGPU[0..<2, 0..<10, 0..<768] = clipSeq
+  xfOutGPU[0..<2, 10..<87, 0..<768] = dimNFullEmb
+  debugPrint(xfOutGPU)
+  let timesteps = graph.variable(
+    timeEmbedding(timestep: 999, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000).toGPU(1))
+  let (timeEmbedReader, timeEmbed) = timestepEmbedding(prefix: "time_embed", channels: 384 * 4)
+  timeEmbed.compile(inputs: timesteps)
+  timeEmbedReader(model_state_dict)
+  var embGPU = timeEmbed(inputs: timesteps)[0].as(of: Float.self)
+  embGPU = embGPU + xfProj.reshaped(.NC(2, 384 * 4))
   let (reader, unet) = UNet(
     batchSize: 2, channels: 384, outChannels: 8, channelMult: [1, 2, 3, 4], numResBlocks: 3,
     numHeadChannels: 64, t: 87, startHeight: 96, startWidth: 96,
@@ -1176,17 +1354,51 @@ graph.withNoGrad {
   let hInputGPU = graph.variable(
     try! Tensor<Float>(numpy: hInput.detach().type(torch.float).cpu().numpy())
   ).toGPU(1)
+  /*
   let embGPU = graph.variable(
     try! Tensor<Float>(numpy: emb.detach().type(torch.float).cpu().numpy())
   ).toGPU(1)
   let xfOutGPU = graph.variable(
     try! Tensor<Float>(numpy: xfOut.detach().type(torch.float).cpu().numpy())
   ).toGPU(1).permuted(0, 2, 1).copied()
-  unet.compile(inputs: hInputGPU, embGPU, xfOutGPU)
+  */
+  var x = hInputGPU
+  var xIn = graph.variable(.GPU(1), .NCHW(2, 4, 96, 96), of: Float.self)
+  xIn[0..<1, 0..<4, 0..<96, 0..<96] = x
+  xIn[1..<2, 0..<4, 0..<96, 0..<96] = x
+  unet.compile(inputs: xIn, embGPU, xfOutGPU)
   reader(model_state_dict)
-  let result = unet(inputs: hInputGPU, embGPU, xfOutGPU)[0].as(of: Float.self)
-  debugPrint(result)
+  for (i, timestep) in mTimesteps.enumerated().reversed() {
+    let timesteps = graph.variable(
+      timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000).toGPU(
+        1))
+    embGPU = timeEmbed(inputs: timesteps)[0].as(of: Float.self)
+    embGPU = embGPU + xfProj.reshaped(.NC(2, 384 * 4))
+    let result = unet(inputs: xIn, embGPU, xfOutGPU)[0].as(of: Float.self)
+    /*
+    let modelVar = result[0..<2, 4..<8, 0..<96, 0..<96].copied()
+    let minLog = mPosteriorLogVarianceClipped[i]
+    let maxLog = mNewBetas[i]
+    let frac = 0.5 * (modelVar + 1)
+    let modelLogVar = frac * maxLog + (1 - frac) * minLog
+    */
+    let condEps = result[0..<1, 0..<4, 0..<96, 0..<96].copied()
+    let uncondEps = result[1..<2, 0..<4, 0..<96, 0..<96].copied()
+    let eps = uncondEps + 4 * (condEps - uncondEps)
+    let predXStart = Functional.add(
+      left: x, right: eps, leftScalar: Float((1.0 / mNewAlphasCumprod[i]).squareRoot()),
+      rightScalar: -Float((1.0 / mNewAlphasCumprod[i] - 1).squareRoot())
+    ).clamped(-2...2)
+    x = Functional.add(
+      left: predXStart, right: x, leftScalar: Float(mPosteriorMeanCoef1[i]),
+      rightScalar: Float(mPosteriorMeanCoef2[i]))
+    xIn[0..<1, 0..<4, 0..<96, 0..<96] = x
+    xIn[1..<2, 0..<4, 0..<96, 0..<96] = x
+  }
+  image = x
 }
+print(model.scale)
+debugPrint(image!)
 
 /*
 model.model.eval()
@@ -1217,19 +1429,41 @@ print(result.cpu())
 */
 
 graph.withNoGrad {
+  guard let image = image else { return }
   let (reader, movq) = MOVQDecoder(
     zChannels: 4, channels: 128, channelMult: [1, 2, 2, 4], numResBlocks: 2, startHeight: 96,
     startWidth: 96, attnResolutions: Set([32]))
+  /*
   let hGPU = graph.variable(try! Tensor<Float>(numpy: h.detach().type(torch.float).cpu().numpy()))
     .toGPU(1)
-  movq.compile(inputs: hGPU)
+  */
+  movq.compile(inputs: image)
   reader(movq_state_dict)
-  let result = movq(inputs: hGPU)[0].as(of: Float.self)
+  let result = movq(inputs: image)[0].as(of: Float.self).toCPU()
   debugPrint(result)
+  let startWidth = 96
+  let startHeight = 96
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
+  for y in 0..<startHeight * 8 {
+    for x in 0..<startWidth * 8 {
+      let (r, g, b) = (result[0, 0, y, x], result[0, 1, y, x], result[0, 2, y, x])
+      rgba[y * startWidth * 8 + x].r = UInt8(
+        min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
+      rgba[y * startWidth * 8 + x].g = UInt8(
+        min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
+      rgba[y * startWidth * 8 + x].b = UInt8(
+        min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
+    }
+  }
+  let png = PNG.Data.Rectangular(
+    packing: rgba, size: (startWidth * 8, startHeight * 8),
+    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+  try! png.compress(path: "/home/liu/workspace/swift-diffusion/kandinsky.png", level: 4)
 }
-
+/*
 torch.cuda.set_device(0)
 let images = model.generate_text2img(
   prompt, num_steps: 100, batch_size: 1, guidance_scale: 4, h: 768, w: 768,
   sampler: "p_sampler", prior_cf_scale: 4, prior_steps: "5")
 images[0].save("/home/liu/workspace/swift-diffusion/kandinsky.png")
+*/
