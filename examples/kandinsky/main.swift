@@ -1247,7 +1247,7 @@ print(result)
 */
 
 torch.cuda.set_device(0)
-let hInput = torch.randn([1, 4, 96, 96]).type(torch.float16).cuda()
+let hInput = torch.randn([2, 4, 96, 96]).type(torch.float16).cuda()
 let emb = torch.randn([2, 768 * 2]).type(torch.float).cuda()
 let xfOut = torch.randn([2, 768, 87]).type(torch.float16).cuda()
 
@@ -1301,7 +1301,7 @@ func percentile(_ tensor: DynamicGraph.Tensor<Float>) -> Float {
     }
   }
   value = value.sorted()
-  return value[Int(floor((Float(1 * 4 * 96 * 96) * 0.995)))]
+  return value[Int(floor((Float(1 * 4 * 96 * 96 - 1) * 0.995)))]
 }
 
 var image: DynamicGraph.Tensor<Float>? = nil
@@ -1380,8 +1380,6 @@ graph.withNoGrad {
   */
   var x = hInputGPU
   var xIn = graph.variable(.GPU(1), .NCHW(2, 4, 96, 96), of: Float.self)
-  xIn[0..<1, 0..<4, 0..<96, 0..<96] = x
-  xIn[1..<2, 0..<4, 0..<96, 0..<96] = x
   unet.compile(inputs: xIn, embGPU, xfOutGPU)
   reader(model_state_dict)
   for (i, timestep) in mTimesteps.enumerated().reversed() {
@@ -1390,6 +1388,8 @@ graph.withNoGrad {
         1))
     embGPU = timeEmbed(inputs: timesteps)[0].as(of: Float.self)
     embGPU = embGPU + xfProj.reshaped(.NC(2, 384 * 4))
+    xIn[0..<1, 0..<4, 0..<96, 0..<96] = x[0..<1, 0..<4, 0..<96, 0..<96]
+    xIn[1..<2, 0..<4, 0..<96, 0..<96] = x[0..<1, 0..<4, 0..<96, 0..<96]
     let result = unet(inputs: xIn, embGPU, xfOutGPU)[0].as(of: Float.self)
     let modelVar = result[0..<2, 4..<8, 0..<96, 0..<96].copied().clamped(-1...1)
     let minLog = Float(mPosteriorLogVarianceClipped[i])
@@ -1399,25 +1399,25 @@ graph.withNoGrad {
     let condEps = result[0..<1, 0..<4, 0..<96, 0..<96].copied()
     let uncondEps = result[1..<2, 0..<4, 0..<96, 0..<96].copied()
     let halfEps = uncondEps + 4 * (condEps - uncondEps)
-    x = xIn[0..<1, 0..<4, 0..<96, 0..<96]
+    var eps = graph.variable(like: xIn)
+    eps[0..<1, 0..<4, 0..<96, 0..<96] = halfEps
+    eps[1..<2, 0..<4, 0..<96, 0..<96] = halfEps
     var predXStart = Functional.add(
-      left: x, right: halfEps, leftScalar: Float((1.0 / mNewAlphasCumprod[i]).squareRoot()),
+      left: x, right: eps, leftScalar: Float((1.0 / mNewAlphasCumprod[i]).squareRoot()),
       rightScalar: -Float((1.0 / mNewAlphasCumprod[i] - 1).squareRoot())
     ).clamped(-2...2)
-    // let s = max(percentile(predXStart), 1)
-    // predXStart = (1.0 / s) * predXStart.clamped(-s...s)
+    let s = max(percentile(predXStart), 1)
+    predXStart = (1.0 / s) * predXStart.clamped(-s...s)
     x = Functional.add(
       left: predXStart, right: x, leftScalar: Float(mPosteriorMeanCoef1[i]),
       rightScalar: Float(mPosteriorMeanCoef2[i]))
-    xIn[0..<1, 0..<4, 0..<96, 0..<96] = x
-    xIn[1..<2, 0..<4, 0..<96, 0..<96] = x
     if i > 0 {
       let noise = graph.variable(like: xIn)
       noise.randn()
-      xIn = xIn + Functional.exp(0.5 * modelLogVar) .* noise
+      x = x + Functional.exp(0.5 * modelLogVar) .* noise
     }
   }
-  image = xIn[0..<1, 0..<4, 0..<96, 0..<96].copied()
+  image = x[0..<1, 0..<4, 0..<96, 0..<96].copied()
 }
 print(model.scale)
 debugPrint(image!)
