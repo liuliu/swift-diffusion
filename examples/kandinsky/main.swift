@@ -1288,6 +1288,22 @@ for i in 0..<mNewAlphasCumprod.count {
     (1 - alphasCumProdPrev) * (1 - mNewBetas[i]).squareRoot() / (1 - mNewAlphasCumprod[i]))
 }
 
+func percentile(_ tensor: DynamicGraph.Tensor<Float>) -> Float {
+  let tensor = tensor.toCPU()
+  var value = [Float]()
+  for i in 0..<1 {
+    for j in 0..<4 {
+      for x in 0..<96 {
+        for y in 0..<96 {
+          value.append(abs(tensor[i, j, x, y]))
+        }
+      }
+    }
+  }
+  value = value.sorted()
+  return value[Int(floor((Float(1 * 4 * 96 * 96) * 0.995)))]
+}
+
 var image: DynamicGraph.Tensor<Float>? = nil
 graph.withNoGrad {
   guard let fullEmb1 = fullEmb1, let poolEmb1 = poolEmb1, let imageEmb1 = imageEmb1 else { return }
@@ -1375,27 +1391,33 @@ graph.withNoGrad {
     embGPU = timeEmbed(inputs: timesteps)[0].as(of: Float.self)
     embGPU = embGPU + xfProj.reshaped(.NC(2, 384 * 4))
     let result = unet(inputs: xIn, embGPU, xfOutGPU)[0].as(of: Float.self)
-    /*
-    let modelVar = result[0..<2, 4..<8, 0..<96, 0..<96].copied()
-    let minLog = mPosteriorLogVarianceClipped[i]
-    let maxLog = mNewBetas[i]
+    let modelVar = result[0..<2, 4..<8, 0..<96, 0..<96].copied().clamped(-1...1)
+    let minLog = Float(mPosteriorLogVarianceClipped[i])
+    let maxLog = log(Float(mNewBetas[i]))
     let frac = 0.5 * (modelVar + 1)
     let modelLogVar = frac * maxLog + (1 - frac) * minLog
-    */
     let condEps = result[0..<1, 0..<4, 0..<96, 0..<96].copied()
     let uncondEps = result[1..<2, 0..<4, 0..<96, 0..<96].copied()
-    let eps = uncondEps + 4 * (condEps - uncondEps)
-    let predXStart = Functional.add(
-      left: x, right: eps, leftScalar: Float((1.0 / mNewAlphasCumprod[i]).squareRoot()),
+    let halfEps = uncondEps + 4 * (condEps - uncondEps)
+    x = xIn[0..<1, 0..<4, 0..<96, 0..<96]
+    var predXStart = Functional.add(
+      left: x, right: halfEps, leftScalar: Float((1.0 / mNewAlphasCumprod[i]).squareRoot()),
       rightScalar: -Float((1.0 / mNewAlphasCumprod[i] - 1).squareRoot())
     ).clamped(-2...2)
+    // let s = max(percentile(predXStart), 1)
+    // predXStart = (1.0 / s) * predXStart.clamped(-s...s)
     x = Functional.add(
       left: predXStart, right: x, leftScalar: Float(mPosteriorMeanCoef1[i]),
       rightScalar: Float(mPosteriorMeanCoef2[i]))
     xIn[0..<1, 0..<4, 0..<96, 0..<96] = x
     xIn[1..<2, 0..<4, 0..<96, 0..<96] = x
+    if i > 0 {
+      let noise = graph.variable(like: xIn)
+      noise.randn()
+      xIn = xIn + Functional.exp(0.5 * modelLogVar) .* noise
+    }
   }
-  image = x
+  image = xIn[0..<1, 0..<4, 0..<96, 0..<96].copied()
 }
 print(model.scale)
 debugPrint(image!)
@@ -1460,6 +1482,7 @@ graph.withNoGrad {
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
   try! png.compress(path: "/home/liu/workspace/swift-diffusion/kandinsky.png", level: 4)
 }
+
 /*
 torch.cuda.set_device(0)
 let images = model.generate_text2img(
