@@ -643,7 +643,7 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(1)
   let tokenTypesTensorGPU = tokenTypesTensor.toGPU(1)
   textEncoder.compile(inputs: tokensTensorGPU, positionTensorGPU, tokenTypesTensorGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
     $0.read("embedding", model: textEncoder)
   }
   let embeddings = textEncoder(inputs: tokensTensorGPU, positionTensorGPU, tokenTypesTensorGPU)[0]
@@ -660,7 +660,7 @@ graph.withNoGrad {
   }
   let attentionMaskGPU = attentionMask.toGPU(1)
   layer.compile(inputs: embeddings, attentionMaskGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
     $0.read("roberta", model: layer)
   }
   let textEncoderEmb = layer(inputs: embeddings, attentionMaskGPU)[0].as(of: FloatType.self)
@@ -681,12 +681,19 @@ graph.withNoGrad {
   let poolEmb = weightPoolingMask.toGPU(1) .* (poolingMask.toGPU(1) * textEncoderEmb)
   let linearTransformation = Dense(count: 768)
   linearTransformation.compile(inputs: poolEmb)
-  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
     $0.read("linear_transformation", model: linearTransformation)
   }
   let poolEmbOut = linearTransformation(inputs: poolEmb)[0].as(of: FloatType.self)
   debugPrint(poolEmbOut)
   poolEmb1 = poolEmbOut
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
+    $0.write("embedding", model: textEncoder)
+    $0.write("roberta", model: layer)
+    $0.write("linear_transformation", model: linearTransformation)
+  }
+  */
 
   let tokenizer = CLIPTokenizer(
     vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
@@ -728,7 +735,7 @@ graph.withNoGrad {
     inputs: tokensTensorCLIPGPU, positionTensorCLIPGPU, casualAttentionMaskGPU)[0].as(
       of: FloatType.self
     )
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("text_projection", variable: textProjectionGPU)
   }
   var indexGP = Tensor<Int32>(.CPU, .C(2))
@@ -752,7 +759,7 @@ graph.withNoGrad {
       from: timeEmbedding(timestep: 999, batchSize: 2, embeddingSize: 2048, maxPeriod: 10_000)
         .toGPU(1)))
   timeEmbed.compile(inputs: timesteps)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("time_embed", model: timeEmbed)
     $0.read("clip_img_proj", model: clipImgProj)
     $0.read("text_enc_proj", model: textEncProj)
@@ -767,7 +774,7 @@ graph.withNoGrad {
   dmInputTensorGPU[77..<78, 0..<2048] = textEmbOut[0..<1, 0..<2048]
   dmInputTensorGPU[(81 + 77)..<(81 + 78), 0..<2048] = textEmbOut[1..<2, 0..<2048]
   let prdEmb = graph.variable(.GPU(1), .NC(1, 2048), of: FloatType.self)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("prd_emb", variable: prdEmb)
   }
   dmInputTensorGPU[80..<81, 0..<2048] = prdEmb
@@ -775,7 +782,7 @@ graph.withNoGrad {
   let positionalEmbedding = graph.variable(.GPU(1), .NC(81, 2048), of: FloatType.self)
   let clipStd = graph.variable(.GPU(1), .NC(1, 768), of: FloatType.self)
   let clipMean = graph.variable(.GPU(1), .NC(1, 768), of: FloatType.self)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("positional_embedding", variable: positionalEmbedding)
     $0.read("clip_std", variable: clipStd)
     $0.read("clip_mean", variable: clipMean)
@@ -807,10 +814,25 @@ graph.withNoGrad {
   noiseGPU.randn()
   var x = noiseGPU
   let zeroImgEmbGPU = graph.variable(.GPU(1), .NC(1, 768), of: FloatType.self)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("diffusion_mapping", model: diffusionMapping)
     $0.read("zero_img_emb", variable: zeroImgEmbGPU)
   }
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
+    $0.write("diffusion_mapping", model: diffusionMapping)
+    $0.write("time_embed", model: timeEmbed)
+    $0.write("clip_img_proj", model: clipImgProj)
+    $0.write("text_enc_proj", model: textEncProj)
+    $0.write("text_emb_proj", model: textEmbProj)
+    $0.write("positional_embedding", variable: positionalEmbedding)
+    $0.write("clip_std", variable: clipStd)
+    $0.write("clip_mean", variable: clipMean)
+    $0.write("zero_img_emb", variable: zeroImgEmbGPU)
+    $0.write("text_projection", variable: textProjectionGPU)
+    $0.write("prd_emb", variable: prdEmb)
+  }
+  */
   for (i, timestep) in [0, 250, 500, 749, 999].enumerated().reversed() {
     xIn[0..<1, 0..<768] = x
     xIn[1..<2, 0..<768] = x
@@ -909,7 +931,7 @@ graph.withNoGrad {
   guard let fullEmb1 = fullEmb1, let poolEmb1 = poolEmb1, let imageEmb1 = imageEmb1 else { return }
   let imageAndTextEmbedding = ImageAndTextEmbedding(batchSize: 2)
   imageAndTextEmbedding.compile(inputs: poolEmb1, fullEmb1, imageEmb1)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
     $0.read("image_and_text_embed", model: imageAndTextEmbedding)
   }
   let outputs = imageAndTextEmbedding(inputs: poolEmb1, fullEmb1, imageEmb1).map {
@@ -923,7 +945,7 @@ graph.withNoGrad {
         1)))
   let timeEmbed = timestepEmbedding(prefix: "time_embed", channels: 384 * 4)
   timeEmbed.compile(inputs: timesteps)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
     $0.read("time_embed", model: timeEmbed)
   }
   var embGPU = timeEmbed(inputs: timesteps)[0].as(of: FloatType.self)
@@ -937,9 +959,16 @@ graph.withNoGrad {
   var x = hInputGPU
   var xIn = graph.variable(.GPU(1), .NCHW(2, 4, 96, 96), of: FloatType.self)
   unet.compile(inputs: xIn, embGPU, xfOutGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
     $0.read("unet", model: unet)
   }
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
+    $0.write("unet", model: unet)
+    $0.write("time_embed", model: timeEmbed)
+    $0.write("image_and_text_embed", model: imageAndTextEmbedding)
+  }
+  */
   for (i, timestep) in mTimesteps.enumerated().reversed() {
     let timesteps = graph.variable(
       Tensor<FloatType>(
@@ -983,9 +1012,14 @@ graph.withNoGrad {
     zChannels: 4, channels: 128, channelMult: [1, 2, 2, 4], numResBlocks: 2, startHeight: 96,
     startWidth: 96, attnResolutions: Set([32]))
   movq.compile(inputs: image)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
     $0.read("movq", model: movq)
   }
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
+    $0.write("movq", model: movq)
+  }
+  */
   let result = movq(inputs: image)[0].as(of: FloatType.self).toCPU()
   debugPrint(result)
   let startWidth = 96
