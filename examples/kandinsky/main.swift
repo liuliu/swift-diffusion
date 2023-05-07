@@ -1247,7 +1247,7 @@ print(result)
 */
 
 torch.cuda.set_device(0)
-let hInput = torch.randn([2, 4, 96, 96]).type(torch.float16).cuda()
+let hInput = torch.randn([1, 4, 96, 96]).type(torch.float16).cuda()
 let emb = torch.randn([2, 768 * 2]).type(torch.float).cuda()
 let xfOut = torch.randn([2, 768, 87]).type(torch.float16).cuda()
 
@@ -1388,20 +1388,17 @@ graph.withNoGrad {
         1))
     embGPU = timeEmbed(inputs: timesteps)[0].as(of: Float.self)
     embGPU = embGPU + xfProj.reshaped(.NC(2, 384 * 4))
-    xIn[0..<1, 0..<4, 0..<96, 0..<96] = x[0..<1, 0..<4, 0..<96, 0..<96]
-    xIn[1..<2, 0..<4, 0..<96, 0..<96] = x[0..<1, 0..<4, 0..<96, 0..<96]
+    xIn[0..<1, 0..<4, 0..<96, 0..<96] = x
+    xIn[1..<2, 0..<4, 0..<96, 0..<96] = x
     let result = unet(inputs: xIn, embGPU, xfOutGPU)[0].as(of: Float.self)
-    let modelVar = result[0..<2, 4..<8, 0..<96, 0..<96].copied().clamped(-1...1)
+    let modelVar = result[0..<1, 4..<8, 0..<96, 0..<96].copied().clamped(-1...1)
     let minLog = Float(mPosteriorLogVarianceClipped[i])
     let maxLog = log(Float(mNewBetas[i]))
     let frac = 0.5 * (modelVar + 1)
     let modelLogVar = frac * maxLog + (1 - frac) * minLog
     let condEps = result[0..<1, 0..<4, 0..<96, 0..<96].copied()
     let uncondEps = result[1..<2, 0..<4, 0..<96, 0..<96].copied()
-    let halfEps = uncondEps + 4 * (condEps - uncondEps)
-    var eps = graph.variable(like: xIn)
-    eps[0..<1, 0..<4, 0..<96, 0..<96] = halfEps
-    eps[1..<2, 0..<4, 0..<96, 0..<96] = halfEps
+    let eps = uncondEps + 4 * (condEps - uncondEps)
     var predXStart = Functional.add(
       left: x, right: eps, leftScalar: Float((1.0 / mNewAlphasCumprod[i]).squareRoot()),
       rightScalar: -Float((1.0 / mNewAlphasCumprod[i] - 1).squareRoot())
@@ -1412,12 +1409,12 @@ graph.withNoGrad {
       left: predXStart, right: x, leftScalar: Float(mPosteriorMeanCoef1[i]),
       rightScalar: Float(mPosteriorMeanCoef2[i]))
     if i > 0 {
-      let noise = graph.variable(like: xIn)
+      let noise = graph.variable(like: x)
       noise.randn()
       x = x + Functional.exp(0.5 * modelLogVar) .* noise
     }
   }
-  image = x[0..<1, 0..<4, 0..<96, 0..<96].copied()
+  image = x.copied()
 }
 print(model.scale)
 debugPrint(image!)
