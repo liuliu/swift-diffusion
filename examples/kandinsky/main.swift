@@ -1118,6 +1118,11 @@ graph.withNoGrad {
   let poolEmbOut = linearTransformation(inputs: poolEmb)[0].as(of: Float.self)
   debugPrint(poolEmbOut)
   poolEmb1 = poolEmbOut
+  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f32.ckpt") {
+    $0.write("embedding", model: textEncoder)
+    $0.write("roberta", model: layer)
+    $0.write("linear_transformation", model: linearTransformation)
+  }
 
   let tokenizer = CLIPTokenizer(
     vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
@@ -1249,6 +1254,21 @@ graph.withNoGrad {
   let noiseGPU = graph.variable(try! Tensor<Float>(numpy: noise.type(torch.float).cpu().numpy()))
     .toGPU(1)
   var x = noiseGPU[0..<1, 0..<768]
+  let zeroImgEmb = graph.variable(try! Tensor<Float>(numpy: zeroImgEmb))
+  let zeroImgEmbGPU = zeroImgEmb.toGPU(1)
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f32.ckpt") {
+    $0.write("diffusion_mapping", model: diffusionMapping)
+    $0.write("time_embed", model: timeEmbed)
+    $0.write("clip_img_proj", model: clipImgProj)
+    $0.write("text_enc_proj", model: textEncProj)
+    $0.write("text_emb_proj", model: textEmbProj)
+    $0.write("positional_embedding", variable: positionalEmbedding)
+    $0.write("clip_std", variable: clipStd)
+    $0.write("clip_mean", variable: clipMean)
+    $0.write("zero_img_emb", variable: zeroImgEmb)
+    $0.write("text_projection", variable: textProjectionGPU)
+    $0.write("prd_emb", variable: prdEmb)
+  }
   for (i, timestep) in [0, 250, 500, 749, 999].enumerated().reversed() {
     xIn[0..<1, 0..<768] = x
     xIn[1..<2, 0..<768] = x
@@ -1280,7 +1300,6 @@ graph.withNoGrad {
     }
   }
   let imageEmbGPU = x .* clipStd + clipMean
-  let zeroImgEmbGPU = graph.variable(try! Tensor<Float>(numpy: zeroImgEmb)).toGPU(1)
   var imageEmb = graph.variable(.GPU(1), .NC(2, 768), of: Float.self)
   imageEmb[0..<1, 0..<768] = imageEmbGPU
   imageEmb[1..<2, 0..<768] = zeroImgEmbGPU
@@ -1390,6 +1409,11 @@ graph.withNoGrad {
   var xIn = graph.variable(.GPU(1), .NCHW(2, 4, 96, 96), of: Float.self)
   unet.compile(inputs: xIn, embGPU, xfOutGPU)
   reader(model_state_dict)
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f32.ckpt") {
+    $0.write("unet", model: unet)
+    $0.write("time_embed", model: timeEmbed)
+    $0.write("image_and_text_embed", model: imageAndTextEmbedding)
+  }
   for (i, timestep) in mTimesteps.enumerated().reversed() {
     let timesteps = graph.variable(
       timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000).toGPU(
@@ -1466,6 +1490,9 @@ graph.withNoGrad {
   */
   movq.compile(inputs: image)
   reader(movq_state_dict)
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f32.ckpt") {
+    $0.write("movq", model: movq)
+  }
   let result = movq(inputs: image)[0].as(of: Float.self).toCPU()
   debugPrint(result)
   let startWidth = 96

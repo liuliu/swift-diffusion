@@ -276,3 +276,18 @@ swift_binary(
         "@s4nnc//nnc:nnc_python",
     ],
 )
+
+swift_binary(
+    name = "kandinsky2",
+    srcs = ["kandinsky2/main.swift"],
+    data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+    ],
+    deps = [
+        "//:diffusion",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+    ],
+)
