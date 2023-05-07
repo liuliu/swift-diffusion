@@ -660,6 +660,54 @@ func OutputBlocks(
   return (reader, out)
 }
 
+func ImageAndTextEmbedding(batchSize: Int) -> ((PythonObject) -> Void, Model) {
+  let imageEmb = Input()
+  let poolEmb = Input()
+  let fullEmb = Input()
+  let clipToSeq = Dense(count: 10 * 768)
+  let projN = Dense(count: 384 * 4)
+  let lnModelN = LayerNorm(epsilon: 1e-5, axis: [2])
+  let imgLayer = Dense(count: 384 * 4)
+  let toModelDimN = Dense(count: 768)
+  let clipSeq = clipToSeq(imageEmb).reshaped([batchSize, 10, 768])
+  let xfProj = lnModelN(projN(poolEmb)) + imgLayer(imageEmb)
+  let textEmb = toModelDimN(fullEmb)
+  let xfOut = Functional.concat(axis: 1, clipSeq, textEmb)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let clip_to_seq_weight = state_dict["clip_to_seq.weight"].type(torch.float).cpu()
+      .numpy()
+    clipToSeq.weight.copy(from: try! Tensor<Float>(numpy: clip_to_seq_weight))
+    let clip_to_seq_bias = state_dict["clip_to_seq.bias"].type(torch.float).cpu()
+      .numpy()
+    clipToSeq.bias.copy(from: try! Tensor<Float>(numpy: clip_to_seq_bias))
+    let proj_n_weight = state_dict["proj_n.weight"].type(torch.float).cpu()
+      .numpy()
+    projN.weight.copy(from: try! Tensor<Float>(numpy: proj_n_weight))
+    let proj_n_bias = state_dict["proj_n.bias"].type(torch.float).cpu()
+      .numpy()
+    projN.bias.copy(from: try! Tensor<Float>(numpy: proj_n_bias))
+    let ln_model_n_weight = state_dict["ln_model_n.weight"].type(torch.float).cpu()
+      .numpy()
+    lnModelN.weight.copy(from: try! Tensor<Float>(numpy: ln_model_n_weight))
+    let ln_model_n_bias = state_dict["ln_model_n.bias"].type(torch.float).cpu()
+      .numpy()
+    lnModelN.bias.copy(from: try! Tensor<Float>(numpy: ln_model_n_bias))
+    let img_layer_weight = state_dict["img_layer.weight"].type(torch.float).cpu()
+      .numpy()
+    imgLayer.weight.copy(from: try! Tensor<Float>(numpy: img_layer_weight))
+    let img_layer_bias = state_dict["img_layer.bias"].type(torch.float).cpu()
+      .numpy()
+    imgLayer.bias.copy(from: try! Tensor<Float>(numpy: img_layer_bias))
+    let to_model_dim_n_weight = state_dict["to_model_dim_n.weight"].type(torch.float).cpu()
+      .numpy()
+    toModelDimN.weight.copy(from: try! Tensor<Float>(numpy: to_model_dim_n_weight))
+    let to_model_dim_n_bias = state_dict["to_model_dim_n.bias"].type(torch.float).cpu()
+      .numpy()
+    toModelDimN.bias.copy(from: try! Tensor<Float>(numpy: to_model_dim_n_bias))
+  }
+  return (reader, Model([poolEmb, fullEmb, imageEmb], [xfProj, xfOut]))
+}
+
 func UNet(
   batchSize: Int, channels: Int, outChannels: Int, channelMult: [Int], numResBlocks: Int,
   numHeadChannels: Int, t: Int, startHeight: Int, startWidth: Int, attentionResolutions: Set<Int>
@@ -1307,54 +1355,14 @@ func percentile(_ tensor: DynamicGraph.Tensor<Float>) -> Float {
 var image: DynamicGraph.Tensor<Float>? = nil
 graph.withNoGrad {
   guard let fullEmb1 = fullEmb1, let poolEmb1 = poolEmb1, let imageEmb1 = imageEmb1 else { return }
-  let clipToSeq = Dense(count: 10 * 768)
-  let projN = Dense(count: 384 * 4)
-  let lnModelN = LayerNorm(epsilon: 1e-5, axis: [2])
-  let imgLayer = Dense(count: 384 * 4)
-  let toModelDimN = Dense(count: 768)
-  clipToSeq.compile(inputs: imageEmb1)
-  let clip_to_seq_weight = model_state_dict["clip_to_seq.weight"].type(torch.float).cpu()
-    .numpy()
-  clipToSeq.weight.copy(from: try! Tensor<Float>(numpy: clip_to_seq_weight))
-  let clip_to_seq_bias = model_state_dict["clip_to_seq.bias"].type(torch.float).cpu()
-    .numpy()
-  clipToSeq.bias.copy(from: try! Tensor<Float>(numpy: clip_to_seq_bias))
-  let clipSeq = clipToSeq(inputs: imageEmb1)[0].as(of: Float.self).reshaped(.CHW(2, 10, 768))
-  projN.compile(inputs: poolEmb1)
-  let proj_n_weight = model_state_dict["proj_n.weight"].type(torch.float).cpu()
-    .numpy()
-  projN.weight.copy(from: try! Tensor<Float>(numpy: proj_n_weight))
-  let proj_n_bias = model_state_dict["proj_n.bias"].type(torch.float).cpu()
-    .numpy()
-  projN.bias.copy(from: try! Tensor<Float>(numpy: proj_n_bias))
-  var xfProj = projN(inputs: poolEmb1)[0].as(of: Float.self)
-  lnModelN.compile(inputs: xfProj)
-  let ln_model_n_weight = model_state_dict["ln_model_n.weight"].type(torch.float).cpu()
-    .numpy()
-  lnModelN.weight.copy(from: try! Tensor<Float>(numpy: ln_model_n_weight))
-  let ln_model_n_bias = model_state_dict["ln_model_n.bias"].type(torch.float).cpu()
-    .numpy()
-  lnModelN.bias.copy(from: try! Tensor<Float>(numpy: ln_model_n_bias))
-  xfProj = lnModelN(inputs: xfProj)[0].as(of: Float.self)
-  imgLayer.compile(inputs: imageEmb1)
-  let img_layer_weight = model_state_dict["img_layer.weight"].type(torch.float).cpu()
-    .numpy()
-  imgLayer.weight.copy(from: try! Tensor<Float>(numpy: img_layer_weight))
-  let img_layer_bias = model_state_dict["img_layer.bias"].type(torch.float).cpu()
-    .numpy()
-  imgLayer.bias.copy(from: try! Tensor<Float>(numpy: img_layer_bias))
-  xfProj = xfProj + imgLayer(inputs: imageEmb1)[0].as(of: Float.self)
-  toModelDimN.compile(inputs: fullEmb1)
-  let to_model_dim_n_weight = model_state_dict["to_model_dim_n.weight"].type(torch.float).cpu()
-    .numpy()
-  toModelDimN.weight.copy(from: try! Tensor<Float>(numpy: to_model_dim_n_weight))
-  let to_model_dim_n_bias = model_state_dict["to_model_dim_n.bias"].type(torch.float).cpu()
-    .numpy()
-  toModelDimN.bias.copy(from: try! Tensor<Float>(numpy: to_model_dim_n_bias))
-  let dimNFullEmb = toModelDimN(inputs: fullEmb1)[0].as(of: Float.self)
-  var xfOutGPU = graph.variable(.GPU(1), .CHW(2, 87, 768), of: Float.self)
-  xfOutGPU[0..<2, 0..<10, 0..<768] = clipSeq
-  xfOutGPU[0..<2, 10..<87, 0..<768] = dimNFullEmb
+  let (imageAndTextEmbeddingReader, imageAndTextEmbedding) = ImageAndTextEmbedding(batchSize: 2)
+  imageAndTextEmbedding.compile(inputs: poolEmb1, fullEmb1, imageEmb1)
+  imageAndTextEmbeddingReader(model_state_dict)
+  let outputs = imageAndTextEmbedding(inputs: poolEmb1, fullEmb1, imageEmb1).map {
+    $0.as(of: Float.self)
+  }
+  let xfProj = outputs[0]
+  let xfOutGPU = outputs[1]
   debugPrint(xfOutGPU)
   let timesteps = graph.variable(
     timeEmbedding(timestep: 999, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000).toGPU(1))
@@ -1414,7 +1422,7 @@ graph.withNoGrad {
       x = x + Functional.exp(0.5 * modelLogVar) .* noise
     }
   }
-  image = x.copied()
+  image = x
 }
 print(model.scale)
 debugPrint(image!)
