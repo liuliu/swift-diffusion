@@ -922,7 +922,7 @@ graph.withNoGrad {
     }
   }
   for i in 0..<81 {
-    for j in 8..<77 {
+    for j in tokenLength..<77 {
       dmCasualAttentionMask[0, 0, i, j] = -FloatType.greatestFiniteMagnitude
     }
     for j in 2..<77 {
@@ -989,7 +989,8 @@ graph.withNoGrad {
   }
   let imageEmbGPU = x .* clipStd + clipMean
   var imageEmb = graph.variable(.GPU(1), .NC(2, 768), of: FloatType.self)
-  imageEmb[0..<1, 0..<768] = imageEmbGPU
+  imageEmb[0..<1, 0..<768] = Functional.add(
+    left: zeroImgEmbGPU, right: imageEmbGPU, leftScalar: 1, rightScalar: 0)
   imageEmb[1..<2, 0..<768] = zeroImgEmbGPU
   imageEmb1 = imageEmb.reshaped(.CHW(2, 1, 768))
 }
@@ -1108,7 +1109,7 @@ graph.withNoGrad {
     let modelLogVar = frac * maxLog + (1 - frac) * minLog
     let condEps = result[0..<1, 0..<4, 0..<96, 0..<96].copied()
     let uncondEps = result[1..<2, 0..<4, 0..<96, 0..<96].copied()
-    let eps = uncondEps + 4 * (condEps - uncondEps)
+    let eps = uncondEps + 10 * (condEps - uncondEps)
     var predXStart = Functional.add(
       left: x, right: eps, leftScalar: Float((1.0 / mNewAlphasCumprod[i]).squareRoot()),
       rightScalar: -Float((1.0 / mNewAlphasCumprod[i] - 1).squareRoot())
