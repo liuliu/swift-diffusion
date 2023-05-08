@@ -2,6 +2,7 @@ import Diffusion
 import Foundation
 import NNC
 import PNG
+import SentencePiece
 
 typealias FloatType = Float16
 
@@ -59,7 +60,9 @@ extension CLIPDiffusionModel {
   }
 }
 
-let prompt = "red cat, 4k photo"
+let prompt =
+  CommandLine.arguments.count > 1
+  ? CommandLine.arguments.suffix(from: 1).joined(separator: " ") : ""
 
 func XLMRobertaTextEmbedding(
   prefix: String, vocabularySize: Int, maxLength: Int, tokenTypes: Int, embeddingSize: Int
@@ -726,17 +729,17 @@ graph.withNoGrad {
     prefix: "model.transformer.embeddings", vocabularySize: 250_002, maxLength: 514, tokenTypes: 1,
     embeddingSize: 1_024)
   let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
+  let sentencePiece = SentencePiece(
+    file: "/home/liu/workspace/swift-diffusion/examples/kandinsky2/sentencepiece.bpe.model")
+  let ids = sentencePiece.encode(prompt)
   for i in 0..<154 {
     tokensTensor[i] = 1
   }
   tokensTensor[0] = 0
-  tokensTensor[1] = 4842
-  tokensTensor[2] = 7515
-  tokensTensor[3] = 4
-  tokensTensor[4] = 201
-  tokensTensor[5] = 92
-  tokensTensor[6] = 16186
-  tokensTensor[7] = 2
+  for i in 0..<ids.count {
+    tokensTensor[i + 1] = Int32(ids[i] + 1)
+  }
+  tokensTensor[ids.count + 1] = 2
   tokensTensor[77] = 0
   tokensTensor[78] = 2
   let tokenTypesTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
@@ -745,7 +748,7 @@ graph.withNoGrad {
     tokenTypesTensor[i] = 0
     positionTensor[i] = 1
   }
-  for i in 0..<8 {
+  for i in 0..<ids.count + 2 {
     positionTensor[i] = Int32(i + 2)
   }
   positionTensor[77] = 2
@@ -763,7 +766,7 @@ graph.withNoGrad {
   let layer = XLMRobertaModel(numberOfLayers: 24, k: 64, h: 16, b: 2, t: 77)
   let attentionMask = graph.variable(.CPU, .NCHW(2, 1, 1, 77), of: FloatType.self)
   attentionMask.full(0)
-  for i in 8..<77 {
+  for i in (ids.count + 2)..<77 {
     attentionMask[0, 0, 0, i] = -FloatType.greatestFiniteMagnitude
   }
   for i in 2..<77 {
@@ -781,10 +784,10 @@ graph.withNoGrad {
   let poolingMask = graph.variable(.CPU, .CHW(2, 1, 77), of: FloatType.self)
   let weightPoolingMask = graph.variable(.CPU, .CHW(2, 1, 1), of: FloatType.self)
   poolingMask.full(0)
-  for i in 0..<8 {
+  for i in 0..<(ids.count + 2) {
     poolingMask[0, 0, i] = 1
   }
-  weightPoolingMask[0, 0, 0] = 1 / 8
+  weightPoolingMask[0, 0, 0] = FloatType(1 / Float(ids.count + 2))
   for i in 0..<2 {
     poolingMask[1, 0, i] = 1
   }
@@ -811,6 +814,13 @@ graph.withNoGrad {
 
   let unconditionalTokens = tokenizer.tokenize(text: "", truncation: true, maxLength: 77)
   let tokens = tokenizer.tokenize(text: prompt, truncation: true, maxLength: 77)
+  var tokenLength = 0
+  for i in 0..<tokens.count {
+    if tokens[i] == tokenizer.endToken {
+      tokenLength = i + 1
+      break
+    }
+  }
 
   let textModel = CLIPTextModel(
     FloatType.self,
@@ -821,7 +831,7 @@ graph.withNoGrad {
   let positionTensorCLIP = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
   for i in 0..<77 {
     // Kandinsky implementation error, need to replicate that.
-    tokensTensorCLIP[i] = i >= 8 ? 0 : tokens[i]
+    tokensTensorCLIP[i] = i >= tokenLength ? 0 : tokens[i]
     tokensTensorCLIP[i + 77] = i >= 2 ? 0 : unconditionalTokens[i]
     positionTensorCLIP[i] = Int32(i)
     positionTensorCLIP[i + 77] = Int32(i)
@@ -850,7 +860,7 @@ graph.withNoGrad {
     $0.read("text_projection", variable: textProjectionGPU)
   }
   var indexGP = Tensor<Int32>(.CPU, .C(2))
-  indexGP[0] = 7
+  indexGP[0] = Int32(tokenLength) - 1
   indexGP[1] = 78
   let textEmb =
     Functional.indexSelect(

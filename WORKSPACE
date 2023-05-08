@@ -44,6 +44,17 @@ load("@swift-fickling//:deps.bzl", "swift_fickling_deps")
 
 swift_fickling_deps()
 
+git_repository(
+    name = "swift-sentencepiece",
+    commit = "099d71c5a7899d5cb41f78815f97bbbf30fc16e9",
+    remote = "https://github.com/liuliu/swift-sentencepiece.git",
+    shallow_since = "1683576388 -0400",
+)
+
+load("@swift-sentencepiece//:deps.bzl", "swift_sentencepiece_deps")
+
+swift_sentencepiece_deps()
+
 new_git_repository(
     name = "SwiftPNG",
     build_file = "swift-png.BUILD",

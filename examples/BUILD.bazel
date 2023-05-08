@@ -283,11 +283,13 @@ swift_binary(
     data = [
         "clip/merges.txt",
         "clip/vocab.json",
+        "kandinsky2/sentencepiece.bpe.model",
     ],
     deps = [
         "//:diffusion",
         "@SwiftNumerics//:Numerics",
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
+        "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )

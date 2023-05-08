@@ -11,9 +11,9 @@ public struct CLIPTokenizer {
   }
   let vocabulary: [String: Int32]
   let bpeRanks: [Pair: Int]
-  let unknownToken: Int32
-  let startToken: Int32
-  let endToken: Int32
+  public let unknownToken: Int32
+  public let startToken: Int32
+  public let endToken: Int32
   public init(vocabulary: String, merges: String) {
     let vocabJSONData = try! Data(contentsOf: URL(fileURLWithPath: vocabulary))
     let decoder = JSONDecoder()
