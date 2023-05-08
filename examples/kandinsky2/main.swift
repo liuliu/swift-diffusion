@@ -441,6 +441,117 @@ func UNet(
   return Model([x, emb, xfOut], [out])
 }
 
+func ResnetBlock(prefix: String, inChannels: Int, outChannels: Int) -> Model {
+  let x = Input()
+  let norm1 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  var out = norm1(x).swish()
+  let conv1 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = conv1(out)
+  let norm2 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  out = norm2(out).swish()
+  let conv2 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = conv2(out)
+  if inChannels != outChannels {
+    let shortcut = Convolution(groups: 1, filters: outChannels, filterSize: [1, 1])
+    out = shortcut(x) + out
+  } else {
+    out = x + out
+  }
+  return Model([x], [out])
+}
+
+func AttnBlock(
+  prefix: String, inChannels: Int, batchSize: Int, height: Int, width: Int
+) -> Model {
+  let x = Input()
+  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  var out = norm(x)
+  let hw = width * height
+  let tokeys = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let k = tokeys(out).reshaped([batchSize, inChannels, hw])
+  let toqueries = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
+    batchSize, inChannels, hw,
+  ])
+  var dot = Matmul(transposeA: (1, 2))(q, k)
+  dot = dot.reshaped([batchSize * hw, hw])
+  dot = dot.softmax()
+  dot = dot.reshaped([batchSize, hw, hw])
+  let tovalues = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  let v = tovalues(out).reshaped([batchSize, inChannels, hw])
+  out = Matmul(transposeB: (1, 2))(v, dot)
+  let projOut = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  out = x + projOut(out.reshaped([batchSize, inChannels, height, width]))
+  return Model([x], [out])
+}
+
+func Encoder(
+  zChannels: Int, channels: Int, channelMult: [Int], numResBlocks: Int, startHeight: Int,
+  startWidth: Int, attnResolutions: Set<Int>
+) -> Model {
+  let x = Input()
+  let convIn = Convolution(
+    groups: 1, filters: channels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  var out = convIn(x)
+  var lastCh = channels
+  var currentRes = 256
+  var height = startHeight
+  var width = startWidth
+  for (i, mult) in channelMult.enumerated() {
+    let ch = channels * mult
+    for j in 0..<numResBlocks {
+      let resnetBlock = ResnetBlock(
+        prefix: "encoder.down.\(i).block.\(j)", inChannels: lastCh, outChannels: ch)
+      out = resnetBlock(out)
+      lastCh = ch
+      if attnResolutions.contains(currentRes) {
+        let attnBlock = AttnBlock(
+          prefix: "encoder.down.\(i).attn.\(j)", inChannels: ch, batchSize: 1, height: height,
+          width: width)
+        out = attnBlock(out)
+      }
+    }
+    if i != channelMult.count - 1 {
+      currentRes /= 2
+      height /= 2
+      width /= 2
+      let conv2d = Convolution(
+        groups: 1, filters: ch, filterSize: [3, 3],
+        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [2, 2], end: [1, 1])))
+      out = conv2d(out).reshaped(
+        [1, ch, height, width], offset: [0, 0, 1, 1],
+        strides: [ch * (height + 1) * (width + 1), (height + 1) * (width + 1), width + 1, 1])
+    }
+  }
+  let midResnetBlock1 = ResnetBlock(
+    prefix: "encoder.mid.block_1", inChannels: lastCh, outChannels: lastCh)
+  out = midResnetBlock1(out)
+  let midAttnBlock1 = AttnBlock(
+    prefix: "encoder.mid.attn_1", inChannels: lastCh, batchSize: 1, height: height, width: width)
+  out = midAttnBlock1(out)
+  let midResnetBlock2 = ResnetBlock(
+    prefix: "encoder.mid.block_2", inChannels: lastCh, outChannels: lastCh)
+  out = midResnetBlock2(out)
+  let normOut = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  out = normOut(out).swish()
+  let convOut = Convolution(
+    groups: 1, filters: zChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  out = convOut(out)
+  let quantConv = Convolution(groups: 1, filters: zChannels, filterSize: [1, 1])
+  out = quantConv(out)
+  return Model([x], [out])
+}
+
 func SpatialNorm(prefix: String, channels: Int, heightScale: Float, widthScale: Float) -> Model {
   let x = Input()
   let zq = Input()
@@ -453,7 +564,7 @@ func SpatialNorm(prefix: String, channels: Int, heightScale: Float, widthScale: 
   return Model([x, zq], [out])
 }
 
-func ResnetBlock(prefix: String, inChannels: Int, outChannels: Int, scale: Float) -> Model {
+func MOVQResnetBlock(prefix: String, inChannels: Int, outChannels: Int, scale: Float) -> Model {
   let x = Input()
   let zq = Input()
   let norm1 = SpatialNorm(
@@ -479,7 +590,7 @@ func ResnetBlock(prefix: String, inChannels: Int, outChannels: Int, scale: Float
   return Model([x, zq], [out])
 }
 
-func AttnBlock(
+func MOVQAttnBlock(
   prefix: String, inChannels: Int, batchSize: Int, height: Int, width: Int, scale: Float
 ) -> Model {
   let x = Input()
@@ -522,14 +633,14 @@ func MOVQDecoder(
     groups: 1, filters: blockIn, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   var out = convIn(z)
-  let midBlock1 = ResnetBlock(
+  let midBlock1 = MOVQResnetBlock(
     prefix: "decoder.mid.block_1", inChannels: blockIn, outChannels: blockIn, scale: 1)
   out = midBlock1(out, x)
-  let midAttn1 = AttnBlock(
+  let midAttn1 = MOVQAttnBlock(
     prefix: "decoder.mid.attn_1", inChannels: blockIn, batchSize: 1, height: startHeight,
     width: startWidth, scale: 1)
   out = midAttn1(out, x)
-  let midBlock2 = ResnetBlock(
+  let midBlock2 = MOVQResnetBlock(
     prefix: "decoder.mid.block_2", inChannels: blockIn, outChannels: blockIn, scale: 1)
   out = midBlock2(out, x)
   var ds = 1
@@ -539,13 +650,13 @@ func MOVQDecoder(
   for (i, mult) in channelMult.enumerated().reversed() {
     let blockOut = channels * mult
     for j in 0..<(numResBlocks + 1) {
-      let resnetBlock = ResnetBlock(
+      let resnetBlock = MOVQResnetBlock(
         prefix: "decoder.up.\(i).block.\(j)", inChannels: blockIn, outChannels: blockOut,
         scale: Float(ds))
       out = resnetBlock(out, x)
       blockIn = blockOut
       if attnResolutions.contains(currentRes) {
-        let attn = AttnBlock(
+        let attn = MOVQAttnBlock(
           prefix: "decoder.up.\(i).attn.\(j)", inChannels: blockIn, batchSize: 1, height: height,
           width: width, scale: Float(ds))
         out = attn(out, x)
@@ -1015,12 +1126,24 @@ graph.withNoGrad {
   graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
     $0.read("movq", model: movq)
   }
+  var result = movq(inputs: image)[0].as(of: FloatType.self)
+  let encoder = Encoder(
+    zChannels: 4, channels: 128, channelMult: [1, 2, 2, 4], numResBlocks: 2, startHeight: 768,
+    startWidth: 768, attnResolutions: Set([32]))
+  encoder.compile(inputs: result)
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
+    $0.read("encoder", model: encoder)
+  }
+  let encodedImage = encoder(inputs: result)[0].as(of: FloatType.self)
+  debugPrint(image)
+  debugPrint(encodedImage)
+  result = result.toCPU()
   /*
   graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
     $0.write("movq", model: movq)
+    $0.write("encoder", model: encoder)
   }
   */
-  let result = movq(inputs: image)[0].as(of: FloatType.self).toCPU()
   debugPrint(result)
   let startWidth = 96
   let startHeight = 96
