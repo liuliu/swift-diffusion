@@ -219,7 +219,7 @@ func ResBlock(
 ) -> Model {
   let x = Input()
   let emb = Input()
-  let norm1 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  let norm1 = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
   var out = norm1(x).swish()
   var xhd: Model.IO = x
   if up {
@@ -235,23 +235,23 @@ func ResBlock(
   }
   let conv1 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   out = conv1(out)
   let embLayer = Dense(count: 2 * outChannels)
   let embOut = embLayer(emb.swish())
   let embScale = embOut.reshaped(
-    [batchSize, outChannels, 1, 1], offset: [0, 0, 0, 0], strides: [outChannels * 2, 1, 1, 1])
+    [batchSize, 1, 1, outChannels], offset: [0, 0, 0, 0], strides: [outChannels * 2, outChannels * 2, outChannels * 2, 1])
   let embShift = embOut.reshaped(
-    [batchSize, outChannels, 1, 1], offset: [0, outChannels, 0, 0],
-    strides: [outChannels * 2, 1, 1, 1])
-  let norm2 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+    [batchSize, 1, 1, outChannels], offset: [0, 0, 0, outChannels],
+    strides: [outChannels * 2, outChannels * 2, outChannels * 2, 1])
+  let norm2 = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
   out = norm2(out) .* (1 + embScale) + embShift
   let conv2 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   out = conv2(out.swish())
   if skipConnection {
-    let conv = Convolution(groups: 1, filters: outChannels, filterSize: [1, 1])
+    let conv = Convolution(groups: 1, filters: outChannels, filterSize: [1, 1], format: .OIHW)
     xhd = conv(xhd)
   }
   out = xhd + out
@@ -264,27 +264,39 @@ func AttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int, height: Int,
   let hw = height * width
   let x = Input()
   let encoderOut = Input()
-  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
-  var out = norm(x).reshaped([b, k * h, hw]).transposed(1, 2)
+  let norm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
+  var out = norm(x)
   let toencoderkeys = Dense(count: k * h)
   let toencodervalues = Dense(count: k * h)
   let encoderIn = encoderOut
-  let encoderkeys = toencoderkeys(encoderIn).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
-  let encodervalues = toencodervalues(encoderIn).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  let encoderkeys = toencoderkeys(encoderIn).reshaped([b, t, h, k]).transposed(1, 2)
+  let encodervalues = toencodervalues(encoderIn).reshaped([b, t, h, k]).transposed(1, 2)
   let tokeys = Dense(count: k * h)
   let toqueries = Dense(count: k * h)
   let tovalues = Dense(count: k * h)
-  let keys = tokeys(out).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  var keys = tokeys(out).reshaped([b, hw, h, k]).transposed(1, 2)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(out)).reshaped([b, hw, h, k])
-    .permuted(0, 2, 1, 3)
-  let values = tovalues(out).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
-  var dot = Matmul(transposeB: (2, 3))(queries, Functional.concat(axis: 2, encoderkeys, keys))
-  dot = dot.reshaped([b * h * hw, t + hw])
-  dot = dot.softmax()
-  dot = dot.reshaped([b, h, hw, t + hw])
-  out = dot * Functional.concat(axis: 2, encodervalues, values)
-  out = out.reshaped([b, h, hw, k]).transposed(2, 3).reshaped([b, k * h, height, width])
-  let projOut = Convolution(groups: 1, filters: k * h, filterSize: [1, 1])
+    .transposed(1, 2)
+  var values = tovalues(out).reshaped([b, hw, h, k]).transposed(1, 2)
+  keys = Functional.concat(axis: 2, encoderkeys, keys)
+  values = Functional.concat(axis: 2, encodervalues, values)
+  var outs = [Model.IO]()
+  for i in 0..<(b * h) {
+    let key = keys.reshaped([1, (hw + t), k], offset: [i, 0, 0], strides: [(hw + t) * k, k, 1])
+    let query = queries.reshaped([1, hw, k], offset: [i, 0, 0], strides: [hw * k, k, 1])
+    let value = values.reshaped([1, (hw + t), k], offset: [i, 0, 0], strides: [(hw + t) * k, k, 1])
+    var dot = Matmul(transposeB: (1, 2))(query, key)
+    if let last = outs.last {
+      dot.add(dependencies: [last])
+    }
+    dot = dot.reshaped([hw, t + hw])
+    dot = dot.softmax()
+    dot = dot.reshaped([1, hw, t + hw])
+    outs.append(dot * value)
+  }
+  out = Concat(axis: 0)(outs)
+  out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, height, width, k * h])
+  let projOut = Convolution(groups: 1, filters: k * h, filterSize: [1, 1], format: .OIHW)
   out = projOut(out) + x
   return Model([x, encoderOut], [out])
 }
@@ -296,7 +308,7 @@ func InputBlocks(
 ) -> (Model.IO, [Model.IO]) {
   let convIn = Convolution(
     groups: 1, filters: channels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   var out = convIn(x)
   var i = 1
   var lastCh = channels
@@ -355,7 +367,7 @@ func OutputBlocks(
   for (level, mult) in channelMult.enumerated().reversed() {
     let ch = channels * mult
     for j in 0..<(numResBlocks + 1) {
-      out = Functional.concat(axis: 1, out, hs[hs.count - 1 - i])
+      out = Functional.concat(axis: 3, out, hs[hs.count - 1 - i])
       let resBlock = ResBlock(
         prefix: "\(prefix).\(i).0", batchSize: batchSize, outChannels: ch, up: false, down: false,
         skipConnection: true)
@@ -435,31 +447,31 @@ func UNet(
     startWidth: startWidth, attentionResolutions: attentionResolutions, x: out, emb: emb,
     xfOut: xfOut, hs: hs)
   out = outputBlocksOut
-  let normOut = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
+  let normOut = GroupNorm(axis: 3, groups: 32, epsilon: 1e-5, reduce: [1, 2])
   out = normOut(out).swish()
   let convOut = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   out = convOut(out)
   return Model([x, emb, xfOut], [out])
 }
 
 func ResnetBlock(prefix: String, inChannels: Int, outChannels: Int) -> Model {
   let x = Input()
-  let norm1 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  let norm1 = GroupNorm(axis: 3, groups: 32, epsilon: 1e-6, reduce: [1, 2])
   var out = norm1(x).swish()
   let conv1 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   out = conv1(out)
-  let norm2 = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  let norm2 = GroupNorm(axis: 3, groups: 32, epsilon: 1e-6, reduce: [1, 2])
   out = norm2(out).swish()
   let conv2 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   out = conv2(out)
   if inChannels != outChannels {
-    let shortcut = Convolution(groups: 1, filters: outChannels, filterSize: [1, 1])
+    let shortcut = Convolution(groups: 1, filters: outChannels, filterSize: [1, 1], format: .OIHW)
     out = shortcut(x) + out
   } else {
     out = x + out
@@ -471,28 +483,28 @@ func AttnBlock(
   prefix: String, inChannels: Int, batchSize: Int, height: Int, width: Int
 ) -> Model {
   let x = Input()
-  let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  let norm = GroupNorm(axis: 3, groups: 32, epsilon: 1e-6, reduce: [1, 2])
   var out = norm(x)
   let hw = width * height
   let tokeys = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  let k = tokeys(out).reshaped([batchSize, inChannels, hw])
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]), format: .OIHW)
+  let k = tokeys(out).reshaped([batchSize, hw, inChannels])
   let toqueries = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]), format: .OIHW)
   let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
-    batchSize, inChannels, hw,
+    batchSize, hw, inChannels,
   ])
-  var dot = Matmul(transposeA: (1, 2))(q, k)
+  var dot = Matmul(transposeB: (1, 2))(q, k)
   dot = dot.reshaped([batchSize * hw, hw])
   dot = dot.softmax()
   dot = dot.reshaped([batchSize, hw, hw])
   let tovalues = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  let v = tovalues(out).reshaped([batchSize, inChannels, hw])
-  out = Matmul(transposeB: (1, 2))(v, dot)
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]), format: .OIHW)
+  let v = tovalues(out).reshaped([batchSize, hw, inChannels])
+  out = dot * v
   let projOut = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  out = x + projOut(out.reshaped([batchSize, inChannels, height, width]))
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]), format: .OIHW)
+  out = x + projOut(out.reshaped([batchSize, height, width, inChannels]))
   return Model([x], [out])
 }
 
@@ -503,7 +515,7 @@ func Encoder(
   let x = Input()
   let convIn = Convolution(
     groups: 1, filters: channels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   var out = convIn(x)
   var lastCh = channels
   var currentRes = 256
@@ -529,10 +541,10 @@ func Encoder(
       width /= 2
       let conv2d = Convolution(
         groups: 1, filters: ch, filterSize: [3, 3],
-        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [2, 2], end: [1, 1])))
+        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [2, 2], end: [1, 1])), format: .OIHW)
       out = conv2d(out).reshaped(
-        [1, ch, height, width], offset: [0, 0, 1, 1],
-        strides: [ch * (height + 1) * (width + 1), (height + 1) * (width + 1), width + 1, 1])
+        [1, height, width, ch], offset: [0, 1, 1, 0],
+        strides: [(height + 1) * (width + 1) * ch, (width + 1) * ch, ch, 1])
     }
   }
   let midResnetBlock1 = ResnetBlock(
@@ -544,13 +556,13 @@ func Encoder(
   let midResnetBlock2 = ResnetBlock(
     prefix: "encoder.mid.block_2", inChannels: lastCh, outChannels: lastCh)
   out = midResnetBlock2(out)
-  let normOut = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  let normOut = GroupNorm(axis: 3, groups: 32, epsilon: 1e-6, reduce: [1, 2])
   out = normOut(out).swish()
   let convOut = Convolution(
     groups: 1, filters: zChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   out = convOut(out)
-  let quantConv = Convolution(groups: 1, filters: zChannels, filterSize: [1, 1])
+  let quantConv = Convolution(groups: 1, filters: zChannels, filterSize: [1, 1], format: .OIHW)
   out = quantConv(out)
   return Model([x], [out])
 }
@@ -558,11 +570,11 @@ func Encoder(
 func SpatialNorm(prefix: String, channels: Int, heightScale: Float, widthScale: Float) -> Model {
   let x = Input()
   let zq = Input()
-  let normLayer = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
+  let normLayer = GroupNorm(axis: 3, groups: 32, epsilon: 1e-6, reduce: [1, 2])
   var out = normLayer(x)
   let zqOut = Upsample(.nearest, widthScale: widthScale, heightScale: heightScale)(zq)
-  let convY = Convolution(groups: 1, filters: channels, filterSize: [1, 1])
-  let convB = Convolution(groups: 1, filters: channels, filterSize: [1, 1])
+  let convY = Convolution(groups: 1, filters: channels, filterSize: [1, 1], format: .OIHW)
+  let convB = Convolution(groups: 1, filters: channels, filterSize: [1, 1], format: .OIHW)
   out = out .* convY(zqOut) + convB(zqOut)
   return Model([x, zq], [out])
 }
@@ -575,17 +587,17 @@ func MOVQResnetBlock(prefix: String, inChannels: Int, outChannels: Int, scale: F
   var out = norm1(x, zq).swish()
   let conv1 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   out = conv1(out)
   let norm2 = SpatialNorm(
     prefix: "\(prefix).norm2", channels: outChannels, heightScale: scale, widthScale: scale)
   out = norm2(out, zq).swish()
   let conv2 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   out = conv2(out)
   if inChannels != outChannels {
-    let shortcut = Convolution(groups: 1, filters: outChannels, filterSize: [1, 1])
+    let shortcut = Convolution(groups: 1, filters: outChannels, filterSize: [1, 1], format: .OIHW)
     out = shortcut(x) + out
   } else {
     out = x + out
@@ -603,24 +615,24 @@ func MOVQAttnBlock(
   var out = norm(x, zq)
   let hw = width * height
   let tokeys = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  let k = tokeys(out).reshaped([batchSize, inChannels, hw])
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]), format: .OIHW)
+  let k = tokeys(out).reshaped([batchSize, hw, inChannels])
   let toqueries = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]), format: .OIHW)
   let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
-    batchSize, inChannels, hw,
+    batchSize, hw, inChannels,
   ])
-  var dot = Matmul(transposeA: (1, 2))(q, k)
+  var dot = Matmul(transposeB: (1, 2))(q, k)
   dot = dot.reshaped([batchSize * hw, hw])
   dot = dot.softmax()
   dot = dot.reshaped([batchSize, hw, hw])
   let tovalues = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  let v = tovalues(out).reshaped([batchSize, inChannels, hw])
-  out = Matmul(transposeB: (1, 2))(v, dot)
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]), format: .OIHW)
+  let v = tovalues(out).reshaped([batchSize, hw, inChannels])
+  out = dot * v
   let projOut = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  out = x + projOut(out.reshaped([batchSize, inChannels, height, width]))
+    groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]), format: .OIHW)
+  out = x + projOut(out.reshaped([batchSize, height, width, inChannels]))
   return Model([x, zq], [out])
 }
 
@@ -629,12 +641,12 @@ func MOVQDecoder(
   startWidth: Int, attnResolutions: Set<Int>
 ) -> Model {
   let x = Input()
-  let postQuantConv = Convolution(groups: 1, filters: zChannels, filterSize: [1, 1])
+  let postQuantConv = Convolution(groups: 1, filters: zChannels, filterSize: [1, 1], format: .OIHW)
   let z = postQuantConv(x)
   var blockIn = channels * channelMult[channelMult.count - 1]
   let convIn = Convolution(
     groups: 1, filters: blockIn, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   var out = convIn(z)
   let midBlock1 = MOVQResnetBlock(
     prefix: "decoder.mid.block_1", inChannels: blockIn, outChannels: blockIn, scale: 1)
@@ -669,7 +681,7 @@ func MOVQDecoder(
       out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
       let conv = Convolution(
         groups: 1, filters: blockIn, filterSize: [3, 3],
-        hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+        hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
       out = conv(out)
       ds *= 2
       currentRes *= 2
@@ -682,7 +694,7 @@ func MOVQDecoder(
   out = normOut(out, x).swish()
   let convOut = Convolution(
     groups: 1, filters: 3, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), format: .OIHW)
   out = convOut(out)
   return Model([x], [out])
 }
@@ -730,7 +742,7 @@ graph.withNoGrad {
     embeddingSize: 1_024)
   let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
   let sentencePiece = SentencePiece(
-    file: "/home/liu/workspace/swift-diffusion/examples/kandinsky2/sentencepiece.bpe.model")
+    file: "/Users/liu/workspace/swift-diffusion/examples/kandinsky2/sentencepiece.bpe.model")
   let ids = sentencePiece.encode(prompt)
   for i in 0..<154 {
     tokensTensor[i] = 1
@@ -757,7 +769,7 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(1)
   let tokenTypesTensorGPU = tokenTypesTensor.toGPU(1)
   textEncoder.compile(inputs: tokensTensorGPU, positionTensorGPU, tokenTypesTensorGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
     $0.read("embedding", model: textEncoder)
   }
   let embeddings = textEncoder(inputs: tokensTensorGPU, positionTensorGPU, tokenTypesTensorGPU)[0]
@@ -774,7 +786,7 @@ graph.withNoGrad {
   }
   let attentionMaskGPU = attentionMask.toGPU(1)
   layer.compile(inputs: embeddings, attentionMaskGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
     $0.read("roberta", model: layer)
   }
   let textEncoderEmb = layer(inputs: embeddings, attentionMaskGPU)[0].as(of: FloatType.self)
@@ -795,7 +807,7 @@ graph.withNoGrad {
   let poolEmb = weightPoolingMask.toGPU(1) .* (poolingMask.toGPU(1) * textEncoderEmb)
   let linearTransformation = Dense(count: 768)
   linearTransformation.compile(inputs: poolEmb)
-  graph.openStore("/home/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/xlm_roberta_f16.ckpt") {
     $0.read("linear_transformation", model: linearTransformation)
   }
   let poolEmbOut = linearTransformation(inputs: poolEmb)[0].as(of: FloatType.self)
@@ -848,7 +860,7 @@ graph.withNoGrad {
   let positionTensorCLIPGPU = positionTensorCLIP.toGPU(1)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(1)
   textModel.compile(inputs: tokensTensorCLIPGPU, positionTensorCLIPGPU, casualAttentionMaskGPU)
-  graph.openStore("/fast/Data/SD/swift-diffusion/clip_vit_l14_f16.ckpt") { store in
+  graph.openStore("/Users/liu/workspace/swift-diffusion/clip_vit_l14_f16.ckpt") { store in
     store.read("text_model", model: textModel)
   }
   let textProjectionGPU = graph.variable(.GPU(1), .NC(768, 768), of: FloatType.self)
@@ -856,7 +868,7 @@ graph.withNoGrad {
     inputs: tokensTensorCLIPGPU, positionTensorCLIPGPU, casualAttentionMaskGPU)[0].as(
       of: FloatType.self
     )
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("text_projection", variable: textProjectionGPU)
   }
   var indexGP = Tensor<Int32>(.CPU, .C(2))
@@ -880,7 +892,7 @@ graph.withNoGrad {
       from: timeEmbedding(timestep: 999, batchSize: 2, embeddingSize: 2048, maxPeriod: 10_000)
         .toGPU(1)))
   timeEmbed.compile(inputs: timesteps)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("time_embed", model: timeEmbed)
     $0.read("clip_img_proj", model: clipImgProj)
     $0.read("text_enc_proj", model: textEncProj)
@@ -895,7 +907,7 @@ graph.withNoGrad {
   dmInputTensorGPU[77..<78, 0..<2048] = textEmbOut[0..<1, 0..<2048]
   dmInputTensorGPU[(81 + 77)..<(81 + 78), 0..<2048] = textEmbOut[1..<2, 0..<2048]
   let prdEmb = graph.variable(.GPU(1), .NC(1, 2048), of: FloatType.self)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("prd_emb", variable: prdEmb)
   }
   dmInputTensorGPU[80..<81, 0..<2048] = prdEmb
@@ -903,7 +915,7 @@ graph.withNoGrad {
   let positionalEmbedding = graph.variable(.GPU(1), .NC(81, 2048), of: FloatType.self)
   let clipStd = graph.variable(.GPU(1), .NC(1, 768), of: FloatType.self)
   let clipMean = graph.variable(.GPU(1), .NC(1, 768), of: FloatType.self)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("positional_embedding", variable: positionalEmbedding)
     $0.read("clip_std", variable: clipStd)
     $0.read("clip_mean", variable: clipMean)
@@ -935,7 +947,7 @@ graph.withNoGrad {
   noiseGPU.randn()
   var x = noiseGPU
   let zeroImgEmbGPU = graph.variable(.GPU(1), .NC(1, 768), of: FloatType.self)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_diffusion_mapping_f16.ckpt") {
     $0.read("diffusion_mapping", model: diffusionMapping)
     $0.read("zero_img_emb", variable: zeroImgEmbGPU)
   }
@@ -990,9 +1002,10 @@ graph.withNoGrad {
   let imageEmbGPU = x .* clipStd + clipMean
   var imageEmb = graph.variable(.GPU(1), .NC(2, 768), of: FloatType.self)
   imageEmb[0..<1, 0..<768] = Functional.add(
-    left: zeroImgEmbGPU, right: imageEmbGPU, leftScalar: 1, rightScalar: 0)
+    left: zeroImgEmbGPU, right: imageEmbGPU, leftScalar: 0, rightScalar: 1)
   imageEmb[1..<2, 0..<768] = zeroImgEmbGPU
   imageEmb1 = imageEmb.reshaped(.CHW(2, 1, 768))
+  debugPrint(imageEmb)
 }
 
 let diffusionModel = DiffusionModel(
@@ -1036,10 +1049,10 @@ func percentile(_ tensor: DynamicGraph.Tensor<FloatType>) -> Float {
   let tensor = tensor.toCPU()
   var value = [Float]()
   for i in 0..<1 {
-    for j in 0..<4 {
-      for x in 0..<96 {
-        for y in 0..<96 {
-          value.append(abs(Float(tensor[i, j, x, y])))
+    for x in 0..<96 {
+      for y in 0..<96 {
+        for j in 0..<4 {
+          value.append(abs(Float(tensor[i, x, y, j])))
         }
       }
     }
@@ -1053,7 +1066,7 @@ graph.withNoGrad {
   guard let fullEmb1 = fullEmb1, let poolEmb1 = poolEmb1, let imageEmb1 = imageEmb1 else { return }
   let imageAndTextEmbedding = ImageAndTextEmbedding(batchSize: 2)
   imageAndTextEmbedding.compile(inputs: poolEmb1, fullEmb1, imageEmb1)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
     $0.read("image_and_text_embed", model: imageAndTextEmbedding)
   }
   let outputs = imageAndTextEmbedding(inputs: poolEmb1, fullEmb1, imageEmb1).map {
@@ -1067,7 +1080,7 @@ graph.withNoGrad {
         1)))
   let timeEmbed = timestepEmbedding(prefix: "time_embed", channels: 384 * 4)
   timeEmbed.compile(inputs: timesteps)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
     $0.read("time_embed", model: timeEmbed)
   }
   var embGPU = timeEmbed(inputs: timesteps)[0].as(of: FloatType.self)
@@ -1076,12 +1089,12 @@ graph.withNoGrad {
     batchSize: 2, channels: 384, outChannels: 8, channelMult: [1, 2, 3, 4], numResBlocks: 3,
     numHeadChannels: 64, t: 87, startHeight: 96, startWidth: 96,
     attentionResolutions: Set([2, 4, 8]))
-  let hInputGPU = graph.variable(.GPU(1), .NCHW(1, 4, 96, 96), of: FloatType.self)
+  let hInputGPU = graph.variable(.GPU(1), .NHWC(1, 96, 96, 4), of: FloatType.self)
   hInputGPU.randn()
   var x = hInputGPU
-  var xIn = graph.variable(.GPU(1), .NCHW(2, 4, 96, 96), of: FloatType.self)
+  var xIn = graph.variable(.GPU(1), .NHWC(2, 96, 96, 4), of: FloatType.self)
   unet.compile(inputs: xIn, embGPU, xfOutGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_f16.ckpt") {
     $0.read("unet", model: unet)
   }
   /*
@@ -1099,16 +1112,17 @@ graph.withNoGrad {
             1)))
     embGPU = timeEmbed(inputs: timesteps)[0].as(of: FloatType.self)
     embGPU = embGPU + xfProj.reshaped(.NC(2, 384 * 4))
-    xIn[0..<1, 0..<4, 0..<96, 0..<96] = x
-    xIn[1..<2, 0..<4, 0..<96, 0..<96] = x
+    xIn[0..<1, 0..<96, 0..<96, 0..<4] = x
+    xIn[1..<2, 0..<96, 0..<96, 0..<4] = x
     let result = unet(inputs: xIn, embGPU, xfOutGPU)[0].as(of: FloatType.self)
-    let modelVar = result[0..<1, 4..<8, 0..<96, 0..<96].copied().clamped(-1...1)
+    print("i \(i)")
+    let modelVar = result[0..<1, 0..<96, 0..<96, 4..<8].copied().clamped(-1...1)
     let minLog = Float(mPosteriorLogVarianceClipped[i])
     let maxLog = Float(log(mNewBetas[i]))
     let frac = 0.5 * (modelVar + 1)
     let modelLogVar = frac * maxLog + (1 - frac) * minLog
-    let condEps = result[0..<1, 0..<4, 0..<96, 0..<96].copied()
-    let uncondEps = result[1..<2, 0..<4, 0..<96, 0..<96].copied()
+    let condEps = result[0..<1, 0..<96, 0..<96, 0..<4].copied()
+    let uncondEps = result[1..<2, 0..<96, 0..<96, 0..<4].copied()
     let eps = uncondEps + 10 * (condEps - uncondEps)
     var predXStart = Functional.add(
       left: x, right: eps, leftScalar: Float((1.0 / mNewAlphasCumprod[i]).squareRoot()),
@@ -1134,7 +1148,7 @@ graph.withNoGrad {
     zChannels: 4, channels: 128, channelMult: [1, 2, 2, 4], numResBlocks: 2, startHeight: 96,
     startWidth: 96, attnResolutions: Set([32]))
   movq.compile(inputs: image)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
     $0.read("movq", model: movq)
   }
   var result = movq(inputs: image)[0].as(of: FloatType.self)
@@ -1142,7 +1156,7 @@ graph.withNoGrad {
     zChannels: 4, channels: 128, channelMult: [1, 2, 2, 4], numResBlocks: 2, startHeight: 768,
     startWidth: 768, attnResolutions: Set([32]))
   encoder.compile(inputs: result)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
+  graph.openStore("/Users/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
     $0.read("encoder", model: encoder)
   }
   let encodedImage = encoder(inputs: result)[0].as(of: FloatType.self)
@@ -1161,7 +1175,7 @@ graph.withNoGrad {
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
   for y in 0..<startHeight * 8 {
     for x in 0..<startWidth * 8 {
-      let (r, g, b) = (result[0, 0, y, x], result[0, 1, y, x], result[0, 2, y, x])
+      let (r, g, b) = (result[0, y, x, 0], result[0, y, x, 1], result[0, y, x, 2])
       rgba[y * startWidth * 8 + x].r = UInt8(
         min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
       rgba[y * startWidth * 8 + x].g = UInt8(
@@ -1173,5 +1187,5 @@ graph.withNoGrad {
   let png = PNG.Data.Rectangular(
     packing: rgba, size: (startWidth * 8, startHeight * 8),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
-  try! png.compress(path: "/home/liu/workspace/swift-diffusion/kandinsky2.png", level: 4)
+  try! png.compress(path: "/Users/liu/workspace/swift-diffusion/kandinsky2.png", level: 4)
 }

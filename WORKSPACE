@@ -10,6 +10,11 @@ git_repository(
 
 load("@s4nnc//:deps.bzl", "s4nnc_deps")
 
+local_repository(
+    name = "ccv",
+    path = "/Users/liu/workspace/ccv",
+)
+
 s4nnc_deps()
 
 load("@ccv//config:ccv.bzl", "ccv_deps", "ccv_setting")
@@ -25,12 +30,8 @@ nccl_configure(name = "local_config_nccl")
 
 ccv_setting(
     name = "local_config_ccv",
-    have_cblas = True,
-    have_cudnn = True,
-    have_nccl = True,
+    have_accelerate_framework = True,
     have_pthread = True,
-    use_dispatch = True,
-    use_openmp = True,
 )
 
 git_repository(
