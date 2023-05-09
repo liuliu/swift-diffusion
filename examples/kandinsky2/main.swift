@@ -731,7 +731,7 @@ graph.withNoGrad {
   let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
   let sentencePiece = SentencePiece(
     file: "/home/liu/workspace/swift-diffusion/examples/kandinsky2/sentencepiece.bpe.model")
-  let ids = sentencePiece.encode(prompt)
+  let ids = sentencePiece.encode(prompt).map { $0.id }
   for i in 0..<154 {
     tokensTensor[i] = 1
   }
@@ -954,6 +954,28 @@ graph.withNoGrad {
     $0.write("prd_emb", variable: prdEmb)
   }
   */
+  let vit = VisionTransformer(
+    grid: 16, width: 1024, outputDim: 768, layers: 24, heads: 16, batchSize: 1)
+  let vitInput = graph.variable(.GPU(1), .NCHW(1, 3, 224, 224), of: FloatType.self)
+  vitInput.full(0)
+  let classEmbedding = graph.variable(.GPU(1), .CHW(1, 1, 1024), of: FloatType.self)
+  let vitPositionalEmbedding = graph.variable(
+    .GPU(1), .CHW(1, 16 * 16 + 1, 1024), of: FloatType.self)
+  vit.compile(inputs: vitInput, classEmbedding, vitPositionalEmbedding)
+  graph.openStore("/home/liu/workspace/swift-diffusion/image_vit_l14_f32.ckpt") {
+    $0.read("vit", model: vit)
+    $0.read("class_embedding", variable: classEmbedding)
+    $0.read("positional_embedding", variable: vitPositionalEmbedding)
+  }
+  let zeroOut = vit(inputs: vitInput, classEmbedding, vitPositionalEmbedding)[0].as(
+    of: FloatType.self)
+  graph.openStore("/home/liu/workspace/swift-diffusion/image_vit_l14_f16.ckpt") {
+    $0.write("vit", model: vit)
+    $0.write("class_embedding", variable: classEmbedding)
+    $0.write("positional_embedding", variable: vitPositionalEmbedding)
+  }
+  debugPrint(zeroOut)
+  debugPrint(zeroImgEmbGPU)
   for (i, timestep) in [0, 250, 500, 749, 999].enumerated().reversed() {
     xIn[0..<1, 0..<768] = x
     xIn[1..<2, 0..<768] = x
@@ -990,7 +1012,7 @@ graph.withNoGrad {
   let imageEmbGPU = x .* clipStd + clipMean
   var imageEmb = graph.variable(.GPU(1), .NC(2, 768), of: FloatType.self)
   imageEmb[0..<1, 0..<768] = Functional.add(
-    left: zeroImgEmbGPU, right: imageEmbGPU, leftScalar: 1, rightScalar: 0)
+    left: zeroImgEmbGPU, right: imageEmbGPU, leftScalar: 0, rightScalar: 1)
   imageEmb[1..<2, 0..<768] = zeroImgEmbGPU
   imageEmb1 = imageEmb.reshaped(.CHW(2, 1, 768))
 }
