@@ -561,9 +561,13 @@ func SpatialNorm(prefix: String, channels: Int, heightScale: Float, widthScale: 
   let normLayer = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
   var out = normLayer(x)
   let zqOut = Upsample(.nearest, widthScale: widthScale, heightScale: heightScale)(zq)
+  zqOut.add(dependencies: [out])
   let convY = Convolution(groups: 1, filters: channels, filterSize: [1, 1])
+  out = out .* convY(zqOut)
   let convB = Convolution(groups: 1, filters: channels, filterSize: [1, 1])
-  out = out .* convY(zqOut) + convB(zqOut)
+  let bias = convB(zqOut)
+  bias.add(dependencies: [out])
+  out = out + bias
   return Model([x, zq], [out])
 }
 
@@ -969,11 +973,13 @@ graph.withNoGrad {
   }
   let zeroOut = vit(inputs: vitInput, classEmbedding, vitPositionalEmbedding)[0].as(
     of: FloatType.self)
+  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/image_vit_l14_f16.ckpt") {
     $0.write("vit", model: vit)
     $0.write("class_embedding", variable: classEmbedding)
     $0.write("positional_embedding", variable: vitPositionalEmbedding)
   }
+  */
   debugPrint(zeroOut)
   debugPrint(zeroImgEmbGPU)
   for (i, timestep) in [0, 250, 500, 749, 999].enumerated().reversed() {
@@ -1082,7 +1088,9 @@ graph.withNoGrad {
     $0.as(of: FloatType.self)
   }
   let xfProj = outputs[0]
+  debugPrint(xfProj)
   let xfOutGPU = outputs[1]
+  debugPrint(xfOutGPU)
   let timesteps = graph.variable(
     Tensor<FloatType>(
       from: timeEmbedding(timestep: 999, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000).toGPU(
@@ -1156,7 +1164,7 @@ graph.withNoGrad {
     zChannels: 4, channels: 128, channelMult: [1, 2, 2, 4], numResBlocks: 2, startHeight: 96,
     startWidth: 96, attnResolutions: Set([32]))
   movq.compile(inputs: image)
-  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f32.ckpt") {
     $0.read("movq", model: movq)
   }
   var result = movq(inputs: image)[0].as(of: FloatType.self)

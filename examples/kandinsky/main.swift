@@ -985,9 +985,13 @@ func SpatialNorm(prefix: String, channels: Int, heightScale: Float, widthScale: 
   let normLayer = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
   var out = normLayer(x)
   let zqOut = Upsample(.nearest, widthScale: widthScale, heightScale: heightScale)(zq)
+  zqOut.add(dependencies: [out])
   let convY = Convolution(groups: 1, filters: channels, filterSize: [1, 1])
+  out = out .* convY(zqOut)
   let convB = Convolution(groups: 1, filters: channels, filterSize: [1, 1])
-  out = out .* convY(zqOut) + convB(zqOut)
+  let bias = convB(zqOut)
+  bias.add(dependencies: [out])
+  out = out + bias
   let reader: (PythonObject) -> Void = { state_dict in
     let norm_layer_weight = state_dict["\(prefix).norm_layer.weight"].type(torch.float).cpu()
       .numpy()
