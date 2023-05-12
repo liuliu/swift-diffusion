@@ -735,15 +735,15 @@ graph.withNoGrad {
   let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
   let sentencePiece = SentencePiece(
     file: "/home/liu/workspace/swift-diffusion/examples/kandinsky2/sentencepiece.bpe.model")
-  let ids = sentencePiece.encode(prompt).map { $0.id }
+  let ids = sentencePiece.encode(prompt).map { return $0.id }
   for i in 0..<154 {
     tokensTensor[i] = 1
   }
   tokensTensor[0] = 0
   for i in 0..<ids.count {
-    tokensTensor[i + 1] = Int32(ids[i] + 1)
+    tokensTensor[i + 1] = ids[i] + 1
   }
-  tokensTensor[ids.count + 1] = 2
+  tokensTensor[Int(ids.count) + 1] = 2
   tokensTensor[77] = 0
   tokensTensor[78] = 2
   let tokenTypesTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
