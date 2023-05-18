@@ -28,6 +28,8 @@ ccv_setting(
     have_cblas = True,
     have_cudnn = True,
     have_nccl = True,
+    have_libjpeg = True,
+    have_libpng = True,
     have_pthread = True,
     use_dispatch = True,
     use_openmp = True,

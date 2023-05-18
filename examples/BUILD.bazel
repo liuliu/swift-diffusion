@@ -289,7 +289,16 @@ swift_binary(
         "//:diffusion",
         "@SwiftNumerics//:Numerics",
         "@SwiftPNG//:PNG",
+        "@ccv//lib:ccv",
         "@s4nnc//nnc",
         "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
+
+swift_binary(
+    name = "vqgan",
+    srcs = ["vqgan/main.swift"],
+    deps = [
+        "@s4nnc//nnc",
     ],
 )

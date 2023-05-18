@@ -4,6 +4,8 @@ import NNC
 import PNG
 import SentencePiece
 
+// import C_ccv
+
 typealias FloatType = Float16
 
 public struct DiffusionModel {
@@ -692,6 +694,68 @@ func MOVQDecoder(
 }
 
 let graph = DynamicGraph()
+/*
+try graph.withNoGrad {
+  var df = DataFrame(fromCSV: "/home/liu/workspace/swift-diffusion/files.txt", automaticUseHeader: false)!
+  df["image"] = df["0"].toLoadImage()
+  df["resize"] = df["image"]!.toImageJitter(Float.self, size: ImageJitter.Size(rows: 768, cols: 768), resize: ImageJitter.Resize(min: 768, max: 768), centerCrop: true, normalize: ImageJitter.Normalize(mean: [127.5, 127.5, 127.5], std: [127.5, 127.5, 127.5]))
+  DynamicGraph.setSeed(0)
+  df.shuffle()
+  let encoder = Encoder(
+    zChannels: 4, channels: 128, channelMult: [1, 2, 2, 4], numResBlocks: 2, startHeight: 768,
+    startWidth: 768, attnResolutions: Set([32]))
+  let movq = MOVQDecoder(
+    zChannels: 4, channels: 128, channelMult: [1, 2, 2, 4], numResBlocks: 2, startHeight: 96,
+    startWidth: 96, attnResolutions: Set([32]))
+  var loadedEncoder = false
+  var loadedMovq = false
+  for (i, batch) in df["resize", Tensor<Float>.self].enumerated() {
+    let initImage = graph.variable(Tensor<FloatType>(from: batch.reshaped(.NCHW(1, 768, 768, 3))).toGPU(0)).permuted(0, 3, 1, 2).copied()
+    if !loadedEncoder {
+      encoder.compile(inputs: initImage)
+      graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f16.ckpt") {
+        $0.read("encoder", model: encoder)
+      }
+      loadedEncoder = true
+    }
+    let encodedImage = encoder(inputs: initImage)[0].as(of: FloatType.self)
+    if !loadedMovq {
+      movq.compile(inputs: encodedImage)
+      graph.openStore("/home/liu/workspace/swift-diffusion/kandinsky_movq_f32.ckpt") {
+        $0.read("movq", model: movq)
+      }
+      loadedMovq = true
+    }
+    var result = movq(inputs: encodedImage)[0].as(of: FloatType.self)
+    result = result.toCPU()
+    let u8Img = ccv_dense_matrix_new(768, 768, Int32(CCV_8U | CCV_C3), nil, 0)!
+    for y in 0..<768 {
+      for x in 0..<768 {
+        let (r, g, b) = (result[0, 0, y, x], result[0, 1, y, x], result[0, 2, y, x])
+        u8Img.pointee.data.u8[y * 768 * 3 + x * 3] = UInt8(
+          min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
+        u8Img.pointee.data.u8[y * 768 * 3 + x * 3 + 1] = UInt8(
+          min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
+        u8Img.pointee.data.u8[y * 768 * 3 + x * 3 + 2] = UInt8(
+          min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
+      }
+    }
+    let encodedImageCPU = encodedImage.toCPU()
+    var smallerImg: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
+    ccv_resample(u8Img, &smallerImg, 0, 96, 96, Int32(CCV_INTER_AREA))
+    for y in 0..<96 {
+      for x in 0..<96 {
+        print("\(encodedImageCPU[0, 0, y, x]),\(encodedImageCPU[0, 1, y, x]),\(encodedImageCPU[0, 2, y, x]),\(encodedImageCPU[0, 3, y, x]),\(smallerImg!.pointee.data.u8[y * 96 * 3 + x * 3]),\(smallerImg!.pointee.data.u8[y * 96 * 3 + x * 3 + 1]),\(smallerImg!.pointee.data.u8[y * 96 * 3 + x * 3 + 2])")
+      }
+    }
+    var data = "/home/liu/workspace/swift-diffusion/dataset/small_\(i).png".data(using: String.Encoding.utf8)!
+    data.withUnsafeMutableBytes {
+      ccv_write(smallerImg, $0, nil, Int32(CCV_IO_PNG_FILE), nil)
+    }
+  }
+}
+exit(0)
+*/
 let diffusion = CLIPDiffusionModel(timesteps: 1_000, steps: 30)
 let alphasCumprod = diffusion.alphasCumprod
 var newBetas = [Double]()
