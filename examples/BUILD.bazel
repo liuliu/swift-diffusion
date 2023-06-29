@@ -302,3 +302,11 @@ swift_binary(
         "@s4nnc//nnc",
     ],
 )
+
+swift_binary(
+    name = "q6p",
+    srcs = ["q6p/main.swift"],
+    deps = [
+        "@s4nnc//nnc",
+    ],
+)
