@@ -310,3 +310,21 @@ swift_binary(
         "@s4nnc//nnc",
     ],
 )
+
+swift_binary(
+    name = "lora_training",
+    srcs = ["lora_training/main.swift"],
+    data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+    ],
+    deps = [
+        "//:diffusion",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@ZIPFoundation",
+        "@ccv//lib:ccv",
+        "@s4nnc//nnc",
+        "@swift-fickling//:fickling",
+    ],
+)

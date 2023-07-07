@@ -88,5 +88,5 @@ public func CLIPTextModel<T: TensorNumeric>(
   }
   let finalLayerNorm = LayerNorm(epsilon: 1e-5, axis: [1])
   out = finalLayerNorm(out)
-  return Model([tokens, positions, casualAttentionMask], [out])
+  return Model([tokens, positions, casualAttentionMask], [out], trainable: false)
 }

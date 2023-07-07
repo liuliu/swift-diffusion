@@ -494,7 +494,7 @@ public func UNet(
   out = outConv2d(out)
   controls.insert(contentsOf: [x, t_emb, c], at: 0)
   controls.append(contentsOf: adapters)
-  return Model(controls, [out])
+  return Model(controls, [out], trainable: false)
 }
 
 public func UNetv2(
@@ -547,5 +547,5 @@ public func UNetv2(
   out = outConv2d(out)
   controls.insert(contentsOf: [x, t_emb, c], at: 0)
   controls.append(contentsOf: adapters)
-  return Model(controls, [out])
+  return Model(controls, [out], trainable: false)
 }
