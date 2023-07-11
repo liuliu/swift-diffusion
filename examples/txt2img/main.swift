@@ -122,7 +122,7 @@ let tokens = tokenizer.tokenize(text: text, truncation: true, maxLength: 77)
 
 let graph = DynamicGraph()
 
-let textModel = CLIPTextModel(
+let textModel = LoRACLIPTextModel(
   UseFloatingPoint.self,
   vocabularySize: 49408, maxLength: 77, embeddingSize: 768, numLayers: 12, numHeads: 12,
   batchSize: 2, intermediateSize: 3072)
@@ -147,7 +147,7 @@ for i in 0..<76 {
 let unet = ModelBuilder {
   let startWidth = $0[0].shape[3]
   let startHeight = $0[0].shape[2]
-  return UNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
+  return LoRAUNet(batchSize: 2, startWidth: startWidth, startHeight: startHeight)
 }
 let decoder = ModelBuilder {
   let startWidth = $0[0].shape[3]
@@ -252,8 +252,8 @@ graph.withNoGrad {
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
   textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore("/fast/Data/SD/swift-diffusion/sd-v1.5.ckpt") { store in
-    store.read("text_model", model: textModel)
+  graph.openStore(workDir + "/lora_training.ckpt") { store in
+    store.read("lora_text_model", model: textModel)
   }
   /*
   graph.openStore(workDir + "/moxin_v1.0_lora_f16.ckpt") { lora in
@@ -283,8 +283,10 @@ graph.withNoGrad {
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
   unet.compile(inputs: xIn, graph.variable(Tensor<UseFloatingPoint>(from: ts)), c)
   decoder.compile(inputs: x)
+  graph.openStore(workDir + "/lora_training.ckpt") { store in
+    store.read("lora_unet", model: unet)
+  }
   graph.openStore("/fast/Data/SD/swift-diffusion/sd-v1.5.ckpt") { store in
-    store.read("unet", model: unet)
     store.read("decoder", model: decoder)
   }
   /*
