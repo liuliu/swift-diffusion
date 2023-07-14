@@ -17,6 +17,7 @@ swift_library(
     deps = [
         ":SwiftFormatConfiguration",
         "@SwiftSyntax",
+        "@SwiftSyntax//:SwiftOperators",
     ],
 )
 
@@ -64,6 +65,7 @@ swift_library(
         ":SwiftFormatPrettyPrint",
         ":SwiftFormatRules",
         ":SwiftFormatWhitespaceLinter",
+        "@SwiftSyntax//:SwiftParserDiagnostics",
         "@SwiftSyntax//:SwiftSyntaxParser",
     ],
 )

@@ -1,7 +1,7 @@
-import PythonKit
+import Foundation
 import NNC
 import NNCPythonConversion
-import Foundation
+import PythonKit
 
 let streamlit_helpers = Python.import("scripts.demo.streamlit_helpers")
 
@@ -13,7 +13,7 @@ var version_dict: [String: PythonObject] = [
   "is_legacy": false,
   "config": "/home/liu/workspace/generative-models/configs/inference/sd_xl_base.yaml",
   "ckpt": "/home/liu/workspace/generative-models/checkpoints/sd_xl_base_0.9.safetensors",
-  "is_guided": true
+  "is_guided": true,
 ]
 
 let state = streamlit_helpers.init_st(version_dict)
@@ -32,8 +32,8 @@ let out = streamlit_helpers.do_sample(state["model"], sampler, value_dict, 1, 10
 print(out)
 */
 // let state_dict = state["model"].conditioner.embedders[0].transformer.state_dict()
-let state_dict = state["model"].conditioner.embedders[1].model.state_dict()
-// let state_dict = state["model"].model.state_dict()
+// let state_dict = state["model"].conditioner.embedders[1].model.state_dict()
+let state_dict = state["model"].model.state_dict()
 print(state_dict.keys())
 
 /* OpenAI CLIP L14 model.
@@ -244,7 +244,7 @@ graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
 }
 */
 
-// OpenCLIP g14 model.
+/* OpenCLIP bigG14 model.
 func CLIPTextEmbedding(vocabularySize: Int, maxLength: Int, embeddingSize: Int) -> (
   Model, Model, Model
 ) {
@@ -481,8 +481,9 @@ graph.withNoGrad {
     $0.write("text_projection", tensor: textProjectionTensor)
   }
 }
+*/
 
-/*
+// SDXL Base UNet
 func timeEmbedding(timesteps: Int, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
 > {
@@ -578,17 +579,13 @@ func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> (Model, Model, Model, Mod
   return (tokeys, toqueries, tovalues, unifyheads, Model([x], [out]))
 }
 
-func CrossAttention(k: Int, h: Int, b: Int, hw: Int, t: Int) -> (Model, Model, Model, Model, Model)
-{
+func CrossAttentionKeysAndValues(k: Int, h: Int, b: Int, hw: Int, t: Int) -> (Model, Model, Model) {
   let x = Input()
-  let c = Input()
-  let tokeys = Dense(count: k * h, noBias: true)
+  let keys = Input()
+  let values = Input()
   let toqueries = Dense(count: k * h, noBias: true)
-  let tovalues = Dense(count: k * h, noBias: true)
-  let keys = tokeys(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
     .permuted(0, 2, 1, 3)
-  let values = tovalues(c).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * hw, t])
   dot = dot.softmax()
@@ -597,7 +594,7 @@ func CrossAttention(k: Int, h: Int, b: Int, hw: Int, t: Int) -> (Model, Model, M
   out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, hw, h * k])
   let unifyheads = Dense(count: k * h)
   out = unifyheads(out)
-  return (tokeys, toqueries, tovalues, unifyheads, Model([x, c], [out]))
+  return (toqueries, unifyheads, Model([x, keys, values], [out]))
 }
 
 func FeedForward(hiddenSize: Int, intermediateSize: Int) -> (Model, Model, Model, Model) {
@@ -611,11 +608,14 @@ func FeedForward(hiddenSize: Int, intermediateSize: Int) -> (Model, Model, Model
   return (fc10, fc11, fc2, Model([x], [out]))
 }
 
-func BasicTransformerBlock(prefix: String, k: Int, h: Int, b: Int, hw: Int, t: Int, intermediateSize: Int) -> (
+func BasicTransformerBlock(
+  prefix: String, k: Int, h: Int, b: Int, hw: Int, t: Int, intermediateSize: Int
+) -> (
   (PythonObject) -> Void, Model
 ) {
   let x = Input()
-  let c = Input()
+  let keys = Input()
+  let values = Input()
   let layerNorm1 = LayerNorm(epsilon: 1e-5, axis: [2])
   var out = layerNorm1(x)
   let (tokeys1, toqueries1, tovalues1, unifyheads1, attn1) = SelfAttention(k: k, h: h, b: b, hw: hw)
@@ -623,9 +623,9 @@ func BasicTransformerBlock(prefix: String, k: Int, h: Int, b: Int, hw: Int, t: I
   var residual = out
   let layerNorm2 = LayerNorm(epsilon: 1e-5, axis: [2])
   out = layerNorm2(out)
-  let (tokeys2, toqueries2, tovalues2, unifyheads2, attn2) = CrossAttention(
+  let (toqueries2, unifyheads2, attn2) = CrossAttentionKeysAndValues(
     k: k, h: h, b: b, hw: hw, t: t)
-  out = attn2(out, c) + residual
+  out = attn2(out, keys, values) + residual
   residual = out
   let layerNorm3 = LayerNorm(epsilon: 1e-5, axis: [2])
   out = layerNorm3(out)
@@ -675,18 +675,10 @@ func BasicTransformerBlock(prefix: String, k: Int, h: Int, b: Int, hw: Int, t: I
     ].cpu().numpy()
     fc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: ff_net_2_weight))
     fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ff_net_2_bias))
-    let attn2_to_k_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_k.weight"
-    ].cpu().numpy()
-    tokeys2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_k_weight))
     let attn2_to_q_weight = state_dict[
       "diffusion_model.\(prefix).attn2.to_q.weight"
     ].cpu().numpy()
     toqueries2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_q_weight))
-    let attn2_to_v_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_v.weight"
-    ].cpu().numpy()
-    tovalues2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
     let attn2_to_out_weight = state_dict[
       "diffusion_model.\(prefix).attn2.to_out.0.weight"
     ].cpu().numpy()
@@ -727,15 +719,16 @@ func BasicTransformerBlock(prefix: String, k: Int, h: Int, b: Int, hw: Int, t: I
     layerNorm3.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm3_weight))
     layerNorm3.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm3_bias))
   }
-  return (reader, Model([x, c], [out]))
+  return (reader, Model([x, keys, values], [out]))
 }
 
 func SpatialTransformer(
   prefix: String,
-  ch: Int, k: Int, h: Int, b: Int, height: Int, width: Int, depth: Int, t: Int, intermediateSize: Int
+  ch: Int, k: Int, h: Int, b: Int, height: Int, width: Int, depth: Int, t: Int,
+  intermediateSize: Int
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
-  let c = Input()
+  var kvs = [Model.IO]()
   let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
   var out = norm(x)
   let projIn = Convolution(groups: 1, filters: k * h, filterSize: [1, 1])
@@ -743,8 +736,14 @@ func SpatialTransformer(
   out = projIn(out).reshaped([b, k * h, hw]).permuted(0, 2, 1)
   var readers = [(PythonObject) -> Void]()
   for i in 0..<depth {
-    let (reader, block) = BasicTransformerBlock(prefix: "\(prefix).transformer_blocks.\(i)", k: k, h: h, b: b, hw: hw, t: t, intermediateSize: intermediateSize)
-    out = block(out, c)
+    let keys = Input()
+    kvs.append(keys)
+    let values = Input()
+    kvs.append(values)
+    let (reader, block) = BasicTransformerBlock(
+      prefix: "\(prefix).transformer_blocks.\(i)", k: k, h: h, b: b, hw: hw, t: t,
+      intermediateSize: intermediateSize)
+    out = block(out, keys, values)
     readers.append(reader)
   }
   out = out.reshaped([b, height, width, k * h]).permuted(0, 3, 1, 2)
@@ -773,7 +772,7 @@ func SpatialTransformer(
     projOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: proj_out_weight))
     projOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: proj_out_bias))
   }
-  return (reader, Model([x, c], [out]))
+  return (reader, Model([x] + kvs, [out]))
 }
 
 func BlockLayer(
@@ -783,7 +782,7 @@ func BlockLayer(
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let emb = Input()
-  var c: Model.IO? = nil
+  var kvs = [Model.IO]()
   precondition(channels % numHeadChannels == 0)
   let numHeads = channels / numHeadChannels
   let k = numHeadChannels
@@ -792,15 +791,17 @@ func BlockLayer(
   var out = resBlock(x, emb)
   var transformerReader: ((PythonObject) -> Void)? = nil
   if attentionBlock > 0 {
-    c = Input()
+    let c = (0..<(attentionBlock * 2)).map { _ in Input() }
     let transformer: Model
     (
       transformerReader, transformer
     ) = SpatialTransformer(
       prefix: "\(prefix).\(layerStart).1",
-      ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, depth: attentionBlock, t: embeddingSize,
+      ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width,
+      depth: attentionBlock, t: embeddingSize,
       intermediateSize: channels * 4)
-    out = transformer(out, c!)
+    out = transformer([out] + c)
+    kvs.append(contentsOf: c)
   }
   let reader: (PythonObject) -> Void = { state_dict in
     let in_layers_0_weight = state_dict[
@@ -859,49 +860,50 @@ func BlockLayer(
       transformerReader(state_dict)
     }
   }
-  if let c = c {
-    return (reader, Model([x, emb, c], [out]))
-  } else {
-    return (reader, Model([x, emb], [out]))
-  }
+  return (reader, Model([x, emb] + kvs, [out]))
 }
 
 func MiddleBlock(
   channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
-  x: Model.IO, emb: Model.IO, c: Model.IO
-) -> ((PythonObject) -> Void, Model.IO) {
+  x: Model.IO, emb: Model.IO
+) -> ((PythonObject) -> Void, Model.IO, [Input]) {
   precondition(channels % numHeadChannels == 0)
   let numHeads = channels / numHeadChannels
   let k = numHeadChannels
   let (inLayerNorm1, inLayerConv2d1, embLayer1, outLayerNorm1, outLayerConv2d1, _, resBlock1) =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   var out = resBlock1(x, emb)
+  let kvs = [Input(), Input()]
   let (
     transformerReader, transformer
   ) = SpatialTransformer(
     prefix: "middle_block.1",
-    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, depth: 1, t: embeddingSize,
+    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, depth: 1,
+    t: embeddingSize,
     intermediateSize: channels * 4)
-  out = transformer(out, c)
+  out = transformer([out] + kvs)
   let (inLayerNorm2, inLayerConv2d2, embLayer2, outLayerNorm2, outLayerConv2d2, _, resBlock2) =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   out = resBlock2(out, emb)
   let reader: (PythonObject) -> Void = { state_dict in
     let in_layers_0_0_weight = state_dict["diffusion_model.middle_block.0.in_layers.0.weight"]
       .cpu().numpy()
-    let in_layers_0_0_bias = state_dict["diffusion_model.middle_block.0.in_layers.0.bias"].cpu().numpy()
+    let in_layers_0_0_bias = state_dict["diffusion_model.middle_block.0.in_layers.0.bias"].cpu()
+      .numpy()
     inLayerNorm1.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: in_layers_0_0_weight))
     inLayerNorm1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_0_0_bias))
     let in_layers_0_2_weight = state_dict["diffusion_model.middle_block.0.in_layers.2.weight"]
       .cpu().numpy()
-    let in_layers_0_2_bias = state_dict["diffusion_model.middle_block.0.in_layers.2.bias"].cpu().numpy()
+    let in_layers_0_2_bias = state_dict["diffusion_model.middle_block.0.in_layers.2.bias"].cpu()
+      .numpy()
     inLayerConv2d1.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: in_layers_0_2_weight))
     inLayerConv2d1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_0_2_bias))
     let emb_layers_0_1_weight = state_dict["diffusion_model.middle_block.0.emb_layers.1.weight"]
       .cpu().numpy()
-    let emb_layers_0_1_bias = state_dict["diffusion_model.middle_block.0.emb_layers.1.bias"].cpu().numpy()
+    let emb_layers_0_1_bias = state_dict["diffusion_model.middle_block.0.emb_layers.1.bias"].cpu()
+      .numpy()
     embLayer1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: emb_layers_0_1_weight))
     embLayer1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: emb_layers_0_1_bias))
     let out_layers_0_0_weight = state_dict["diffusion_model.middle_block.0.out_layers.0.weight"]
@@ -914,7 +916,8 @@ func MiddleBlock(
     outLayerNorm1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_layers_0_0_bias))
     let out_layers_0_3_weight = state_dict["diffusion_model.middle_block.0.out_layers.3.weight"]
       .cpu().numpy()
-    let out_layers_0_3_bias = state_dict["diffusion_model.middle_block.0.out_layers.3.bias"].cpu().numpy()
+    let out_layers_0_3_bias = state_dict["diffusion_model.middle_block.0.out_layers.3.bias"].cpu()
+      .numpy()
     outLayerConv2d1.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: out_layers_0_3_weight))
     outLayerConv2d1.parameters(for: .bias).copy(
@@ -922,19 +925,22 @@ func MiddleBlock(
     transformerReader(state_dict)
     let in_layers_2_0_weight = state_dict["diffusion_model.middle_block.2.in_layers.0.weight"]
       .cpu().numpy()
-    let in_layers_2_0_bias = state_dict["diffusion_model.middle_block.2.in_layers.0.bias"].cpu().numpy()
+    let in_layers_2_0_bias = state_dict["diffusion_model.middle_block.2.in_layers.0.bias"].cpu()
+      .numpy()
     inLayerNorm2.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: in_layers_2_0_weight))
     inLayerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_2_0_bias))
     let in_layers_2_2_weight = state_dict["diffusion_model.middle_block.2.in_layers.2.weight"]
       .cpu().numpy()
-    let in_layers_2_2_bias = state_dict["diffusion_model.middle_block.2.in_layers.2.bias"].cpu().numpy()
+    let in_layers_2_2_bias = state_dict["diffusion_model.middle_block.2.in_layers.2.bias"].cpu()
+      .numpy()
     inLayerConv2d2.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: in_layers_2_2_weight))
     inLayerConv2d2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_2_2_bias))
     let emb_layers_2_1_weight = state_dict["diffusion_model.middle_block.2.emb_layers.1.weight"]
       .cpu().numpy()
-    let emb_layers_2_1_bias = state_dict["diffusion_model.middle_block.2.emb_layers.1.bias"].cpu().numpy()
+    let emb_layers_2_1_bias = state_dict["diffusion_model.middle_block.2.emb_layers.1.bias"].cpu()
+      .numpy()
     embLayer2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: emb_layers_2_1_weight))
     embLayer2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: emb_layers_2_1_bias))
     let out_layers_2_0_weight = state_dict["diffusion_model.middle_block.2.out_layers.0.weight"]
@@ -947,19 +953,21 @@ func MiddleBlock(
     outLayerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_layers_2_0_bias))
     let out_layers_2_3_weight = state_dict["diffusion_model.middle_block.2.out_layers.3.weight"]
       .cpu().numpy()
-    let out_layers_2_3_bias = state_dict["diffusion_model.middle_block.2.out_layers.3.bias"].cpu().numpy()
+    let out_layers_2_3_bias = state_dict["diffusion_model.middle_block.2.out_layers.3.bias"].cpu()
+      .numpy()
     outLayerConv2d2.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: out_layers_2_3_weight))
     outLayerConv2d2.parameters(for: .bias).copy(
       from: try! Tensor<Float>(numpy: out_layers_2_3_bias))
   }
-  return (reader, out)
+  return (reader, out, kvs)
 }
 
 func InputBlocks(
-  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int, startWidth: Int,
-  embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO, c: Model.IO
-) -> ((PythonObject) -> Void, [Model.IO], Model.IO) {
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
+  embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO
+) -> ((PythonObject) -> Void, [Model.IO], Model.IO, [Input]) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
@@ -971,20 +979,20 @@ func InputBlocks(
   var previousChannel = channels[0]
   var ds = 1
   var passLayers = [out]
+  var kvs = [Input]()
   for (i, channel) in channels.enumerated() {
     let attentionBlock = attentionRes[ds, default: 0]
     for _ in 0..<numRepeat {
       let (reader, inputLayer) = BlockLayer(
         prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
-        attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
+        batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       previousChannel = channel
-      if attentionBlock > 0 {
-        out = inputLayer(out, emb, c)
-      } else {
-        out = inputLayer(out, emb)
-      }
+      let c = (0..<(attentionBlock * 2)).map { _ in Input() }
+      out = inputLayer([out, emb] + c)
+      kvs.append(contentsOf: c)
       passLayers.append(out)
       readers.append(reader)
       layerStart += 1
@@ -997,8 +1005,10 @@ func InputBlocks(
       passLayers.append(out)
       let downLayer = layerStart
       let reader: (PythonObject) -> Void = { state_dict in
-        let op_weight = state_dict["diffusion_model.input_blocks.\(downLayer).0.op.weight"].cpu().numpy()
-        let op_bias = state_dict["diffusion_model.input_blocks.\(downLayer).0.op.bias"].cpu().numpy()
+        let op_weight = state_dict["diffusion_model.input_blocks.\(downLayer).0.op.weight"].cpu()
+          .numpy()
+        let op_bias = state_dict["diffusion_model.input_blocks.\(downLayer).0.op.bias"].cpu()
+          .numpy()
         downsample.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: op_weight))
         downsample.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: op_bias))
       }
@@ -1010,7 +1020,8 @@ func InputBlocks(
     }
   }
   let reader: (PythonObject) -> Void = { state_dict in
-    let input_blocks_0_0_weight = state_dict["diffusion_model.input_blocks.0.0.weight"].cpu().numpy()
+    let input_blocks_0_0_weight = state_dict["diffusion_model.input_blocks.0.0.weight"].cpu()
+      .numpy()
     let input_blocks_0_0_bias = state_dict["diffusion_model.input_blocks.0.0.bias"].cpu().numpy()
     conv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_weight))
     conv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_bias))
@@ -1018,14 +1029,15 @@ func InputBlocks(
       reader(state_dict)
     }
   }
-  return (reader, passLayers, out)
+  return (reader, passLayers, out, kvs)
 }
 
 func OutputBlocks(
-  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int, startWidth: Int,
-  embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO, c: Model.IO,
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
+  embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO,
   inputs: [Model.IO]
-) -> ((PythonObject) -> Void, Model.IO) {
+) -> ((PythonObject) -> Void, Model.IO, [Input]) {
   var layerStart = 0
   var height = startHeight
   var width = startWidth
@@ -1043,6 +1055,7 @@ func OutputBlocks(
     dss.append(ds)
   }
   var out = x
+  var kvs = [Input]()
   var inputIdx = inputs.count - 1
   for (i, channel) in channels.enumerated().reversed() {
     let height = heights[i]
@@ -1055,13 +1068,12 @@ func OutputBlocks(
       let (reader, outputLayer) = BlockLayer(
         prefix: "output_blocks",
         layerStart: layerStart, skipConnection: true,
-        attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels, batchSize: batchSize,
+        attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
+        batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
-      if attentionBlock > 0 {
-        out = outputLayer(out, emb, c)
-      } else {
-        out = outputLayer(out, emb)
-      }
+      let c = (0..<(attentionBlock * 2)).map { _ in Input() }
+      out = outputLayer([out, emb] + c)
+      kvs.append(contentsOf: c)
       readers.append(reader)
       if i > 0 && j == numRepeat {
         out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
@@ -1090,32 +1102,32 @@ func OutputBlocks(
       reader(state_dict)
     }
   }
-  return (reader, out)
+  return (reader, out, kvs)
 }
 
 func UNetXL(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let t_emb = Input()
-  let c = Input()
   let y = Input()
   let (timeFc0, timeFc2, timeEmbed) = TimeEmbed(modelChannels: 320)
   let (labelFc0, labelFc2, labelEmbed) = LabelEmbed(modelChannels: 320)
   let emb = timeEmbed(t_emb) + labelEmbed(y)
   let attentionRes: [Int: Int] = [2: 2, 4: 10]
-  let (inputReader, inputs, inputBlocks) = InputBlocks(
+
+  let (inputReader, inputs, inputBlocks, inputKVs) = InputBlocks(
     channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: 128,
-    startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb, c: c)
+    startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb)
   var out = inputBlocks
-  let (middleReader, middleBlock) = MiddleBlock(
-    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32, embeddingSize: 77,
-    x: out,
-    emb: emb, c: c)
+  let (middleReader, middleBlock, middleKVs) = MiddleBlock(
+    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
+    embeddingSize: 77,
+    x: out, emb: emb)
   out = middleBlock
-  let (outputReader, outputBlocks) = OutputBlocks(
+  let (outputReader, outputBlocks, outputKVs) = OutputBlocks(
     channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: 128,
-    startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb, c: c,
+    startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb,
     inputs: inputs)
   out = outputBlocks
   let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
@@ -1154,7 +1166,208 @@ func UNetXL(batchSize: Int) -> ((PythonObject) -> Void, Model) {
     outConv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_2_weight))
     outConv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_2_bias))
   }
-  return (reader, Model([x, t_emb, c, y], [out]))
+  return (reader, Model([x, t_emb, y] + inputKVs + middleKVs + outputKVs, [out]))
+}
+
+func CrossAttentionFixed(k: Int, h: Int, b: Int, hw: Int, t: Int) -> (Model, Model, Model) {
+  let c = Input()
+  let tokeys = Dense(count: k * h, noBias: true)
+  let tovalues = Dense(count: k * h, noBias: true)
+  let keys = tokeys(c).reshaped([b, t, h, k]).transposed(1, 2)
+  let values = tovalues(c).reshaped([b, t, h, k]).transposed(1, 2)
+  return (tokeys, tovalues, Model([c], [keys, values]))
+}
+
+func BasicTransformerBlockFixed(
+  prefix: String, k: Int, h: Int, b: Int, hw: Int, t: Int, intermediateSize: Int
+) -> (
+  (PythonObject) -> Void, Model
+) {
+  let (tokeys2, tovalues2, attn2) = CrossAttentionFixed(k: k, h: h, b: b, hw: hw, t: t)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let attn2_to_k_weight = state_dict[
+      "diffusion_model.\(prefix).attn2.to_k.weight"
+    ].cpu().numpy()
+    tokeys2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_k_weight))
+    let attn2_to_v_weight = state_dict[
+      "diffusion_model.\(prefix).attn2.to_v.weight"
+    ].cpu().numpy()
+    tovalues2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
+  }
+  return (reader, attn2)
+}
+
+func SpatialTransformerFixed(
+  prefix: String,
+  ch: Int, k: Int, h: Int, b: Int, height: Int, width: Int, depth: Int, t: Int,
+  intermediateSize: Int
+) -> ((PythonObject) -> Void, Model) {
+  let c = Input()
+  var readers = [(PythonObject) -> Void]()
+  var outs = [Model.IO]()
+  let hw = height * width
+  for i in 0..<depth {
+    let (reader, block) = BasicTransformerBlockFixed(
+      prefix: "\(prefix).transformer_blocks.\(i)", k: k, h: h, b: b, hw: hw, t: t,
+      intermediateSize: intermediateSize)
+    outs.append(block(c))
+    readers.append(reader)
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
+  return (reader, Model([c], outs))
+}
+
+func BlockLayerFixed(
+  prefix: String,
+  layerStart: Int, skipConnection: Bool, attentionBlock: Int, channels: Int, numHeadChannels: Int,
+  batchSize: Int, height: Int, width: Int, embeddingSize: Int, intermediateSize: Int
+) -> ((PythonObject) -> Void, Model) {
+  precondition(channels % numHeadChannels == 0)
+  let numHeads = channels / numHeadChannels
+  let k = numHeadChannels
+  let (transformerReader, transformer) = SpatialTransformerFixed(
+    prefix: "\(prefix).\(layerStart).1",
+    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width,
+    depth: attentionBlock, t: embeddingSize,
+    intermediateSize: channels * 4)
+  return (transformerReader, transformer)
+}
+
+func MiddleBlockFixed(
+  channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
+  c: Model.IO
+) -> ((PythonObject) -> Void, Model.IO) {
+  precondition(channels % numHeadChannels == 0)
+  let numHeads = channels / numHeadChannels
+  let k = numHeadChannels
+  let (
+    transformerReader, transformer
+  ) = SpatialTransformerFixed(
+    prefix: "middle_block.1",
+    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, depth: 1,
+    t: embeddingSize,
+    intermediateSize: channels * 4)
+  let out = transformer(c)
+  return (transformerReader, out)
+}
+
+func InputBlocksFixed(
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
+  embeddingSize: Int, attentionRes: [Int: Int], c: Model.IO
+) -> ((PythonObject) -> Void, [Model.IO]) {
+  var layerStart = 1
+  var height = startHeight
+  var width = startWidth
+  var readers = [(PythonObject) -> Void]()
+  var previousChannel = channels[0]
+  var ds = 1
+  var outs = [Model.IO]()
+  for (i, channel) in channels.enumerated() {
+    let attentionBlock = attentionRes[ds, default: 0]
+    for _ in 0..<numRepeat {
+      if attentionBlock > 0 {
+        let (reader, inputLayer) = BlockLayerFixed(
+          prefix: "input_blocks",
+          layerStart: layerStart, skipConnection: previousChannel != channel,
+          attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
+          batchSize: batchSize,
+          height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
+        previousChannel = channel
+        outs.append(inputLayer(c))
+        readers.append(reader)
+      }
+      layerStart += 1
+    }
+    if i != channels.count - 1 {
+      height = height / 2
+      width = width / 2
+      layerStart += 1
+      ds *= 2
+    }
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
+  return (reader, outs)
+}
+
+func OutputBlocksFixed(
+  channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
+  startWidth: Int,
+  embeddingSize: Int, attentionRes: [Int: Int], c: Model.IO
+) -> ((PythonObject) -> Void, [Model.IO]) {
+  var layerStart = 0
+  var height = startHeight
+  var width = startWidth
+  var readers = [(PythonObject) -> Void]()
+  var ds = 1
+  var heights = [height]
+  var widths = [width]
+  var dss = [ds]
+  for _ in 0..<channels.count - 1 {
+    height = height / 2
+    width = width / 2
+    ds *= 2
+    heights.append(height)
+    widths.append(width)
+    dss.append(ds)
+  }
+  var outs = [Model.IO]()
+  for (i, channel) in channels.enumerated().reversed() {
+    let height = heights[i]
+    let width = widths[i]
+    let ds = dss[i]
+    let attentionBlock = attentionRes[ds, default: 0]
+    for _ in 0..<(numRepeat + 1) {
+      if attentionBlock > 0 {
+        let (reader, outputLayer) = BlockLayerFixed(
+          prefix: "output_blocks",
+          layerStart: layerStart, skipConnection: true,
+          attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
+          batchSize: batchSize,
+          height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
+        outs.append(outputLayer(c))
+        readers.append(reader)
+      }
+      layerStart += 1
+    }
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
+  return (reader, outs)
+}
+
+func UNetXLFixed(batchSize: Int) -> ((PythonObject) -> Void, Model) {
+  let c = Input()
+  let attentionRes: [Int: Int] = [2: 2, 4: 10]
+  let (inputReader, inputBlocks) = InputBlocksFixed(
+    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: 128, startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, c: c)
+  var out = inputBlocks
+  let (middleReader, middleBlock) = MiddleBlockFixed(
+    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
+    embeddingSize: 77, c: c)
+  out.append(middleBlock)
+  let (outputReader, outputBlocks) = OutputBlocksFixed(
+    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: 128, startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, c: c)
+  out.append(contentsOf: outputBlocks)
+  let reader: (PythonObject) -> Void = { state_dict in
+    inputReader(state_dict)
+    middleReader(state_dict)
+    outputReader(state_dict)
+  }
+  return (reader, Model([c], out))
 }
 
 let random = Python.import("random")
@@ -1182,15 +1395,19 @@ let t_emb = graph.variable(
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(1)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(1)
 let yTensor = graph.variable(try! Tensor<Float>(numpy: y.numpy())).toGPU(1)
+let (readerFixed, unetFixed) = UNetXLFixed(batchSize: 2)
 let (reader, unet) = UNetXL(batchSize: 2)
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 graph.withNoGrad {
-  let _ = unet(inputs: xTensor, t_emb, cTensor, yTensor)
+  let _ = unetFixed(inputs: cTensor)
+  readerFixed(state_dict)
+  let kvs = unetFixed(inputs: cTensor).map { $0.as(of: Float.self) }
+  let _ = unet(inputs: xTensor, [t_emb, yTensor] + kvs)
   reader(state_dict)
-  let attnOut = unet(inputs: xTensor, t_emb, cTensor, yTensor)[0].as(of: Float.self)
+  let attnOut = unet(inputs: xTensor, [t_emb, yTensor] + kvs)[0].as(of: Float.self)
   debugPrint(attnOut)
   graph.openStore("/home/liu/workspace/swift-diffusion/unet.ckpt") {
+    $0.write("unet_fixed", model: unetFixed)
     $0.write("unet", model: unet)
   }
 }
-*/

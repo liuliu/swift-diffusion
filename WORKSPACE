@@ -123,17 +123,17 @@ new_git_repository(
 new_git_repository(
     name = "SwiftSyntax",
     build_file = "swift-syntax.BUILD",
-    commit = "72d3da66b085c2299dd287c2be3b92b5ebd226de",
+    commit = "cd793adf5680e138bf2bcbaacc292490175d0dcd",
     remote = "https://github.com/apple/swift-syntax.git",
-    shallow_since = "1664965455 +0200",
+    shallow_since = "1676877517 +0100",
 )
 
 new_git_repository(
     name = "SwiftFormat",
     build_file = "swift-format.BUILD",
-    commit = "5f184220d032a019a63df457cdea4b9c8241e911",
+    commit = "9f1cc7172f100118229644619ce9c8f9ebc1032c",
     remote = "https://github.com/apple/swift-format.git",
-    shallow_since = "1665415355 -0700",
+    shallow_since = "1676404655 +0000",
 )
 
 new_git_repository(

@@ -1,19 +1,6 @@
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 
-cc_library(
-    name = "_CSwiftSyntax",
-    srcs = ["Sources/_CSwiftSyntax/src/atomic-counter.c"],
-    hdrs = [
-        "Sources/_CSwiftSyntax/include/atomic-counter.h",
-        "Sources/_CSwiftSyntax/include/c-syntax-nodes.h",
-    ],
-    includes = [
-        "Sources/_CSwiftSyntax/include/",
-    ],
-    tags = ["swift_module=_CSwiftSyntax"],
-)
-
 swift_library(
     name = "SwiftSyntax",
     srcs = glob([
@@ -21,8 +8,58 @@ swift_library(
     ]),
     module_name = "SwiftSyntax",
     visibility = ["//visibility:public"],
+    deps = [],
+)
+
+swift_library(
+    name = "SwiftBasicFormat",
+    srcs = glob([
+        "Sources/SwiftBasicFormat/**/*.swift",
+    ]),
+    module_name = "SwiftBasicFormat",
+    visibility = ["//visibility:public"],
     deps = [
-        ":_CSwiftSyntax",
+        ":SwiftSyntax",
+    ],
+)
+
+swift_library(
+    name = "SwiftDiagnostics",
+    srcs = glob([
+        "Sources/SwiftDiagnostics/**/*.swift",
+    ]),
+    module_name = "SwiftDiagnostics",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":SwiftSyntax",
+    ],
+)
+
+swift_library(
+    name = "SwiftParser",
+    srcs = glob([
+        "Sources/SwiftParser/**/*.swift",
+    ]),
+    module_name = "SwiftParser",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":SwiftDiagnostics",
+        ":SwiftSyntax",
+    ],
+)
+
+swift_library(
+    name = "SwiftParserDiagnostics",
+    srcs = glob([
+        "Sources/SwiftParserDiagnostics/**/*.swift",
+    ]),
+    module_name = "SwiftParserDiagnostics",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":SwiftBasicFormat",
+        ":SwiftDiagnostics",
+        ":SwiftParser",
+        ":SwiftSyntax",
     ],
 )
 
@@ -34,6 +71,9 @@ swift_library(
     module_name = "SwiftSyntaxBuilder",
     visibility = ["//visibility:public"],
     deps = [
+        ":SwiftBasicFormat",
+        ":SwiftParser",
+        ":SwiftParserDiagnostics",
         ":SwiftSyntax",
     ],
 )
@@ -46,6 +86,21 @@ swift_library(
     module_name = "SwiftSyntaxParser",
     visibility = ["//visibility:public"],
     deps = [
+        ":SwiftParser",
+        ":SwiftSyntax",
+    ],
+)
+
+swift_library(
+    name = "SwiftOperators",
+    srcs = glob([
+        "Sources/SwiftOperators/**/*.swift",
+    ]),
+    module_name = "SwiftOperators",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":SwiftDiagnostics",
+        ":SwiftParser",
         ":SwiftSyntax",
     ],
 )
