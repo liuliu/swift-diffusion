@@ -328,3 +328,14 @@ swift_binary(
         "@swift-fickling//:fickling",
     ],
 )
+
+swift_binary(
+    name = "sdxl",
+    srcs = ["sdxl/main.swift"],
+    deps = [
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
