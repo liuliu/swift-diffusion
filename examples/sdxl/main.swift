@@ -17,24 +17,27 @@ var version_dict: [String: PythonObject] = [
 ]
 
 let state = streamlit_helpers.init_st(version_dict)
-/*
 let init_dict: [String: PythonObject] = [
-  "orig_width": 1024,
+  "orig_width": 1280,
   "orig_height": 1024,
   "target_width": 1024,
-  "target_height": 1024
+  "target_height": 1024,
 ]
 let prompt = "astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
 let negative_prompt = ""
-let value_dict = streamlit_helpers.init_embedder_options(streamlit_helpers.get_unique_embedder_keys_from_conditioner(state["model"].conditioner), init_dict, prompt: prompt, negative_prompt: negative_prompt)
-let (num_rows, num_cols, sampler) = streamlit_helpers.init_sampling(use_identity_guider: false).tuple3
-let out = streamlit_helpers.do_sample(state["model"], sampler, value_dict, 1, 1024, 1024, 4, 8, force_uc_zero_embeddings: [PythonObject](), return_latents: false)
+let value_dict = streamlit_helpers.init_embedder_options(
+  streamlit_helpers.get_unique_embedder_keys_from_conditioner(state["model"].conditioner),
+  init_dict, prompt: prompt, negative_prompt: negative_prompt)
+let (num_rows, num_cols, sampler) = streamlit_helpers.init_sampling(use_identity_guider: false)
+  .tuple3
+let out = streamlit_helpers.do_sample(
+  state["model"], sampler, value_dict, 1, 1024, 1024, 4, 8,
+  force_uc_zero_embeddings: [PythonObject](), return_latents: false)
 print(out)
-*/
 // let state_dict = state["model"].conditioner.embedders[0].transformer.state_dict()
 // let state_dict = state["model"].conditioner.embedders[1].model.state_dict()
-let state_dict = state["model"].model.state_dict()
-print(state_dict.keys())
+// let state_dict = state["model"].model.state_dict()
+// print(state_dict.keys())
 
 /* OpenAI CLIP L14 model.
 func CLIPTextEmbedding(vocabularySize: Int, maxLength: Int, embeddingSize: Int) -> (
@@ -483,7 +486,7 @@ graph.withNoGrad {
 }
 */
 
-// SDXL Base UNet
+/* SDXL Base UNet
 func timeEmbedding(timesteps: Int, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
 > {
@@ -1411,3 +1414,4 @@ graph.withNoGrad {
     $0.write("unet", model: unet)
   }
 }
+*/

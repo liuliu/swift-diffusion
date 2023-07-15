@@ -339,3 +339,22 @@ swift_binary(
         "@s4nnc//nnc:nnc_python",
     ],
 )
+
+swift_binary(
+    name = "sdxl_txt2img",
+    srcs = ["sdxl_txt2img/main.swift"],
+    data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+        "open_clip/bpe_simple_vocab_16e6.txt",
+        "open_clip/vocab_16e6.json",
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)

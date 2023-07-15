@@ -43,7 +43,7 @@ public func timeEmbedding(timestep: Float, batchSize: Int, embeddingSize: Int, m
   return embedding
 }
 
-func TimeEmbed(modelChannels: Int) -> Model {
+public func TimeEmbed(modelChannels: Int) -> Model {
   let x = Input()
   let fc0 = Dense(count: modelChannels * 4)
   var out = fc0(x).swish()
@@ -52,7 +52,7 @@ func TimeEmbed(modelChannels: Int) -> Model {
   return Model([x], [out])
 }
 
-func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> Model {
+public func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> Model {
   let x = Input()
   let emb = Input()
   let inLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
@@ -84,7 +84,7 @@ func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> Model {
   return Model([x, emb], [out])
 }
 
-func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> Model {
+public func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> Model {
   let x = Input()
   let tokeys = Dense(count: k * h, noBias: true)
   let toqueries = Dense(count: k * h, noBias: true)
@@ -125,7 +125,7 @@ func CrossAttention(k: Int, h: Int, b: Int, hw: Int, t: Int) -> Model {
   return Model([x, c], [out])
 }
 
-func FeedForward(hiddenSize: Int, intermediateSize: Int) -> Model {
+public func FeedForward(hiddenSize: Int, intermediateSize: Int) -> Model {
   let x = Input()
   let fc10 = Dense(count: intermediateSize)
   let fc11 = Dense(count: intermediateSize)

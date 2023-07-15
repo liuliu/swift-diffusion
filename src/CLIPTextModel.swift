@@ -71,7 +71,7 @@ func CLIPEncoderLayer(k: Int, h: Int, b: Int, t: Int, intermediateSize: Int) -> 
 public func CLIPTextModel<T: TensorNumeric>(
   _ dataType: T.Type,
   vocabularySize: Int, maxLength: Int, embeddingSize: Int, numLayers: Int, numHeads: Int,
-  batchSize: Int, intermediateSize: Int
+  batchSize: Int, intermediateSize: Int, noFinalLayerNorm: Bool = false
 ) -> Model {
   let tokens = Input()
   let positions = Input()
@@ -86,7 +86,9 @@ public func CLIPTextModel<T: TensorNumeric>(
       k: k, h: numHeads, b: batchSize, t: maxLength, intermediateSize: intermediateSize)
     out = encoderLayer(out, casualAttentionMask)
   }
-  let finalLayerNorm = LayerNorm(epsilon: 1e-5, axis: [1])
-  out = finalLayerNorm(out)
+  if !noFinalLayerNorm {
+    let finalLayerNorm = LayerNorm(epsilon: 1e-5, axis: [1])
+    out = finalLayerNorm(out)
+  }
   return Model([tokens, positions, casualAttentionMask], [out], trainable: false)
 }

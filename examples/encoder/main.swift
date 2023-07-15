@@ -3,7 +3,7 @@ import NNC
 import NNCPythonConversion
 import PythonKit
 
-let ldm_util = Python.import("ldm.util")
+// let ldm_util = Python.import("ldm.util")
 let torch = Python.import("torch")
 let omegaconf = Python.import("omegaconf")
 let random = Python.import("random")
@@ -43,25 +43,25 @@ func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (
     out = x + out
   }
   let reader: (PythonObject) -> Void = { state_dict in
-    let norm1_weight = state_dict["encoder.\(prefix).norm1.weight"].numpy()
-    let norm1_bias = state_dict["encoder.\(prefix).norm1.bias"].numpy()
+    let norm1_weight = state_dict["encoder.\(prefix).norm1.weight"].cpu().numpy()
+    let norm1_bias = state_dict["encoder.\(prefix).norm1.bias"].cpu().numpy()
     norm1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm1_weight))
     norm1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm1_bias))
-    let conv1_weight = state_dict["encoder.\(prefix).conv1.weight"].numpy()
-    let conv1_bias = state_dict["encoder.\(prefix).conv1.bias"].numpy()
+    let conv1_weight = state_dict["encoder.\(prefix).conv1.weight"].cpu().numpy()
+    let conv1_bias = state_dict["encoder.\(prefix).conv1.bias"].cpu().numpy()
     conv1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv1_weight))
     conv1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv1_bias))
-    let norm2_weight = state_dict["encoder.\(prefix).norm2.weight"].numpy()
-    let norm2_bias = state_dict["encoder.\(prefix).norm2.bias"].numpy()
+    let norm2_weight = state_dict["encoder.\(prefix).norm2.weight"].cpu().numpy()
+    let norm2_bias = state_dict["encoder.\(prefix).norm2.bias"].cpu().numpy()
     norm2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm2_weight))
     norm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm2_bias))
-    let conv2_weight = state_dict["encoder.\(prefix).conv2.weight"].numpy()
-    let conv2_bias = state_dict["encoder.\(prefix).conv2.bias"].numpy()
+    let conv2_weight = state_dict["encoder.\(prefix).conv2.weight"].cpu().numpy()
+    let conv2_bias = state_dict["encoder.\(prefix).conv2.bias"].cpu().numpy()
     conv2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv2_weight))
     conv2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv2_bias))
     if let ninShortcut = ninShortcut {
-      let nin_shortcut_weight = state_dict["encoder.\(prefix).nin_shortcut.weight"].numpy()
-      let nin_shortcut_bias = state_dict["encoder.\(prefix).nin_shortcut.bias"].numpy()
+      let nin_shortcut_weight = state_dict["encoder.\(prefix).nin_shortcut.weight"].cpu().numpy()
+      let nin_shortcut_bias = state_dict["encoder.\(prefix).nin_shortcut.bias"].cpu().numpy()
       ninShortcut.parameters(for: .weight).copy(
         from: try! Tensor<Float>(numpy: nin_shortcut_weight))
       ninShortcut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: nin_shortcut_bias))
@@ -97,24 +97,24 @@ func AttnBlock(prefix: String, inChannels: Int, batchSize: Int, width: Int, heig
     groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = x + projOut(out.reshaped([batchSize, inChannels, height, width]))
   let reader: (PythonObject) -> Void = { state_dict in
-    let norm_weight = state_dict["encoder.\(prefix).norm.weight"].numpy()
-    let norm_bias = state_dict["encoder.\(prefix).norm.bias"].numpy()
+    let norm_weight = state_dict["encoder.\(prefix).norm.weight"].cpu().numpy()
+    let norm_bias = state_dict["encoder.\(prefix).norm.bias"].cpu().numpy()
     norm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm_weight))
     norm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm_bias))
-    let k_weight = state_dict["encoder.\(prefix).k.weight"].numpy()
-    let k_bias = state_dict["encoder.\(prefix).k.bias"].numpy()
+    let k_weight = state_dict["encoder.\(prefix).k.weight"].cpu().numpy()
+    let k_bias = state_dict["encoder.\(prefix).k.bias"].cpu().numpy()
     tokeys.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: k_weight))
     tokeys.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: k_bias))
-    let q_weight = state_dict["encoder.\(prefix).q.weight"].numpy()
-    let q_bias = state_dict["encoder.\(prefix).q.bias"].numpy()
+    let q_weight = state_dict["encoder.\(prefix).q.weight"].cpu().numpy()
+    let q_bias = state_dict["encoder.\(prefix).q.bias"].cpu().numpy()
     toqueries.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: q_weight))
     toqueries.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: q_bias))
-    let v_weight = state_dict["encoder.\(prefix).v.weight"].numpy()
-    let v_bias = state_dict["encoder.\(prefix).v.bias"].numpy()
+    let v_weight = state_dict["encoder.\(prefix).v.weight"].cpu().numpy()
+    let v_bias = state_dict["encoder.\(prefix).v.bias"].cpu().numpy()
     tovalues.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: v_weight))
     tovalues.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: v_bias))
-    let proj_out_weight = state_dict["encoder.\(prefix).proj_out.weight"].numpy()
-    let proj_out_bias = state_dict["encoder.\(prefix).proj_out.bias"].numpy()
+    let proj_out_weight = state_dict["encoder.\(prefix).proj_out.weight"].cpu().numpy()
+    let proj_out_bias = state_dict["encoder.\(prefix).proj_out.bias"].cpu().numpy()
     projOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: proj_out_weight))
     projOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: proj_out_bias))
   }
@@ -159,8 +159,9 @@ func Encoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
         strides: [channel * (height + 1) * (width + 1), (height + 1) * (width + 1), width + 1, 1])
       let downLayer = i
       let reader: (PythonObject) -> Void = { state_dict in
-        let conv_weight = state_dict["encoder.down.\(downLayer).downsample.conv.weight"].numpy()
-        let conv_bias = state_dict["encoder.down.\(downLayer).downsample.conv.bias"].numpy()
+        let conv_weight = state_dict["encoder.down.\(downLayer).downsample.conv.weight"].cpu()
+          .numpy()
+        let conv_bias = state_dict["encoder.down.\(downLayer).downsample.conv.bias"].cpu().numpy()
         conv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_weight))
         conv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_bias))
       }
@@ -188,8 +189,8 @@ func Encoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
     groups: 1, filters: 8, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = quantConv2d(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let conv_in_weight = state_dict["encoder.conv_in.weight"].numpy()
-    let conv_in_bias = state_dict["encoder.conv_in.bias"].numpy()
+    let conv_in_weight = state_dict["encoder.conv_in.weight"].cpu().numpy()
+    let conv_in_bias = state_dict["encoder.conv_in.bias"].cpu().numpy()
     convIn.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_in_weight))
     convIn.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_in_bias))
     for reader in readers {
@@ -198,16 +199,16 @@ func Encoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
     midBlockReader1(state_dict)
     midAttnReader1(state_dict)
     midBlockReader2(state_dict)
-    let norm_out_weight = state_dict["encoder.norm_out.weight"].numpy()
-    let norm_out_bias = state_dict["encoder.norm_out.bias"].numpy()
+    let norm_out_weight = state_dict["encoder.norm_out.weight"].cpu().numpy()
+    let norm_out_bias = state_dict["encoder.norm_out.bias"].cpu().numpy()
     normOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm_out_weight))
     normOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm_out_bias))
-    let conv_out_weight = state_dict["encoder.conv_out.weight"].numpy()
-    let conv_out_bias = state_dict["encoder.conv_out.bias"].numpy()
+    let conv_out_weight = state_dict["encoder.conv_out.weight"].cpu().numpy()
+    let conv_out_bias = state_dict["encoder.conv_out.bias"].cpu().numpy()
     convOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_out_weight))
     convOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_out_bias))
-    let quant_conv_weight = state_dict["quant_conv.weight"].numpy()
-    let quant_conv_bias = state_dict["quant_conv.bias"].numpy()
+    let quant_conv_weight = state_dict["quant_conv.weight"].cpu().numpy()
+    let quant_conv_bias = state_dict["quant_conv.bias"].cpu().numpy()
     quantConv2d.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: quant_conv_weight))
     quantConv2d.parameters(for: .bias).copy(
@@ -217,13 +218,29 @@ func Encoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
 }
 
 let x = torch.randn([1, 3, 512, 512])
-
+/*
 let config = omegaconf.OmegaConf.load(
   "/home/liu/workspace/stable-diffusion/configs/stable-diffusion/v1-inference.yaml")
 let pl_sd = torch.load(
   "/home/liu/workspace/stable-diffusion/models/ldm/stable-diffusion-v1/vae-ft-mse-840000-ema-pruned.ckpt",
   map_location: "cpu")
 let sd = pl_sd["state_dict"]
+*/
+let streamlit_helpers = Python.import("scripts.demo.streamlit_helpers")
+
+var version_dict: [String: PythonObject] = [
+  "H": 1024,
+  "W": 1024,
+  "C": 4,
+  "f": 8,
+  "is_legacy": false,
+  "config": "/home/liu/workspace/generative-models/configs/inference/sd_xl_base.yaml",
+  "ckpt": "/home/liu/workspace/generative-models/checkpoints/sd_xl_base_0.9.safetensors",
+  "is_guided": true,
+]
+
+let state = streamlit_helpers.init_st(version_dict)
+let sd = state["model"].first_stage_model.state_dict()
 /*
 let model = ldm_util.instantiate_from_config(config.model)
 model.load_state_dict(sd, strict: false)
@@ -246,17 +263,7 @@ graph.withNoGrad {
   reader(state_dict)
   let quant = encoder(inputs: zTensor)[0].as(of: Float.self)
   let quantCPU = quant.toCPU()
-  print(quantCPU)
-  for i in 0..<6 {
-    let x = i < 3 ? i : 2 + i
-    for j in 0..<6 {
-      let y = j < 3 ? j : 58 + j
-      for k in 0..<6 {
-        let z = k < 3 ? k : 58 + k
-        print("0 \(x) \(y) \(z) \(quantCPU[0, x, y, z])")
-      }
-    }
-  }
+  debugPrint(quantCPU)
   graph.openStore("/home/liu/workspace/swift-diffusion/autoencoder.ckpt") {
     $0.write("encoder", model: encoder)
   }
