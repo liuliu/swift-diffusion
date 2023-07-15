@@ -3,7 +3,7 @@ import Foundation
 import NNC
 import PNG
 
-typealias FloatType = Float
+typealias FloatType = Float16
 
 func OpenCLIPTextEmbedding(vocabularySize: Int, maxLength: Int, embeddingSize: Int) -> (
   Model, Model, Model
@@ -609,22 +609,28 @@ let (c1, pooled) = graph.withNoGrad {
   return (c1, pooled)
 }
 
-let originalWidth = timeEmbedding(
-  timestep: 1024, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-let originalHeight = timeEmbedding(
-  timestep: 1024, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-var originalSize = Tensor<Float>(.CPU, .C(512))
+let originalWidth = Tensor<FloatType>(
+  from: timeEmbedding(
+    timestep: 1024, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
+let originalHeight = Tensor<FloatType>(
+  from: timeEmbedding(
+    timestep: 1024, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
+var originalSize = Tensor<FloatType>(.CPU, .C(512))
 originalSize[0..<256] = originalHeight
 originalSize[256..<512] = originalWidth
-let cropX = timeEmbedding(timestep: 0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-let cropY = timeEmbedding(timestep: 0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-var cropCoord = Tensor<Float>(.CPU, .C(512))
+let cropX = Tensor<FloatType>(
+  from: timeEmbedding(timestep: 0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
+let cropY = Tensor<FloatType>(
+  from: timeEmbedding(timestep: 0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
+var cropCoord = Tensor<FloatType>(.CPU, .C(512))
 cropCoord[0..<256] = cropY
 cropCoord[256..<512] = cropX
-let targetWidth = timeEmbedding(timestep: 1024, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-let targetHeight = timeEmbedding(
-  timestep: 1024, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-var targetSize = Tensor<Float>(.CPU, .C(512))
+let targetWidth = Tensor<FloatType>(
+  from: timeEmbedding(timestep: 1024, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
+let targetHeight = Tensor<FloatType>(
+  from: timeEmbedding(
+    timestep: 1024, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
+var targetSize = Tensor<FloatType>(.CPU, .C(512))
 targetSize[0..<256] = targetHeight
 targetSize[256..<512] = targetWidth
 
@@ -632,6 +638,7 @@ let kvs = graph.withNoGrad {
   var crossattn = graph.variable(.GPU(0), .CHW(2, 77, 2048), of: FloatType.self)
   crossattn[0..<2, 0..<77, 0..<768] = c0
   crossattn[0..<2, 0..<77, 768..<2048] = c1
+  crossattn[0..<1, 0..<77, 0..<2048].full(0)
   let unetFixed = UNetXLFixed(batchSize: 2)
   unetFixed.compile(inputs: crossattn)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f32.ckpt") {
@@ -725,13 +732,13 @@ extension DiffusionModel {
   }
 }
 
-DynamicGraph.setSeed(42)
+DynamicGraph.setSeed(120)
 
 let unconditionalGuidanceScale: Float = 5
 let scaleFactor: Float = 0.13025
 let startHeight = 128
 let startWidth = 128
-let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 30)
+let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 50)
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
 // This is for Karras scheduler (used in DPM++ 2M Karras)
@@ -741,6 +748,7 @@ let startTime = Date()
 let z = graph.withNoGrad {
   var vector = graph.variable(.GPU(0), .NC(2, 2816), of: FloatType.self)
   vector[0..<2, 0..<1280] = pooled
+  vector[0..<1, 0..<1280].full(0)
   vector[0..<1, 1280..<1792] = graph.variable(originalSize.toGPU(0))
   vector[1..<2, 1280..<1792] = graph.variable(originalSize.toGPU(0))
   vector[0..<1, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
@@ -807,11 +815,12 @@ graph.withNoGrad {
       channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: startWidth,
       startHeight: startHeight)
   }
-  decoder.compile(inputs: z)
+  let z32 = DynamicGraph.Tensor<Float>(from: z)
+  decoder.compile(inputs: z32)
   graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_f32.ckpt") { store in
     store.read("decoder", model: decoder)
   }
-  let img = DynamicGraph.Tensor<Float>(from: decoder(inputs: z)[0].as(of: FloatType.self))
+  let img = decoder(inputs: z32)[0].as(of: Float.self)
     .toCPU()
   print("Total time \(Date().timeIntervalSince(startTime))")
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
