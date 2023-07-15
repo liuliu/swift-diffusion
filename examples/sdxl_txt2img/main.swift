@@ -640,94 +640,6 @@ let kvs = graph.withNoGrad {
   return unetFixed(inputs: crossattn).map { $0.as(of: FloatType.self) }
 }
 
-func uniPBhUpdate(
-  mt: DynamicGraph.Tensor<FloatType>, prevTimestep t: Int,
-  sample x: DynamicGraph.Tensor<FloatType>, timestepList: [Int],
-  outputList: [DynamicGraph.Tensor<FloatType>], lambdas: [Float], alphas: [Float],
-  sigmas: [Float]
-) -> DynamicGraph.Tensor<FloatType> {
-  let s0 = timestepList[timestepList.count - 1]
-  let m0 = outputList[outputList.count - 1]
-  let lambdat = lambdas[t]
-  let lambdas0 = lambdas[s0]
-  let alphat = alphas[t]
-  let sigmat = sigmas[t]
-  let sigmas0 = sigmas[s0]
-  let h = lambdat - lambdas0
-  let D1: DynamicGraph.Tensor<FloatType>?
-  if timestepList.count >= 2 && outputList.count >= 2 {
-    let si = timestepList[timestepList.count - 2]
-    let mi = outputList[outputList.count - 2]
-    let lambdasi = lambdas[si]
-    let rk = (lambdasi - lambdas0) / h
-    D1 = (mi - m0) / rk
-  } else {
-    D1 = nil
-  }
-  let hh = -h
-  let hPhi1 = exp(hh) - 1
-  let Bh = hPhi1
-  let rhosP: Float = 0.5
-  let xt_ = Functional.add(
-    left: x, right: m0, leftScalar: sigmat / sigmas0, rightScalar: -alphat * hPhi1)
-  if let D1 = D1 {
-    let xt = Functional.add(left: xt_, right: D1, leftScalar: 1, rightScalar: -alphat * Bh * rhosP)
-    return xt
-  } else {
-    return xt_
-  }
-}
-
-func uniCBhUpdate(
-  mt: DynamicGraph.Tensor<FloatType>, timestep t: Int,
-  lastSample x: DynamicGraph.Tensor<FloatType>, timestepList: [Int],
-  outputList: [DynamicGraph.Tensor<FloatType>], lambdas: [Float], alphas: [Float],
-  sigmas: [Float]
-) -> DynamicGraph.Tensor<FloatType> {
-  let s0 = timestepList[timestepList.count - 1]
-  let m0 = outputList[outputList.count - 1]
-  let lambdat = lambdas[t]
-  let lambdas0 = lambdas[s0]
-  let alphat = alphas[t]
-  let sigmat = sigmas[t]
-  let sigmas0 = sigmas[s0]
-  let h = lambdat - lambdas0
-  let hh = -h
-  let hPhi1 = exp(hh) - 1
-  let hPhik = hPhi1 / hh - 1
-  let Bh = hPhi1
-  let D1: DynamicGraph.Tensor<FloatType>?
-  let rhosC0: Float
-  let rhosC1: Float
-  if timestepList.count >= 2 && outputList.count >= 2 {
-    let si = timestepList[timestepList.count - 2]
-    let mi = outputList[outputList.count - 2]
-    let lambdasi = lambdas[si]
-    let rk = (lambdasi - lambdas0) / h
-    D1 = (mi - m0) / rk
-    let b0 = hPhik / Bh
-    let b1 = (hPhik / hh - 0.5) * 2 / Bh
-    rhosC0 = (b0 - b1) / (1 - rk)
-    rhosC1 = b0 - rhosC0
-  } else {
-    D1 = nil
-    rhosC0 = 0.5
-    rhosC1 = 0.5
-  }
-  print("rhos_c \(rhosC0), rhos_c \(rhosC1)")
-  let xt_ = Functional.add(
-    left: x, right: m0, leftScalar: sigmat / sigmas0, rightScalar: -alphat * hPhi1)
-  let D1t = mt - m0
-  let D1s: DynamicGraph.Tensor<FloatType>
-  if let D1 = D1 {
-    D1s = Functional.add(left: D1, right: D1t, leftScalar: rhosC0, rightScalar: rhosC1)
-  } else {
-    D1s = rhosC1 * D1t
-  }
-  let xt = Functional.add(left: xt_, right: D1s, leftScalar: 1, rightScalar: -alphat * Bh)
-  return xt
-}
-
 public struct DiffusionModel {
   public var linearStart: Float
   public var linearEnd: Float
@@ -813,7 +725,7 @@ extension DiffusionModel {
   }
 }
 
-DynamicGraph.setSeed(40)
+DynamicGraph.setSeed(42)
 
 let unconditionalGuidanceScale: Float = 5
 let scaleFactor: Float = 0.13025
@@ -821,9 +733,9 @@ let startHeight = 128
 let startWidth = 128
 let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 30)
 let alphasCumprod = model.alphasCumprod
-let alphas = alphasCumprod.map { $0.squareRoot() }
-let sigmas = alphasCumprod.map { (1 - $0).squareRoot() }
-let lambdas = zip(alphas, sigmas).map { log($0) - log($1) }
+let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
+// This is for Karras scheduler (used in DPM++ 2M Karras)
+let sigmas = model.karrasSigmas(sigmasForTimesteps[0]...sigmasForTimesteps[999])
 
 let startTime = Date()
 let z = graph.withNoGrad {
@@ -845,16 +757,19 @@ let z = graph.withNoGrad {
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f32.ckpt") {
     $0.read("unet", model: unet)
   }
-  var timestepList = [Int]()
-  var outputList = [DynamicGraph.Tensor<FloatType>]()
-  var lastSample: DynamicGraph.Tensor<FloatType>? = nil
+  var oldDenoised: DynamicGraph.Tensor<FloatType>? = nil
+  // Now do DPM++ 2M Karras sampling. (DPM++ 2S a Karras requires two denoising per step, not ideal for my use case).
+  x = sigmas[0] * x
   for i in 0..<model.steps {
-    let timestep = model.timesteps - model.timesteps / model.steps * i - 1
+    let sigma = sigmas[i]
+    let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
     let ts = timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
       .toGPU(0)
     let t = graph.variable(Tensor<FloatType>(from: ts))
-    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = x  // cIn * x
-    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = x  // cIn * x
+    let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
+    let cOut = -sigma
+    xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
+    xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     var et = unet(inputs: xIn, [t, vector] + kvs)[0].as(of: FloatType.self)
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: FloatType.self)
@@ -865,33 +780,21 @@ let z = graph.withNoGrad {
     etCond[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] =
       et[1..<2, 0..<4, 0..<startHeight, 0..<startWidth]
     et = etUncond + unconditionalGuidanceScale * (etCond - etUncond)
-    // UniPC sampler.
-    let mt = Functional.add(
-      left: x, right: et, leftScalar: 1.0 / alphas[timestep],
-      rightScalar: -sigmas[timestep] / alphas[timestep])
-    let useCorrector = lastSample != nil
-    if useCorrector, let lastSample = lastSample {
-      x = uniCBhUpdate(
-        mt: mt, timestep: timestep, lastSample: lastSample, timestepList: timestepList,
-        outputList: outputList, lambdas: lambdas, alphas: alphas, sigmas: sigmas)
-    }
-    if timestepList.count < 2 {
-      timestepList.append(timestep)
+    let denoised = x + cOut * et
+    let h = log(sigmas[i]) - log(sigmas[i + 1])
+    if let oldDenoised = oldDenoised, i < model.steps - 1 {
+      let hLast = log(sigmas[i - 1]) - log(sigmas[i])
+      let r = (h / hLast) / 2
+      let denoisedD = (1 + r) * denoised - r * oldDenoised
+      let w = sigmas[i + 1] / sigmas[i]
+      x = w * x - (w - 1) * denoisedD
+    } else if i == model.steps - 1 {
+      x = denoised
     } else {
-      timestepList[0] = timestepList[1]
-      timestepList[1] = timestep
+      let w = sigmas[i + 1] / sigmas[i]
+      x = w * x - (w - 1) * denoised
     }
-    if outputList.count < 2 {
-      outputList.append(mt)
-    } else {
-      outputList[0] = outputList[1]
-      outputList[1] = mt
-    }
-    let prevTimestep = max(0, model.timesteps - model.timesteps / model.steps * (i + 1) - 1)
-    lastSample = x
-    x = uniPBhUpdate(
-      mt: mt, prevTimestep: prevTimestep, sample: x, timestepList: timestepList,
-      outputList: outputList, lambdas: lambdas, alphas: alphas, sigmas: sigmas)
+    oldDenoised = denoised
   }
   return 1.0 / scaleFactor * x
 }
