@@ -11,8 +11,9 @@ func OpenCLIPTextEmbedding(vocabularySize: Int, maxLength: Int, embeddingSize: I
   let tokens = Input()
   let positions = Input()
   let tokenEmbed = Embedding(
-    Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize)
-  let positionEmbed = Embedding(Float.self, vocabularySize: maxLength, embeddingSize: embeddingSize)
+    FloatType.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize)
+  let positionEmbed = Embedding(
+    FloatType.self, vocabularySize: maxLength, embeddingSize: embeddingSize)
   let embedding = tokenEmbed(tokens) + positionEmbed(positions)
   return (tokenEmbed, positionEmbed, Model([tokens, positions], [embedding], name: "embeddings"))
 }
@@ -527,7 +528,8 @@ let tokenizer1 = CLIPTokenizer(
   vocabulary: "examples/open_clip/vocab_16e6.json",
   merges: "examples/open_clip/bpe_simple_vocab_16e6.txt")
 
-let prompt = "astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
+let prompt =
+  "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
 let negativePrompt = ""
 
 let tokens0 = tokenizer0.tokenize(text: prompt, truncation: true, maxLength: 77)
@@ -761,7 +763,7 @@ let z = graph.withNoGrad {
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, 128, 128), of: FloatType.self)
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
-  unet.compile(inputs: [xIn, graph.variable(ts), vector] + kvs)
+  unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector] + kvs)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f32.ckpt") {
     $0.read("unet", model: unet)
   }
