@@ -583,7 +583,7 @@ let (c1, pooled) = graph.withNoGrad {
     batchSize: 2, intermediateSize: 5120)
   let textProjection = graph.variable(.GPU(0), .NC(1280, 1280), of: FloatType.self)
   textModel1.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/open_clip_vit_bigg14_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/open_clip_vit_bigg14_f16.ckpt") {
     $0.read("text_model", model: textModel1)
     $0.read("text_projection", variable: textProjection)
   }
@@ -649,7 +649,7 @@ let kvs = graph.withNoGrad {
   */
   let unetFixed = UNetXLFixed(batchSize: 2)
   unetFixed.compile(inputs: crossattn)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
     $0.read("unet_fixed", model: unetFixed)
   }
   return unetFixed(inputs: crossattn).map { $0.as(of: FloatType.self) }
@@ -806,7 +806,7 @@ let z = graph.withNoGrad {
   */
   let unet = UNetXL(batchSize: 2)
   unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector] + kvs)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
     $0.read("unet", model: unet)
   }
   var oldDenoised: DynamicGraph.Tensor<FloatType>? = nil
@@ -864,8 +864,8 @@ graph.withNoGrad {
   }
   let z32 = DynamicGraph.Tensor<Float>(from: z)
   decoder.compile(inputs: z32)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_f32.ckpt") { store in
-    store.read("decoder", model: decoder)
+  graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_f32.ckpt") {
+    $0.read("decoder", model: decoder)
   }
   let img = decoder(inputs: z32)[0].as(of: Float.self)
     .toCPU()
