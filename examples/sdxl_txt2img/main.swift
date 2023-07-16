@@ -203,7 +203,7 @@ func BlockLayer(
 
 func MiddleBlock(
   channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
-  x: Model.IO, emb: Model.IO
+  attentionBlock: Int, x: Model.IO, emb: Model.IO
 ) -> (Model.IO, [Input]) {
   precondition(channels % numHeadChannels == 0)
   let numHeads = channels / numHeadChannels
@@ -211,12 +211,10 @@ func MiddleBlock(
   let resBlock1 =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   var out = resBlock1(x, emb)
-  let kvs = [Input(), Input()]
+  let kvs = (0..<(attentionBlock * 2)).map { _ in Input() }
   let transformer = SpatialTransformer(
-    prefix: "middle_block.1",
-    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, depth: 1,
-    t: embeddingSize,
-    intermediateSize: channels * 4)
+    prefix: "middle_block.1", ch: channels, k: k, h: numHeads, b: batchSize, height: height,
+    width: width, depth: attentionBlock, t: embeddingSize, intermediateSize: channels * 4)
   out = transformer([out] + kvs)
   let resBlock2 =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
@@ -226,8 +224,7 @@ func MiddleBlock(
 
 func InputBlocks(
   channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
-  startWidth: Int,
-  embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO
+  startWidth: Int, embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO
 ) -> ([Model.IO], Model.IO, [Input]) {
   let conv2d = Convolution(
     groups: 1, filters: 320, filterSize: [3, 3],
@@ -341,8 +338,7 @@ func UNetXL(batchSize: Int) -> Model {
   var out = inputBlocks
   let (middleBlock, middleKVs) = MiddleBlock(
     channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
-    embeddingSize: 77,
-    x: out, emb: emb)
+    embeddingSize: 77, attentionBlock: 10, x: out, emb: emb)
   out = middleBlock
   let (outputBlocks, outputKVs) = OutputBlocks(
     channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
@@ -411,16 +407,14 @@ func BlockLayerFixed(
 
 func MiddleBlockFixed(
   channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
-  c: Model.IO
+  attentionBlock: Int, c: Model.IO
 ) -> Model.IO {
   precondition(channels % numHeadChannels == 0)
   let numHeads = channels / numHeadChannels
   let k = numHeadChannels
   let transformer = SpatialTransformerFixed(
-    prefix: "middle_block.1",
-    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, depth: 1,
-    t: embeddingSize,
-    intermediateSize: channels * 4)
+    prefix: "middle_block.1", ch: channels, k: k, h: numHeads, b: batchSize, height: height,
+    width: width, depth: attentionBlock, t: embeddingSize, intermediateSize: channels * 4)
   let out = transformer(c)
   return out
 }
@@ -512,7 +506,7 @@ func UNetXLFixed(batchSize: Int) -> Model {
   var out = inputBlocks
   let middleBlock = MiddleBlockFixed(
     channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
-    embeddingSize: 77, c: c)
+    embeddingSize: 77, attentionBlock: 10, c: c)
   out.append(middleBlock)
   let outputBlocks = OutputBlocksFixed(
     channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
@@ -529,6 +523,8 @@ let tokenizer1 = CLIPTokenizer(
   merges: "examples/open_clip/bpe_simple_vocab_16e6.txt")
 
 let prompt =
+  //  "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
+  //  "a professional photograph of an astronaut riding a horse, detailed, 8k"
   "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
 let negativePrompt = ""
 
@@ -636,11 +632,21 @@ var targetSize = Tensor<FloatType>(.CPU, .C(512))
 targetSize[0..<256] = targetHeight
 targetSize[256..<512] = targetWidth
 
+// let random = Python.import("random")
+// let numpy = Python.import("numpy")
+// let torch = Python.import("torch")
+
 let kvs = graph.withNoGrad {
   var crossattn = graph.variable(.GPU(0), .CHW(2, 77, 2048), of: FloatType.self)
   crossattn[0..<2, 0..<77, 0..<768] = c0
   crossattn[0..<2, 0..<77, 768..<2048] = c1
   crossattn[0..<1, 0..<77, 0..<2048].full(0)
+  /*
+  let crossattnNumpy = numpy.load("/home/liu/workspace/swift-diffusion/context.np.npy")
+  let crossattnTensor = try! Tensor<Float>(numpy: crossattnNumpy)
+  let crossattn = graph.variable(Tensor<FloatType>(from: crossattnTensor).toGPU(0))
+  debugPrint(crossattn)
+  */
   let unetFixed = UNetXLFixed(batchSize: 2)
   unetFixed.compile(inputs: crossattn)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f32.ckpt") {
@@ -740,11 +746,15 @@ let unconditionalGuidanceScale: Float = 5
 let scaleFactor: Float = 0.13025
 let startHeight = 128
 let startWidth = 128
-let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 50)
+let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 30)
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
 // This is for Karras scheduler (used in DPM++ 2M Karras)
 let sigmas = model.karrasSigmas(sigmasForTimesteps[0]...sigmasForTimesteps[999])
+// let sigmas: [Float] = [14.6146, 11.9484,  9.9172,  8.3028,  6.9739,  5.9347,  5.0878,  4.3728,
+//          3.7997,  3.3211,  2.9183,  2.5671,  2.2765,  2.0260,  1.8024,  1.6129,
+//          1.4458,  1.2931,  1.1606,  1.0410,  0.9324,  0.8299,  0.7380,  0.6524,
+//          0.5693,  0.4924,  0.4179,  0.3417,  0.2653,  0.1793,  0.0000]
 
 let startTime = Date()
 let z = graph.withNoGrad {
@@ -757,12 +767,44 @@ let z = graph.withNoGrad {
   vector[1..<2, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
   vector[0..<1, 2304..<2816] = graph.variable(targetSize.toGPU(0))
   vector[1..<2, 2304..<2816] = graph.variable(targetSize.toGPU(0))
-  let unet = UNetXL(batchSize: 2)
+  /*
+  let vectorNumpy = numpy.load("/home/liu/workspace/swift-diffusion/y.np.npy")
+  let vectorTensor = try! Tensor<Float>(numpy: vectorNumpy)
+  let vector = graph.variable(Tensor<FloatType>(from: vectorTensor).toGPU(0))
+  debugPrint(vector)
+
+  random.seed(42)
+  numpy.random.seed(42)
+  torch.manual_seed(42)
+  torch.cuda.manual_seed_all(42)
+
+  let torchX = torch.randn([1, 4, 128, 128]).numpy()
+  let x_T = graph.variable(Tensor<FloatType>(from: try! Tensor<Float>(numpy: torchX)).toGPU(0))
+  */
   let x_T = graph.variable(.GPU(0), .NCHW(1, 4, 128, 128), of: FloatType.self)
   x_T.randn(std: 1, mean: 0)
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, 128, 128), of: FloatType.self)
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
+  /*
+  let streamlit_helpers = Python.import("scripts.demo.streamlit_helpers")
+  var version_dict: [String: PythonObject] = [
+    "H": 1024,
+    "W": 1024,
+    "C": 4,
+    "f": 8,
+    "is_legacy": false,
+    "config": "/home/liu/workspace/generative-models/configs/inference/sd_xl_base.yaml",
+    "ckpt": "/home/liu/workspace/generative-models/checkpoints/sd_xl_base_0.9.safetensors",
+    "is_guided": true,
+  ]
+  let state = streamlit_helpers.init_st(version_dict)
+  let unetModel = state["model"].model
+  let crossattnNumpy = numpy.load("/home/liu/workspace/swift-diffusion/context.np.npy")
+  let crossattnPy = torch.from_numpy(crossattnNumpy).cuda()
+  let vectorPy = torch.from_numpy(vectorNumpy).cuda()
+  */
+  let unet = UNetXL(batchSize: 2)
   unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector] + kvs)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f32.ckpt") {
     $0.read("unet", model: unet)
@@ -770,6 +812,7 @@ let z = graph.withNoGrad {
   var oldDenoised: DynamicGraph.Tensor<FloatType>? = nil
   // Now do DPM++ 2M Karras sampling. (DPM++ 2S a Karras requires two denoising per step, not ideal for my use case).
   x = sigmas[0] * x
+  // let timesteps = [999, 965, 932, 899, 865, 832, 799, 765, 732, 699, 666, 632, 599, 566, 532, 499, 466, 432, 399, 366, 333, 299, 266, 233, 199, 166, 133, 99, 66, 33]
   for i in 0..<model.steps {
     let sigma = sigmas[i]
     let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
@@ -780,6 +823,8 @@ let z = graph.withNoGrad {
     let cOut = -sigma
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
+    // let etPy = unetModel(torch.from_numpy(xIn.rawValue.toCPU()).cuda(), torch.full([1], timestep).cuda(), ["crossattn": crossattnPy, "vector": vectorPy])
+    // var et = graph.variable(Tensor<FloatType>(from: try! Tensor<Float>(numpy: etPy.detach().cpu().numpy())).toGPU(0))
     var et = unet(inputs: xIn, [t, vector] + kvs)[0].as(of: FloatType.self)
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: FloatType.self)

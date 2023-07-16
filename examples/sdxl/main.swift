@@ -17,6 +17,7 @@ var version_dict: [String: PythonObject] = [
 ]
 
 let state = streamlit_helpers.init_st(version_dict)
+/*
 let init_dict: [String: PythonObject] = [
   "orig_width": 1280,
   "orig_height": 1024,
@@ -34,10 +35,12 @@ let out = streamlit_helpers.do_sample(
   state["model"], sampler, value_dict, 1, 1024, 1024, 4, 8,
   force_uc_zero_embeddings: [PythonObject](), return_latents: false)
 print(out)
+*/
 // let state_dict = state["model"].conditioner.embedders[0].transformer.state_dict()
 // let state_dict = state["model"].conditioner.embedders[1].model.state_dict()
-// let state_dict = state["model"].model.state_dict()
-// print(state_dict.keys())
+let state_dict = state["model"].model.state_dict()
+print(state["model"].model.diffusion_model)
+print(state_dict.keys())
 
 /* OpenAI CLIP L14 model.
 func CLIPTextEmbedding(vocabularySize: Int, maxLength: Int, embeddingSize: Int) -> (
@@ -479,14 +482,16 @@ graph.withNoGrad {
   debugPrint(c[1][10..<11, 0..<1280])
   let pooled = c[1][10..<11, 0..<1280] * textProjection
   debugPrint(pooled)
+  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
     $0.write("text_model", model: textModel)
     $0.write("text_projection", tensor: textProjectionTensor)
   }
+  */
 }
 */
 
-/* SDXL Base UNet
+// SDXL Base UNet
 func timeEmbedding(timesteps: Int, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
 > {
@@ -868,7 +873,7 @@ func BlockLayer(
 
 func MiddleBlock(
   channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
-  x: Model.IO, emb: Model.IO
+  attentionBlock: Int, x: Model.IO, emb: Model.IO
 ) -> ((PythonObject) -> Void, Model.IO, [Input]) {
   precondition(channels % numHeadChannels == 0)
   let numHeads = channels / numHeadChannels
@@ -876,14 +881,12 @@ func MiddleBlock(
   let (inLayerNorm1, inLayerConv2d1, embLayer1, outLayerNorm1, outLayerConv2d1, _, resBlock1) =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   var out = resBlock1(x, emb)
-  let kvs = [Input(), Input()]
+  let kvs = (0..<(attentionBlock * 2)).map { _ in Input() }
   let (
     transformerReader, transformer
   ) = SpatialTransformer(
-    prefix: "middle_block.1",
-    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, depth: 1,
-    t: embeddingSize,
-    intermediateSize: channels * 4)
+    prefix: "middle_block.1", ch: channels, k: k, h: numHeads, b: batchSize, height: height,
+    width: width, depth: attentionBlock, t: embeddingSize, intermediateSize: channels * 4)
   out = transformer([out] + kvs)
   let (inLayerNorm2, inLayerConv2d2, embLayer2, outLayerNorm2, outLayerConv2d2, _, resBlock2) =
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
@@ -1124,8 +1127,7 @@ func UNetXL(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   var out = inputBlocks
   let (middleReader, middleBlock, middleKVs) = MiddleBlock(
     channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
-    embeddingSize: 77,
-    x: out, emb: emb)
+    embeddingSize: 77, attentionBlock: 10, x: out, emb: emb)
   out = middleBlock
   let (outputReader, outputBlocks, outputKVs) = OutputBlocks(
     channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
@@ -1242,7 +1244,7 @@ func BlockLayerFixed(
 
 func MiddleBlockFixed(
   channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
-  c: Model.IO
+  attentionBlock: Int, c: Model.IO
 ) -> ((PythonObject) -> Void, Model.IO) {
   precondition(channels % numHeadChannels == 0)
   let numHeads = channels / numHeadChannels
@@ -1250,10 +1252,8 @@ func MiddleBlockFixed(
   let (
     transformerReader, transformer
   ) = SpatialTransformerFixed(
-    prefix: "middle_block.1",
-    ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width, depth: 1,
-    t: embeddingSize,
-    intermediateSize: channels * 4)
+    prefix: "middle_block.1", ch: channels, k: k, h: numHeads, b: batchSize, height: height,
+    width: width, depth: attentionBlock, t: embeddingSize, intermediateSize: channels * 4)
   let out = transformer(c)
   return (transformerReader, out)
 }
@@ -1359,7 +1359,7 @@ func UNetXLFixed(batchSize: Int) -> ((PythonObject) -> Void, Model) {
   var out = inputBlocks
   let (middleReader, middleBlock) = MiddleBlockFixed(
     channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
-    embeddingSize: 77, c: c)
+    embeddingSize: 77, attentionBlock: 10, c: c)
   out.append(middleBlock)
   let (outputReader, outputBlocks) = OutputBlocksFixed(
     channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
@@ -1414,4 +1414,3 @@ graph.withNoGrad {
     $0.write("unet", model: unet)
   }
 }
-*/
