@@ -227,7 +227,7 @@ func InputBlocks(
   startWidth: Int, embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO
 ) -> ([Model.IO], Model.IO, [Input]) {
   let conv2d = Convolution(
-    groups: 1, filters: 320, filterSize: [3, 3],
+    groups: 1, filters: channels[0], filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   var out = conv2d(x)
   var layerStart = 1
@@ -322,29 +322,33 @@ func OutputBlocks(
   return (out, kvs)
 }
 
-func UNetXL(batchSize: Int) -> Model {
+func UNetXL(
+  batchSize: Int, startHeight: Int, startWidth: Int, channels: [Int],
+  attentionRes: KeyValuePairs<Int, Int>
+) -> Model {
   let x = Input()
   let t_emb = Input()
   let y = Input()
-  let timeEmbed = TimeEmbed(modelChannels: 320)
-  let labelEmbed = LabelEmbed(modelChannels: 320)
+  let middleBlockAttentionBlock = attentionRes.last!.value
+  let attentionRes = [Int: Int](uniqueKeysWithValues: attentionRes.map { ($0.key, $0.value) })
+  let timeEmbed = TimeEmbed(modelChannels: channels[0])
+  let labelEmbed = LabelEmbed(modelChannels: channels[0])
   let emb = timeEmbed(t_emb) + labelEmbed(y)
-  let attentionRes: [Int: Int] = [2: 2, 4: 10]
-
+  let middleBlockSizeMult = 1 << (channels.count - 1)
   let (inputs, inputBlocks, inputKVs) = InputBlocks(
-    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: 128,
-    startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb)
+    channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    x: x, emb: emb)
   var out = inputBlocks
   let (middleBlock, middleKVs) = MiddleBlock(
-    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
-    embeddingSize: 77, attentionBlock: 10, x: out, emb: emb)
+    channels: channels.last!, numHeadChannels: 64, batchSize: batchSize,
+    height: startHeight / middleBlockSizeMult, width: startWidth / middleBlockSizeMult,
+    embeddingSize: 77, attentionBlock: middleBlockAttentionBlock, x: out, emb: emb)
   out = middleBlock
   let (outputBlocks, outputKVs) = OutputBlocks(
-    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: 128,
-    startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb,
-    inputs: inputs)
+    channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    x: out, emb: emb, inputs: inputs)
   out = outputBlocks
   let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
   out = outNorm(out)
@@ -497,20 +501,28 @@ func OutputBlocksFixed(
   return outs
 }
 
-func UNetXLFixed(batchSize: Int) -> Model {
+func UNetXLFixed(
+  batchSize: Int, startHeight: Int, startWidth: Int, channels: [Int],
+  attentionRes: KeyValuePairs<Int, Int>
+) -> Model {
   let c = Input()
-  let attentionRes: [Int: Int] = [2: 2, 4: 10]
+  let middleBlockAttentionBlock = attentionRes.last!.value
+  let attentionRes = [Int: Int](uniqueKeysWithValues: attentionRes.map { ($0.key, $0.value) })
   let inputBlocks = InputBlocksFixed(
-    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: 128, startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, c: c)
+    channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    c: c)
   var out = inputBlocks
+  let middleBlockSizeMult = 1 << (channels.count - 1)
   let middleBlock = MiddleBlockFixed(
-    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
-    embeddingSize: 77, attentionBlock: 10, c: c)
+    channels: channels.last!, numHeadChannels: 64, batchSize: batchSize,
+    height: startHeight / middleBlockSizeMult, width: startWidth / middleBlockSizeMult,
+    embeddingSize: 77, attentionBlock: middleBlockAttentionBlock, c: c)
   out.append(middleBlock)
   let outputBlocks = OutputBlocksFixed(
-    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: 128, startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, c: c)
+    channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    c: c)
   out.append(contentsOf: outputBlocks)
   return Model([c], out)
 }
@@ -631,12 +643,17 @@ let targetHeight = Tensor<FloatType>(
 var targetSize = Tensor<FloatType>(.CPU, .C(512))
 targetSize[0..<256] = targetHeight
 targetSize[256..<512] = targetWidth
+let aestheticScore = Tensor<FloatType>(
+  from: timeEmbedding(timestep: 6.0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
+let negativeAestheticScore = Tensor<FloatType>(
+  from: timeEmbedding(
+    timestep: 2.5, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
 
 // let random = Python.import("random")
 // let numpy = Python.import("numpy")
 // let torch = Python.import("torch")
 
-let kvs = graph.withNoGrad {
+let kvs0 = graph.withNoGrad {
   var crossattn = graph.variable(.GPU(0), .CHW(2, 77, 2048), of: FloatType.self)
   crossattn[0..<2, 0..<77, 0..<768] = c0
   crossattn[0..<2, 0..<77, 768..<2048] = c1
@@ -647,12 +664,25 @@ let kvs = graph.withNoGrad {
   let crossattn = graph.variable(Tensor<FloatType>(from: crossattnTensor).toGPU(0))
   debugPrint(crossattn)
   */
-  let unetFixed = UNetXLFixed(batchSize: 2)
-  unetFixed.compile(inputs: crossattn)
+  let unetBaseFixed = UNetXLFixed(
+    batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
+    attentionRes: [2: 2, 4: 10])
+  unetBaseFixed.compile(inputs: crossattn)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
-    $0.read("unet_fixed", model: unetFixed)
+    $0.read("unet_fixed", model: unetBaseFixed)
   }
-  return unetFixed(inputs: crossattn).map { $0.as(of: FloatType.self) }
+  return unetBaseFixed(inputs: crossattn).map { $0.as(of: FloatType.self) }
+}
+
+let kvs1 = graph.withNoGrad {
+  let unetRefinerFixed = UNetXLFixed(
+    batchSize: 2, startHeight: 128, startWidth: 128, channels: [384, 768, 1536, 1536],
+    attentionRes: [2: 4, 4: 4])
+  unetRefinerFixed.compile(inputs: c1)
+  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_refiner_0.9_f16.ckpt") {
+    $0.read("unet_fixed", model: unetRefinerFixed)
+  }
+  return unetRefinerFixed(inputs: c1).map { $0.as(of: FloatType.self) }
 }
 
 public struct DiffusionModel {
@@ -746,6 +776,7 @@ let unconditionalGuidanceScale: Float = 5
 let scaleFactor: Float = 0.13025
 let startHeight = 128
 let startWidth = 128
+let refinerTimestep: Float = 300
 let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 30)
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
@@ -758,15 +789,23 @@ let sigmas = model.karrasSigmas(sigmasForTimesteps[0]...sigmasForTimesteps[999])
 
 let startTime = Date()
 let z = graph.withNoGrad {
-  var vector = graph.variable(.GPU(0), .NC(2, 2816), of: FloatType.self)
-  vector[0..<2, 0..<1280] = pooled
-  vector[0..<1, 0..<1280].full(0)
-  vector[0..<1, 1280..<1792] = graph.variable(originalSize.toGPU(0))
-  vector[1..<2, 1280..<1792] = graph.variable(originalSize.toGPU(0))
-  vector[0..<1, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
-  vector[1..<2, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
-  vector[0..<1, 2304..<2816] = graph.variable(targetSize.toGPU(0))
-  vector[1..<2, 2304..<2816] = graph.variable(targetSize.toGPU(0))
+  var vector0 = graph.variable(.GPU(0), .NC(2, 2816), of: FloatType.self)
+  vector0[0..<2, 0..<1280] = pooled
+  vector0[0..<1, 0..<1280].full(0)
+  vector0[0..<1, 1280..<1792] = graph.variable(originalSize.toGPU(0))
+  vector0[1..<2, 1280..<1792] = graph.variable(originalSize.toGPU(0))
+  vector0[0..<1, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
+  vector0[1..<2, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
+  vector0[0..<1, 2304..<2816] = graph.variable(targetSize.toGPU(0))
+  vector0[1..<2, 2304..<2816] = graph.variable(targetSize.toGPU(0))
+  var vector1 = graph.variable(.GPU(0), .NC(2, 2560), of: FloatType.self)
+  vector1[0..<2, 0..<1280] = pooled
+  vector1[0..<1, 1280..<1792] = graph.variable(originalSize.toGPU(0))
+  vector1[1..<2, 1280..<1792] = graph.variable(originalSize.toGPU(0))
+  vector1[0..<1, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
+  vector1[1..<2, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
+  vector1[0..<1, 2304..<2560] = graph.variable(negativeAestheticScore.toGPU(0))
+  vector1[1..<2, 2304..<2560] = graph.variable(aestheticScore.toGPU(0))
   /*
   let vectorNumpy = numpy.load("/home/liu/workspace/swift-diffusion/y.np.npy")
   let vectorTensor = try! Tensor<Float>(numpy: vectorNumpy)
@@ -804,20 +843,38 @@ let z = graph.withNoGrad {
   let crossattnPy = torch.from_numpy(crossattnNumpy).cuda()
   let vectorPy = torch.from_numpy(vectorNumpy).cuda()
   */
-  let unet = UNetXL(batchSize: 2)
-  unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector] + kvs)
+  var unet = UNetXL(
+    batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
+    attentionRes: [2: 2, 4: 10])
+  unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector0] + kvs0)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
     $0.read("unet", model: unet)
   }
   var oldDenoised: DynamicGraph.Tensor<FloatType>? = nil
   // Now do DPM++ 2M Karras sampling. (DPM++ 2S a Karras requires two denoising per step, not ideal for my use case).
   x = sigmas[0] * x
+  var refinerPass = false
   // let timesteps = [999, 965, 932, 899, 865, 832, 799, 765, 732, 699, 666, 632, 599, 566, 532, 499, 466, 432, 399, 366, 333, 299, 266, 233, 199, 166, 133, 99, 66, 33]
   for i in 0..<model.steps {
     let sigma = sigmas[i]
     let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
-    let ts = timeEmbedding(timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
+    if timestep <= refinerTimestep && !refinerPass {
+      unet = UNetXL(
+        batchSize: 2, startHeight: 128, startWidth: 128, channels: [384, 768, 1536, 1536],
+        attentionRes: [2: 4, 4: 4])
+      let ts = timeEmbedding(
+        timestep: timestep, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000
+      )
       .toGPU(0)
+      unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector1] + kvs1)
+      graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_refiner_0.9_f16.ckpt") {
+        $0.read("unet", model: unet)
+      }
+      refinerPass = true
+    }
+    let ts = timeEmbedding(
+      timestep: timestep, batchSize: 2, embeddingSize: refinerPass ? 384 : 320, maxPeriod: 10_000
+    ).toGPU(0)
     let t = graph.variable(Tensor<FloatType>(from: ts))
     let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
     let cOut = -sigma
@@ -825,7 +882,8 @@ let z = graph.withNoGrad {
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     // let etPy = unetModel(torch.from_numpy(xIn.rawValue.toCPU()).cuda(), torch.full([1], timestep).cuda(), ["crossattn": crossattnPy, "vector": vectorPy])
     // var et = graph.variable(Tensor<FloatType>(from: try! Tensor<Float>(numpy: etPy.detach().cpu().numpy())).toGPU(0))
-    var et = unet(inputs: xIn, [t, vector] + kvs)[0].as(of: FloatType.self)
+    var et = unet(inputs: xIn, refinerPass ? [t, vector1] + kvs1 : [t, vector0] + kvs0)[0].as(
+      of: FloatType.self)
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: FloatType.self)
     var etCond = graph.variable(

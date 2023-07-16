@@ -11,8 +11,8 @@ var version_dict: [String: PythonObject] = [
   "C": 4,
   "f": 8,
   "is_legacy": false,
-  "config": "/home/liu/workspace/generative-models/configs/inference/sd_xl_base.yaml",
-  "ckpt": "/home/liu/workspace/generative-models/checkpoints/sd_xl_base_0.9.safetensors",
+  "config": "/home/liu/workspace/generative-models/configs/inference/sd_xl_refiner.yaml",
+  "ckpt": "/home/liu/workspace/generative-models/checkpoints/sd_xl_refiner_0.9.safetensors",
   "is_guided": true,
 ]
 
@@ -975,7 +975,7 @@ func InputBlocks(
   embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO
 ) -> ((PythonObject) -> Void, [Model.IO], Model.IO, [Input]) {
   let conv2d = Convolution(
-    groups: 1, filters: 320, filterSize: [3, 3],
+    groups: 1, filters: channels[0], filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   var out = conv2d(x)
   var layerStart = 1
@@ -1111,29 +1111,33 @@ func OutputBlocks(
   return (reader, out, kvs)
 }
 
-func UNetXL(batchSize: Int) -> ((PythonObject) -> Void, Model) {
+func UNetXL(
+  batchSize: Int, startHeight: Int, startWidth: Int, channels: [Int],
+  attentionRes: KeyValuePairs<Int, Int>
+) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let t_emb = Input()
   let y = Input()
-  let (timeFc0, timeFc2, timeEmbed) = TimeEmbed(modelChannels: 320)
-  let (labelFc0, labelFc2, labelEmbed) = LabelEmbed(modelChannels: 320)
+  let middleBlockAttentionBlock = attentionRes.last!.value
+  let attentionRes = [Int: Int](uniqueKeysWithValues: attentionRes.map { ($0.key, $0.value) })
+  let (timeFc0, timeFc2, timeEmbed) = TimeEmbed(modelChannels: channels[0])
+  let (labelFc0, labelFc2, labelEmbed) = LabelEmbed(modelChannels: channels[0])
   let emb = timeEmbed(t_emb) + labelEmbed(y)
-  let attentionRes: [Int: Int] = [2: 2, 4: 10]
-
+  let middleBlockSizeMult = 1 << (channels.count - 1)
   let (inputReader, inputs, inputBlocks, inputKVs) = InputBlocks(
-    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: 128,
-    startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, x: x, emb: emb)
+    channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    x: x, emb: emb)
   var out = inputBlocks
   let (middleReader, middleBlock, middleKVs) = MiddleBlock(
-    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
-    embeddingSize: 77, attentionBlock: 10, x: out, emb: emb)
+    channels: channels.last!, numHeadChannels: 64, batchSize: batchSize,
+    height: startHeight / middleBlockSizeMult, width: startWidth / middleBlockSizeMult,
+    embeddingSize: 77, attentionBlock: middleBlockAttentionBlock, x: out, emb: emb)
   out = middleBlock
   let (outputReader, outputBlocks, outputKVs) = OutputBlocks(
-    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: 128,
-    startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, x: out, emb: emb,
-    inputs: inputs)
+    channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    x: out, emb: emb, inputs: inputs)
   out = outputBlocks
   let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
   out = outNorm(out)
@@ -1350,20 +1354,28 @@ func OutputBlocksFixed(
   return (reader, outs)
 }
 
-func UNetXLFixed(batchSize: Int) -> ((PythonObject) -> Void, Model) {
+func UNetXLFixed(
+  batchSize: Int, startHeight: Int, startWidth: Int, channels: [Int],
+  attentionRes: KeyValuePairs<Int, Int>
+) -> ((PythonObject) -> Void, Model) {
   let c = Input()
-  let attentionRes: [Int: Int] = [2: 2, 4: 10]
+  let middleBlockAttentionBlock = attentionRes.last!.value
+  let attentionRes = [Int: Int](uniqueKeysWithValues: attentionRes.map { ($0.key, $0.value) })
   let (inputReader, inputBlocks) = InputBlocksFixed(
-    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: 128, startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, c: c)
+    channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    c: c)
   var out = inputBlocks
+  let middleBlockSizeMult = 1 << (channels.count - 1)
   let (middleReader, middleBlock) = MiddleBlockFixed(
-    channels: 1280, numHeadChannels: 64, batchSize: batchSize, height: 32, width: 32,
-    embeddingSize: 77, attentionBlock: 10, c: c)
+    channels: channels.last!, numHeadChannels: 64, batchSize: batchSize,
+    height: startHeight / middleBlockSizeMult, width: startWidth / middleBlockSizeMult,
+    embeddingSize: 77, attentionBlock: middleBlockAttentionBlock, c: c)
   out.append(middleBlock)
   let (outputReader, outputBlocks) = OutputBlocksFixed(
-    channels: [320, 640, 1280], numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: 128, startWidth: 128, embeddingSize: 77, attentionRes: attentionRes, c: c)
+    channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    c: c)
   out.append(contentsOf: outputBlocks)
   let reader: (PythonObject) -> Void = { state_dict in
     inputReader(state_dict)
@@ -1383,9 +1395,9 @@ torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
 let x = torch.randn([2, 4, 128, 128])
-let c = torch.randn([2, 77, 2048])
+let c = torch.randn([2, 77, 1280])
 let t = torch.full([1], 981)
-let y = torch.randn([2, 2816])
+let y = torch.randn([2, 2560])
 
 let ret = state["model"].model(x.cuda(), t.cuda(), ["crossattn": c.cuda(), "vector": y.cuda()])
 print(ret)
@@ -1393,13 +1405,17 @@ print(ret)
 let graph = DynamicGraph()
 
 let t_emb = graph.variable(
-  timeEmbedding(timesteps: 981, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000)
+  timeEmbedding(timesteps: 981, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000)
 ).toGPU(1)
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(1)
 let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(1)
 let yTensor = graph.variable(try! Tensor<Float>(numpy: y.numpy())).toGPU(1)
-let (readerFixed, unetFixed) = UNetXLFixed(batchSize: 2)
-let (reader, unet) = UNetXL(batchSize: 2)
+let (readerFixed, unetFixed) = UNetXLFixed(
+  batchSize: 2, startHeight: 128, startWidth: 128, channels: [384, 768, 1536, 1536],
+  attentionRes: [2: 4, 4: 4])
+let (reader, unet) = UNetXL(
+  batchSize: 2, startHeight: 128, startWidth: 128, channels: [384, 768, 1536, 1536],
+  attentionRes: [2: 4, 4: 4])
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 graph.withNoGrad {
   let _ = unetFixed(inputs: cTensor)
