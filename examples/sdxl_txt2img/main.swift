@@ -548,6 +548,7 @@ let unconditionalTokens1 = tokenizer1.tokenize(
   text: negativePrompt, truncation: true, maxLength: 77, paddingToken: 0)
 
 let graph = DynamicGraph()
+graph.maxConcurrency = .limit(1)
 
 let tokensTensor0 = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let tokensTensor1 = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
@@ -667,6 +668,7 @@ let kvs0 = graph.withNoGrad {
   let unetBaseFixed = UNetXLFixed(
     batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
     attentionRes: [2: 2, 4: 10])
+  unetBaseFixed.maxConcurrency = .limit(1)
   unetBaseFixed.compile(inputs: crossattn)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
     $0.read("unet_fixed", model: unetBaseFixed)
@@ -678,6 +680,7 @@ let kvs1 = graph.withNoGrad {
   let unetRefinerFixed = UNetXLFixed(
     batchSize: 2, startHeight: 128, startWidth: 128, channels: [384, 768, 1536, 1536],
     attentionRes: [2: 4, 4: 4])
+  unetRefinerFixed.maxConcurrency = .limit(1)
   unetRefinerFixed.compile(inputs: c1)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_refiner_0.9_f16.ckpt") {
     $0.read("unet_fixed", model: unetRefinerFixed)
@@ -846,6 +849,7 @@ let z = graph.withNoGrad {
   var unet = UNetXL(
     batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
     attentionRes: [2: 2, 4: 10])
+  unet.maxConcurrency = .limit(1)
   unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector0] + kvs0)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
     $0.read("unet", model: unet)
@@ -866,6 +870,7 @@ let z = graph.withNoGrad {
         timestep: timestep, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000
       )
       .toGPU(0)
+      unet.maxConcurrency = .limit(1)
       unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector1] + kvs1)
       graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_refiner_0.9_f16.ckpt") {
         $0.read("unet", model: unet)
