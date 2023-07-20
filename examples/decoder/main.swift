@@ -213,6 +213,7 @@ let pl_sd = torch.load(
   map_location: "cpu")
 let sd = pl_sd["state_dict"]
 */
+/*
 let streamlit_helpers = Python.import("scripts.demo.streamlit_helpers")
 
 var version_dict: [String: PythonObject] = [
@@ -228,6 +229,11 @@ var version_dict: [String: PythonObject] = [
 
 let state = streamlit_helpers.init_st(version_dict)
 let sd = state["model"].first_stage_model.state_dict()
+*/
+let safetensors_torch = Python.import("safetensors.torch")
+let file = safetensors_torch.load_file("/home/liu/workspace/swift-diffusion/sdxl_vae.safetensors")
+print(file.keys())
+let sd = file
 /*
 let model = ldm_util.instantiate_from_config(config.model)
 model.load_state_dict(sd, strict: false)
