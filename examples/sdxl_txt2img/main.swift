@@ -1,3 +1,4 @@
+import C_ccv
 import Diffusion
 import Foundation
 import NNC
@@ -534,6 +535,18 @@ let tokenizer1 = CLIPTokenizer(
   vocabulary: "examples/open_clip/vocab_16e6.json",
   merges: "examples/open_clip/bpe_simple_vocab_16e6.txt")
 
+/*
+precondition(tokenizer0.vocabulary.count == tokenizer1.vocabulary.count)
+for (key, value) in tokenizer0.vocabulary {
+  precondition(value == tokenizer1.vocabulary[key])
+}
+
+precondition(tokenizer0.bpeRanks.count == tokenizer1.bpeRanks.count)
+for (key, value) in tokenizer0.bpeRanks {
+  precondition(value == tokenizer1.bpeRanks[key])
+}
+*/
+
 let prompt =
   //  "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
   //  "a professional photograph of an astronaut riding a horse, detailed, 8k"
@@ -549,6 +562,63 @@ let unconditionalTokens1 = tokenizer1.tokenize(
 
 let graph = DynamicGraph()
 graph.maxConcurrency = .limit(1)
+
+/*
+graph.withNoGrad {
+  var df = DataFrame(fromCSV: "/home/liu/workspace/swift-diffusion/files.txt", automaticUseHeader: false)!
+  df["image"] = df["0"].toLoadImage()
+  df["resize"] = df["image"]!.toImageJitter(Float.self, size: ImageJitter.Size(rows: 768, cols: 768), resize: ImageJitter.Resize(min: 768, max: 768), centerCrop: true, normalize: ImageJitter.Normalize(mean: [127.5, 127.5, 127.5], std: [127.5, 127.5, 127.5]))
+  DynamicGraph.setSeed(0)
+  df.shuffle()
+  let encoder = Encoder(
+    channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 96, startHeight: 96)
+  let decoder = Decoder(
+    channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 96, startHeight: 96)
+  var loadedEncoder = false
+  var loadedDecoder = false
+  for (i, batch) in df["resize", Tensor<Float>.self].enumerated() {
+    let initImage = graph.variable(Tensor<FloatType>(from: batch.reshaped(.NCHW(1, 768, 768, 3))).toGPU(0)).permuted(0, 3, 1, 2).copied()
+    if !loadedEncoder {
+      encoder.compile(inputs: initImage)
+      graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_f32_v1.0.ckpt") {
+        $0.read("encoder", model: encoder)
+      }
+      loadedEncoder = true
+    }
+    let encodedImage = encoder(inputs: initImage)[0].as(of: FloatType.self)[0..<1, 0..<4, 0..<96, 0..<96].copied()
+    if !loadedDecoder {
+      decoder.compile(inputs: encodedImage)
+      graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_f32_v1.0.ckpt") {
+        $0.read("decoder", model: decoder)
+      }
+      loadedDecoder = true
+    }
+    var result = decoder(inputs: encodedImage)[0].as(of: FloatType.self)
+    result = result.toCPU()
+    let u8Img = ccv_dense_matrix_new(768, 768, Int32(CCV_8U | CCV_C3), nil, 0)!
+    for y in 0..<768 {
+      for x in 0..<768 {
+        let (r, g, b) = (result[0, 0, y, x], result[0, 1, y, x], result[0, 2, y, x])
+        u8Img.pointee.data.u8[y * 768 * 3 + x * 3] = UInt8(
+          min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
+        u8Img.pointee.data.u8[y * 768 * 3 + x * 3 + 1] = UInt8(
+          min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
+        u8Img.pointee.data.u8[y * 768 * 3 + x * 3 + 2] = UInt8(
+          min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
+      }
+    }
+    let encodedImageCPU = encodedImage.toCPU()
+    var smallerImg: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
+    ccv_resample(u8Img, &smallerImg, 0, 0.125, 0.125, Int32(CCV_INTER_AREA))
+    for y in 0..<96 {
+      for x in 0..<96 {
+        print("\(encodedImageCPU[0, 0, y, x]),\(encodedImageCPU[0, 1, y, x]),\(encodedImageCPU[0, 2, y, x]),\(encodedImageCPU[0, 3, y, x]),\(smallerImg!.pointee.data.u8[y * 96 * 3 + x * 3]),\(smallerImg!.pointee.data.u8[y * 96 * 3 + x * 3 + 1]),\(smallerImg!.pointee.data.u8[y * 96 * 3 + x * 3 + 2])")
+      }
+    }
+  }
+}
+exit(0)
+*/
 
 let tokensTensor0 = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let tokensTensor1 = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
@@ -927,7 +997,7 @@ graph.withNoGrad {
   }
   let z32 = DynamicGraph.Tensor<Float>(from: z)
   decoder.compile(inputs: z32)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_v1.0_f16.ckpt") {
     $0.read("decoder", model: decoder)
   }
   let img = decoder(inputs: z32)[0].as(of: Float.self)

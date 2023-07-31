@@ -244,7 +244,8 @@ let state = streamlit_helpers.init_st(version_dict)
 let sd = state["model"].first_stage_model.state_dict()
 */
 let safetensors_torch = Python.import("safetensors.torch")
-let file = safetensors_torch.load_file("/home/liu/workspace/swift-diffusion/sdxl_vae.safetensors")
+let file = safetensors_torch.load_file(
+  "/home/liu/workspace/swift-diffusion/sdxl_vae_fp16_fix.safetensors")
 let sd = file
 /*
 let model = ldm_util.instantiate_from_config(config.model)

@@ -2,7 +2,7 @@ import Foundation
 import NNC
 
 var df = DataFrame(
-  fromCSV: "/home/liu/workspace/swift-diffusion/regression.csv", automaticUseHeader: false)!
+  fromCSV: "/home/liu/workspace/swift-diffusion/sdxl_vae_regression.csv", automaticUseHeader: false)!
 
 let graph = DynamicGraph()
 
@@ -11,9 +11,15 @@ let linear = Dense(count: 3)
 var adamOptimizer = AdamOptimizer(graph, rate: 0.01)
 adamOptimizer.parameters = [linear.parameters]
 
+let scaleFactor: Float = 0.13025
+
 df["x"] = df["0", "1", "2", "3"].map {
   (c0: String, c1: String, c2: String, c3: String) -> Tensor<Float> in
-  return Tensor<Float>([Float(c0)!, Float(c1)!, Float(c2)!, Float(c3)!], .CPU, .C(4))
+  return Tensor<Float>(
+    [
+      Float(c0)! * scaleFactor, Float(c1)! * scaleFactor, Float(c2)! * scaleFactor,
+      Float(c3)! * scaleFactor,
+    ], .CPU, .C(4))
 }
 
 func f(x: Float) -> Float {
@@ -41,14 +47,18 @@ func linear_srgb_to_oklab(r: Float, g: Float, b: Float) -> (Float, Float, Float)
 }
 
 df["y"] = df["4", "5", "6"].map { (c0: String, c1: String, c2: String) -> Tensor<Float> in
-  let r = f(x: Float(c0)! / 255)
-  let g = f(x: Float(c1)! / 255)
-  let b = f(x: Float(c2)! / 255)
-  let (okl, oka, okb) = linear_srgb_to_oklab(r: r, g: g, b: b)
-  return Tensor<Float>([okl, oka, okb], .CPU, .C(3))
+  return Tensor<Float>([Float(c0)!, Float(c1)!, Float(c2)!], .CPU, .C(3))
+  // let r = f(x: Float(c0)! / 255)
+  // let g = f(x: Float(c1)! / 255)
+  // let b = f(x: Float(c2)! / 255)
+  // let (okl, oka, okb) = linear_srgb_to_oklab(r: r, g: g, b: b)
+  // return Tensor<Float>([okl, oka, okb], .CPU, .C(3))
 }
 
 var batchedDf = df["x", "y"].combine(size: 128, repeating: 1)
+
+let weight = graph.variable(.CPU, .NC(3, 4), of: Float.self)
+let bias = graph.variable(.CPU, .C(3), of: Float.self)
 
 for epoch in 0..<10 {
   batchedDf.shuffle()
@@ -74,10 +84,12 @@ for epoch in 0..<10 {
     adamOptimizer.rate = 0.0001
   }
   print("epoch: \(epoch), loss: \(totalLoss / Double(batchedDf.count))")
+  linear.weight.copy(to: weight)
+  linear.bias.copy(to: bias)
+  debugPrint(weight)
+  debugPrint(bias)
 }
 
-let weight = graph.variable(.CPU, .NC(3, 4), of: Float.self)
-let bias = graph.variable(.CPU, .C(3), of: Float.self)
 linear.weight.copy(to: weight)
 linear.bias.copy(to: bias)
 debugPrint(weight)

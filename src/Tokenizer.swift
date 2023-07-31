@@ -9,8 +9,8 @@ public struct CLIPTokenizer {
       self.second = second
     }
   }
-  let vocabulary: [String: Int32]
-  let bpeRanks: [Pair: Int]
+  public let vocabulary: [String: Int32]
+  public let bpeRanks: [Pair: Int]
   public let unknownToken: Int32
   public let startToken: Int32
   public let endToken: Int32
