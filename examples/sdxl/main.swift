@@ -644,14 +644,17 @@ func BasicTransformerBlock(
       "diffusion_model.\(prefix).attn1.to_k.weight"
     ].cpu().numpy()
     tokeys1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn1_to_k_weight))
+    print("\"diffusion_model.\(prefix).attn1.to_k.weight\": [\"\(tokeys1.weight.name)\"],")
     let attn1_to_q_weight = state_dict[
       "diffusion_model.\(prefix).attn1.to_q.weight"
     ].cpu().numpy()
     toqueries1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn1_to_q_weight))
+    print("\"diffusion_model.\(prefix).attn1.to_q.weight\": [\"\(toqueries1.weight.name)\"],")
     let attn1_to_v_weight = state_dict[
       "diffusion_model.\(prefix).attn1.to_v.weight"
     ].cpu().numpy()
     tovalues1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn1_to_v_weight))
+    print("\"diffusion_model.\(prefix).attn1.to_v.weight\": [\"\(tovalues1.weight.name)\"],")
     let attn1_to_out_weight = state_dict[
       "diffusion_model.\(prefix).attn1.to_out.0.weight"
     ].cpu().numpy()
@@ -660,7 +663,9 @@ func BasicTransformerBlock(
     ].cpu().numpy()
     unifyheads1.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: attn1_to_out_weight))
+    print("\"diffusion_model.\(prefix).attn1.to_out.0.weight\": [\"\(unifyheads1.weight.name)\"],")
     unifyheads1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn1_to_out_bias))
+    print("\"diffusion_model.\(prefix).attn1.to_out.0.bias\": [\"\(unifyheads1.bias.name)\"],")
     let ff_net_0_proj_weight = state_dict[
       "diffusion_model.\(prefix).ff.net.0.proj.weight"
     ].cpu().numpy()
@@ -675,6 +680,8 @@ func BasicTransformerBlock(
       from: try! Tensor<Float>(numpy: ff_net_0_proj_weight[intermediateSize..., ...]))
     fc11.parameters(for: .bias).copy(
       from: try! Tensor<Float>(numpy: ff_net_0_proj_bias[intermediateSize...]))
+    print("\"diffusion_model.\(prefix).ff.net.0.proj.weight\": [\"\(fc10.weight.name)\", \"\(fc11.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).ff.net.0.proj.bias\": [\"\(fc10.bias.name)\", \"\(fc11.bias.name)\"],")
     let ff_net_2_weight = state_dict[
       "diffusion_model.\(prefix).ff.net.2.weight"
     ].cpu().numpy()
@@ -683,10 +690,13 @@ func BasicTransformerBlock(
     ].cpu().numpy()
     fc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: ff_net_2_weight))
     fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ff_net_2_bias))
+    print("\"diffusion_model.\(prefix).ff.net.2.weight\": [\"\(fc2.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).ff.net.2.bias\": [\"\(fc2.bias.name)\"],")
     let attn2_to_q_weight = state_dict[
       "diffusion_model.\(prefix).attn2.to_q.weight"
     ].cpu().numpy()
     toqueries2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_q_weight))
+    print("\"diffusion_model.\(prefix).attn2.to_q.weight\": [\"\(toqueries2.weight.name)\"],")
     let attn2_to_out_weight = state_dict[
       "diffusion_model.\(prefix).attn2.to_out.0.weight"
     ].cpu().numpy()
@@ -696,6 +706,8 @@ func BasicTransformerBlock(
     unifyheads2.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: attn2_to_out_weight))
     unifyheads2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn2_to_out_bias))
+    print("\"diffusion_model.\(prefix).attn2.to_out.0.weight\": [\"\(unifyheads2.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).attn2.to_out.0.bias\": [\"\(unifyheads2.bias.name)\"],")
     let norm1_weight = state_dict[
       "diffusion_model.\(prefix).norm1.weight"
     ]
@@ -706,6 +718,8 @@ func BasicTransformerBlock(
     .cpu().numpy()
     layerNorm1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm1_weight))
     layerNorm1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm1_bias))
+    print("\"diffusion_model.\(prefix).norm1.weight\": [\"\(layerNorm1.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).norm1.bias\": [\"\(layerNorm1.bias.name)\"],")
     let norm2_weight = state_dict[
       "diffusion_model.\(prefix).norm2.weight"
     ]
@@ -716,6 +730,8 @@ func BasicTransformerBlock(
     .cpu().numpy()
     layerNorm2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm2_weight))
     layerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm2_bias))
+    print("\"diffusion_model.\(prefix).norm2.weight\": [\"\(layerNorm2.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).norm2.bias\": [\"\(layerNorm2.bias.name)\"],")
     let norm3_weight = state_dict[
       "diffusion_model.\(prefix).norm3.weight"
     ]
@@ -726,6 +742,8 @@ func BasicTransformerBlock(
     .cpu().numpy()
     layerNorm3.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm3_weight))
     layerNorm3.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm3_bias))
+    print("\"diffusion_model.\(prefix).norm3.weight\": [\"\(layerNorm3.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).norm3.bias\": [\"\(layerNorm3.bias.name)\"],")
   }
   return (reader, Model([x, keys, values], [out]))
 }
@@ -763,12 +781,16 @@ func SpatialTransformer(
     let norm_bias = state_dict["diffusion_model.\(prefix).norm.bias"].cpu().numpy()
     norm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm_weight))
     norm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm_bias))
+    print("\"diffusion_model.\(prefix).norm.weight\": [\"\(norm.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).norm.bias\": [\"\(norm.bias.name)\"],")
     let proj_in_weight = state_dict["diffusion_model.\(prefix).proj_in.weight"]
       .cpu().numpy()
     let proj_in_bias = state_dict["diffusion_model.\(prefix).proj_in.bias"]
       .cpu().numpy()
     projIn.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: proj_in_weight))
     projIn.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: proj_in_bias))
+    print("\"diffusion_model.\(prefix).proj_in.weight\": [\"\(projIn.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).proj_in.bias\": [\"\(projIn.bias.name)\"],")
     for reader in readers {
       reader(state_dict)
     }
@@ -779,6 +801,8 @@ func SpatialTransformer(
       .cpu().numpy()
     projOut.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: proj_out_weight))
     projOut.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: proj_out_bias))
+    print("\"diffusion_model.\(prefix).proj_out.weight\": [\"\(projOut.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).proj_out.bias\": [\"\(projOut.bias.name)\"],")
   }
   return (reader, Model([x] + kvs, [out]))
 }
@@ -820,6 +844,8 @@ func BlockLayer(
     ].cpu().numpy()
     inLayerNorm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: in_layers_0_weight))
     inLayerNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_0_bias))
+    print("\"diffusion_model.\(prefix).\(layerStart).0.in_layers.0.weight\": [\"\(inLayerNorm.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).\(layerStart).0.in_layers.0.bias\": [\"\(inLayerNorm.bias.name)\"],")
     let in_layers_2_weight = state_dict[
       "diffusion_model.\(prefix).\(layerStart).0.in_layers.2.weight"
     ].cpu().numpy()
@@ -828,6 +854,8 @@ func BlockLayer(
     ].cpu().numpy()
     inLayerConv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: in_layers_2_weight))
     inLayerConv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_2_bias))
+    print("\"diffusion_model.\(prefix).\(layerStart).0.in_layers.2.weight\": [\"\(inLayerConv2d.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).\(layerStart).0.in_layers.2.bias\": [\"\(inLayerConv2d.bias.name)\"],")
     let emb_layers_1_weight = state_dict[
       "diffusion_model.\(prefix).\(layerStart).0.emb_layers.1.weight"
     ].cpu().numpy()
@@ -836,6 +864,8 @@ func BlockLayer(
     ].cpu().numpy()
     embLayer.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: emb_layers_1_weight))
     embLayer.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: emb_layers_1_bias))
+    print("\"diffusion_model.\(prefix).\(layerStart).0.emb_layers.1.weight\": [\"\(embLayer.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).\(layerStart).0.emb_layers.1.bias\": [\"\(embLayer.bias.name)\"],")
     let out_layers_0_weight = state_dict[
       "diffusion_model.\(prefix).\(layerStart).0.out_layers.0.weight"
     ].cpu().numpy()
@@ -844,6 +874,8 @@ func BlockLayer(
     ].cpu().numpy()
     outLayerNorm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_layers_0_weight))
     outLayerNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_layers_0_bias))
+    print("\"diffusion_model.\(prefix).\(layerStart).0.out_layers.0.weight\": [\"\(outLayerNorm.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).\(layerStart).0.out_layers.0.bias\": [\"\(outLayerNorm.bias.name)\"],")
     let out_layers_3_weight = state_dict[
       "diffusion_model.\(prefix).\(layerStart).0.out_layers.3.weight"
     ].cpu().numpy()
@@ -853,6 +885,8 @@ func BlockLayer(
     outLayerConv2d.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: out_layers_3_weight))
     outLayerConv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_layers_3_bias))
+    print("\"diffusion_model.\(prefix).\(layerStart).0.out_layers.3.weight\": [\"\(outLayerConv2d.weight.name)\"],")
+    print("\"diffusion_model.\(prefix).\(layerStart).0.out_layers.3.bias\": [\"\(outLayerConv2d.bias.name)\"],")
     if let skipModel = skipModel {
       let skip_connection_weight = state_dict[
         "diffusion_model.\(prefix).\(layerStart).0.skip_connection.weight"
@@ -863,6 +897,8 @@ func BlockLayer(
       skipModel.parameters(for: .weight).copy(
         from: try! Tensor<Float>(numpy: skip_connection_weight))
       skipModel.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: skip_connection_bias))
+      print("\"diffusion_model.\(prefix).\(layerStart).0.skip_connection.weight\": [\"\(skipModel.weight.name)\"],")
+      print("\"diffusion_model.\(prefix).\(layerStart).0.skip_connection.bias\": [\"\(skipModel.bias.name)\"],")
     }
     if let transformerReader = transformerReader {
       transformerReader(state_dict)
@@ -899,6 +935,8 @@ func MiddleBlock(
     inLayerNorm1.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: in_layers_0_0_weight))
     inLayerNorm1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_0_0_bias))
+    print("\"diffusion_model.middle_block.0.in_layers.0.weight\": [\"\(inLayerNorm1.weight.name)\"],")
+    print("\"diffusion_model.middle_block.0.in_layers.0.bias\": [\"\(inLayerNorm1.bias.name)\"],")
     let in_layers_0_2_weight = state_dict["diffusion_model.middle_block.0.in_layers.2.weight"]
       .cpu().numpy()
     let in_layers_0_2_bias = state_dict["diffusion_model.middle_block.0.in_layers.2.bias"].cpu()
@@ -906,12 +944,16 @@ func MiddleBlock(
     inLayerConv2d1.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: in_layers_0_2_weight))
     inLayerConv2d1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_0_2_bias))
+    print("\"diffusion_model.middle_block.0.in_layers.2.weight\": [\"\(inLayerConv2d1.weight.name)\"],")
+    print("\"diffusion_model.middle_block.0.in_layers.2.bias\": [\"\(inLayerConv2d1.bias.name)\"],")
     let emb_layers_0_1_weight = state_dict["diffusion_model.middle_block.0.emb_layers.1.weight"]
       .cpu().numpy()
     let emb_layers_0_1_bias = state_dict["diffusion_model.middle_block.0.emb_layers.1.bias"].cpu()
       .numpy()
     embLayer1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: emb_layers_0_1_weight))
     embLayer1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: emb_layers_0_1_bias))
+    print("\"diffusion_model.middle_block.0.emb_layers.1.weight\": [\"\(embLayer1.weight.name)\"],")
+    print("\"diffusion_model.middle_block.0.emb_layers.1.bias\": [\"\(embLayer1.bias.name)\"],")
     let out_layers_0_0_weight = state_dict["diffusion_model.middle_block.0.out_layers.0.weight"]
       .cpu().numpy()
     let out_layers_0_0_bias = state_dict[
@@ -920,6 +962,8 @@ func MiddleBlock(
     outLayerNorm1.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: out_layers_0_0_weight))
     outLayerNorm1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_layers_0_0_bias))
+    print("\"diffusion_model.middle_block.0.out_layers.0.weight\": [\"\(outLayerNorm1.weight.name)\"],")
+    print("\"diffusion_model.middle_block.0.out_layers.0.bias\": [\"\(outLayerNorm1.bias.name)\"],")
     let out_layers_0_3_weight = state_dict["diffusion_model.middle_block.0.out_layers.3.weight"]
       .cpu().numpy()
     let out_layers_0_3_bias = state_dict["diffusion_model.middle_block.0.out_layers.3.bias"].cpu()
@@ -928,6 +972,8 @@ func MiddleBlock(
       from: try! Tensor<Float>(numpy: out_layers_0_3_weight))
     outLayerConv2d1.parameters(for: .bias).copy(
       from: try! Tensor<Float>(numpy: out_layers_0_3_bias))
+    print("\"diffusion_model.middle_block.0.out_layers.3.weight\": [\"\(outLayerConv2d1.weight.name)\"],")
+    print("\"diffusion_model.middle_block.0.out_layers.3.bias\": [\"\(outLayerConv2d1.bias.name)\"],")
     transformerReader(state_dict)
     let in_layers_2_0_weight = state_dict["diffusion_model.middle_block.2.in_layers.0.weight"]
       .cpu().numpy()
@@ -936,6 +982,8 @@ func MiddleBlock(
     inLayerNorm2.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: in_layers_2_0_weight))
     inLayerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_2_0_bias))
+    print("\"diffusion_model.middle_block.2.in_layers.0.weight\": [\"\(inLayerNorm2.weight.name)\"],")
+    print("\"diffusion_model.middle_block.2.in_layers.0.bias\": [\"\(inLayerNorm2.bias.name)\"],")
     let in_layers_2_2_weight = state_dict["diffusion_model.middle_block.2.in_layers.2.weight"]
       .cpu().numpy()
     let in_layers_2_2_bias = state_dict["diffusion_model.middle_block.2.in_layers.2.bias"].cpu()
@@ -943,12 +991,16 @@ func MiddleBlock(
     inLayerConv2d2.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: in_layers_2_2_weight))
     inLayerConv2d2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_layers_2_2_bias))
+    print("\"diffusion_model.middle_block.2.in_layers.2.weight\": [\"\(inLayerConv2d2.weight.name)\"],")
+    print("\"diffusion_model.middle_block.2.in_layers.2.bias\": [\"\(inLayerConv2d2.bias.name)\"],")
     let emb_layers_2_1_weight = state_dict["diffusion_model.middle_block.2.emb_layers.1.weight"]
       .cpu().numpy()
     let emb_layers_2_1_bias = state_dict["diffusion_model.middle_block.2.emb_layers.1.bias"].cpu()
       .numpy()
     embLayer2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: emb_layers_2_1_weight))
     embLayer2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: emb_layers_2_1_bias))
+    print("\"diffusion_model.middle_block.2.emb_layers.1.weight\": [\"\(embLayer2.weight.name)\"],")
+    print("\"diffusion_model.middle_block.2.emb_layers.1.bias\": [\"\(embLayer2.bias.name)\"],")
     let out_layers_2_0_weight = state_dict["diffusion_model.middle_block.2.out_layers.0.weight"]
       .cpu().numpy()
     let out_layers_2_0_bias = state_dict[
@@ -957,6 +1009,8 @@ func MiddleBlock(
     outLayerNorm2.parameters(for: .weight).copy(
       from: try! Tensor<Float>(numpy: out_layers_2_0_weight))
     outLayerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_layers_2_0_bias))
+    print("\"diffusion_model.middle_block.2.out_layers.0.weight\": [\"\(outLayerNorm2.weight.name)\"],")
+    print("\"diffusion_model.middle_block.2.out_layers.0.bias\": [\"\(outLayerNorm2.bias.name)\"],")
     let out_layers_2_3_weight = state_dict["diffusion_model.middle_block.2.out_layers.3.weight"]
       .cpu().numpy()
     let out_layers_2_3_bias = state_dict["diffusion_model.middle_block.2.out_layers.3.bias"].cpu()
@@ -965,6 +1019,8 @@ func MiddleBlock(
       from: try! Tensor<Float>(numpy: out_layers_2_3_weight))
     outLayerConv2d2.parameters(for: .bias).copy(
       from: try! Tensor<Float>(numpy: out_layers_2_3_bias))
+    print("\"diffusion_model.middle_block.2.out_layers.3.weight\": [\"\(outLayerConv2d2.weight.name)\"],")
+    print("\"diffusion_model.middle_block.2.out_layers.3.bias\": [\"\(outLayerConv2d2.bias.name)\"],")
   }
   return (reader, out, kvs)
 }
@@ -1017,6 +1073,8 @@ func InputBlocks(
           .numpy()
         downsample.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: op_weight))
         downsample.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: op_bias))
+        print("\"diffusion_model.input_blocks.\(downLayer).0.op.weight\": [\"\(downsample.weight.name)\"],")
+        print("\"diffusion_model.input_blocks.\(downLayer).0.op.bias\": [\"\(downsample.bias.name)\"],")
       }
       readers.append(reader)
       height = height / 2
@@ -1031,6 +1089,8 @@ func InputBlocks(
     let input_blocks_0_0_bias = state_dict["diffusion_model.input_blocks.0.0.bias"].cpu().numpy()
     conv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_weight))
     conv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: input_blocks_0_0_bias))
+      print("\"diffusion_model.input_blocks.0.0.weight\": [\"\(conv2d.weight.name)\"],")
+      print("\"diffusion_model.input_blocks.0.0.bias\": [\"\(conv2d.bias.name)\"],")
     for reader in readers {
       reader(state_dict)
     }
@@ -1097,6 +1157,8 @@ func OutputBlocks(
             .cpu().numpy()
           conv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: op_weight))
           conv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: op_bias))
+          print("\"diffusion_model.output_blocks.\(upLayer).\(convIdx).conv.weight\": [\"\(conv2d.weight.name)\"],")
+          print("\"diffusion_model.output_blocks.\(upLayer).\(convIdx).conv.bias\": [\"\(conv2d.bias.name)\"],")
         }
         readers.append(reader)
       }
@@ -1153,16 +1215,24 @@ func UNetXL(
     let time_embed_2_bias = state_dict["diffusion_model.time_embed.2.bias"].cpu().numpy()
     timeFc0.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_0_weight))
     timeFc0.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_0_bias))
+    print("\"diffusion_model.time_embed.0.weight\": [\"\(timeFc0.weight.name)\"],")
+    print("\"diffusion_model.time_embed.0.bias\": [\"\(timeFc0.bias.name)\"],")
     timeFc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: time_embed_2_weight))
     timeFc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: time_embed_2_bias))
+    print("\"diffusion_model.time_embed.2.weight\": [\"\(timeFc2.weight.name)\"],")
+    print("\"diffusion_model.time_embed.2.bias\": [\"\(timeFc2.bias.name)\"],")
     let label_emb_0_0_weight = state_dict["diffusion_model.label_emb.0.0.weight"].cpu().numpy()
     let label_emb_0_0_bias = state_dict["diffusion_model.label_emb.0.0.bias"].cpu().numpy()
     let label_emb_0_2_weight = state_dict["diffusion_model.label_emb.0.2.weight"].cpu().numpy()
     let label_emb_0_2_bias = state_dict["diffusion_model.label_emb.0.2.bias"].cpu().numpy()
     labelFc0.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: label_emb_0_0_weight))
     labelFc0.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: label_emb_0_0_bias))
+    print("\"diffusion_model.label_emb.0.0.weight\": [\"\(labelFc0.weight.name)\"],")
+    print("\"diffusion_model.label_emb.0.0.bias\": [\"\(labelFc0.bias.name)\"],")
     labelFc2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: label_emb_0_2_weight))
     labelFc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: label_emb_0_2_bias))
+    print("\"diffusion_model.label_emb.0.2.weight\": [\"\(labelFc2.weight.name)\"],")
+    print("\"diffusion_model.label_emb.0.2.bias\": [\"\(labelFc2.bias.name)\"],")
     inputReader(state_dict)
     middleReader(state_dict)
     outputReader(state_dict)
@@ -1170,10 +1240,14 @@ func UNetXL(
     let out_0_bias = state_dict["diffusion_model.out.0.bias"].cpu().numpy()
     outNorm.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_0_weight))
     outNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_0_bias))
+    print("\"diffusion_model.out.0.weight\": [\"\(outNorm.weight.name)\"],")
+    print("\"diffusion_model.out.0.bias\": [\"\(outNorm.bias.name)\"],")
     let out_2_weight = state_dict["diffusion_model.out.2.weight"].cpu().numpy()
     let out_2_bias = state_dict["diffusion_model.out.2.bias"].cpu().numpy()
     outConv2d.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_2_weight))
     outConv2d.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_2_bias))
+    print("\"diffusion_model.out.2.weight\": [\"\(outConv2d.weight.name)\"],")
+    print("\"diffusion_model.out.2.bias\": [\"\(outConv2d.bias.name)\"],")
   }
   return (reader, Model([x, t_emb, y] + inputKVs + middleKVs + outputKVs, [out]))
 }
@@ -1197,11 +1271,13 @@ func BasicTransformerBlockFixed(
     let attn2_to_k_weight = state_dict[
       "diffusion_model.\(prefix).attn2.to_k.weight"
     ].cpu().numpy()
-    tokeys2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_k_weight))
+    tokeys2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_k_weight))
+    // print("\"diffusion_model.\(prefix).attn2.to_k.weight\": [\"\(tokeys2.weight.name)\"],")
     let attn2_to_v_weight = state_dict[
       "diffusion_model.\(prefix).attn2.to_v.weight"
     ].cpu().numpy()
-    tovalues2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
+    tovalues2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
+    // print("\"diffusion_model.\(prefix).attn2.to_v.weight\": [\"\(tovalues2.weight.name)\"],")
   }
   return (reader, attn2)
 }
