@@ -2,7 +2,7 @@ import NNC
 
 /// Text Model
 
-func CLIPTextEmbedding<T: TensorNumeric>(
+public func CLIPTextEmbedding<T: TensorNumeric>(
   _ dataType: T.Type, batchSize: Int, vocabularySize: Int, maxLength: Int, embeddingSize: Int
 )
   -> Model

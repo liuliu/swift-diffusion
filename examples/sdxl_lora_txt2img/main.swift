@@ -6,7 +6,33 @@ import PNG
 
 typealias FloatType = Float16
 
-func OpenCLIPTextModel(
+private func LoRAOpenCLIPMLP(hiddenSize: Int, intermediateSize: Int) -> Model {
+  let x = Input()
+  let fc1 = LoRADense(count: intermediateSize)
+  var out = fc1(x)
+  out = GELU()(out)
+  let fc2 = LoRADense(count: hiddenSize)
+  out = fc2(out)
+  return Model([x], [out])
+}
+
+public func LoRAOpenCLIPEncoderLayer(k: Int, h: Int, b: Int, t: Int, intermediateSize: Int) -> Model
+{
+  let x = Input()
+  let casualAttentionMask = Input()
+  let layerNorm1 = LayerNorm(epsilon: 1e-5, axis: [1])
+  var out = layerNorm1(x)
+  let attention = LoRACLIPAttention(k: k, h: h, b: b, t: t)
+  out = attention(out, casualAttentionMask) + x
+  let residual = out
+  let layerNorm2 = LayerNorm(epsilon: 1e-5, axis: [1])
+  out = layerNorm2(out)
+  let mlp = LoRAOpenCLIPMLP(hiddenSize: k * h, intermediateSize: intermediateSize)
+  out = mlp(out) + residual
+  return Model([x, casualAttentionMask], [out])
+}
+
+func LoRAOpenCLIPTextModel(
   vocabularySize: Int, maxLength: Int, embeddingSize: Int, numLayers: Int, numHeads: Int,
   batchSize: Int, intermediateSize: Int
 ) -> Model {
@@ -24,29 +50,29 @@ func OpenCLIPTextModel(
       penultimate = out
     }
     let encoderLayer =
-      OpenCLIPEncoderLayer(
+      LoRAOpenCLIPEncoderLayer(
         k: k, h: numHeads, b: batchSize, t: maxLength, intermediateSize: intermediateSize)
     out = encoderLayer(out, casualAttentionMask)
   }
   let finalLayerNorm = LayerNorm(epsilon: 1e-5, axis: [1])
   out = finalLayerNorm(out)
-  return Model([tokens, positions, casualAttentionMask], [penultimate!, out])
+  return Model([tokens, positions, casualAttentionMask], [penultimate!, out], trainable: false)
 }
 
-func LabelEmbed(modelChannels: Int) -> Model {
+func LoRALabelEmbed(modelChannels: Int) -> Model {
   let x = Input()
-  let fc0 = Dense(count: modelChannels * 4)
+  let fc0 = LoRADense(count: modelChannels * 4)
   var out = fc0(x).swish()
-  let fc2 = Dense(count: modelChannels * 4)
+  let fc2 = LoRADense(count: modelChannels * 4)
   out = fc2(out)
   return Model([x], [out])
 }
 
-func CrossAttentionKeysAndValues(k: Int, h: Int, b: Int, hw: Int, t: Int) -> Model {
+func LoRACrossAttentionKeysAndValues(k: Int, h: Int, b: Int, hw: Int, t: Int) -> Model {
   let x = Input()
   let keys = Input()
   let values = Input()
-  let toqueries = Dense(count: k * h, noBias: true)
+  let toqueries = LoRADense(count: k * h, noBias: true)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
     .permuted(0, 2, 1, 3)
   var dot = Matmul(transposeB: (2, 3))(queries, keys)
@@ -55,12 +81,12 @@ func CrossAttentionKeysAndValues(k: Int, h: Int, b: Int, hw: Int, t: Int) -> Mod
   dot = dot.reshaped([b, h, hw, t])
   var out = dot * values
   out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, hw, h * k])
-  let unifyheads = Dense(count: k * h)
+  let unifyheads = LoRADense(count: k * h)
   out = unifyheads(out)
   return Model([x, keys, values], [out])
 }
 
-private func BasicTransformerBlock(
+private func LoRABasicTransformerBlock(
   prefix: String, k: Int, h: Int, b: Int, hw: Int, t: Int, intermediateSize: Int
 ) -> Model {
   let x = Input()
@@ -68,23 +94,23 @@ private func BasicTransformerBlock(
   let values = Input()
   let layerNorm1 = LayerNorm(epsilon: 1e-5, axis: [2])
   var out = layerNorm1(x)
-  let attn1 = SelfAttention(k: k, h: h, b: b, hw: hw)
+  let attn1 = LoRASelfAttention(k: k, h: h, b: b, hw: hw)
   out = attn1(out) + x
   var residual = out
   let layerNorm2 = LayerNorm(epsilon: 1e-5, axis: [2])
   out = layerNorm2(out)
-  let attn2 = CrossAttentionKeysAndValues(
+  let attn2 = LoRACrossAttentionKeysAndValues(
     k: k, h: h, b: b, hw: hw, t: t)
   out = attn2(out, keys, values) + residual
   residual = out
   let layerNorm3 = LayerNorm(epsilon: 1e-5, axis: [2])
   out = layerNorm3(out)
-  let ff = FeedForward(hiddenSize: k * h, intermediateSize: intermediateSize)
+  let ff = LoRAFeedForward(hiddenSize: k * h, intermediateSize: intermediateSize)
   out = ff(out) + residual
   return Model([x, keys, values], [out])
 }
 
-private func SpatialTransformer(
+private func LoRASpatialTransformer(
   prefix: String,
   ch: Int, k: Int, h: Int, b: Int, height: Int, width: Int, depth: Int, t: Int,
   intermediateSize: Int
@@ -93,7 +119,7 @@ private func SpatialTransformer(
   var kvs = [Model.IO]()
   let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
   var out = norm(x)
-  let projIn = Convolution(groups: 1, filters: k * h, filterSize: [1, 1])
+  let projIn = LoRAConvolution(groups: 1, filters: k * h, filterSize: [1, 1])
   let hw = height * width
   out = projIn(out).reshaped([b, k * h, hw]).permuted(0, 2, 1)
   for i in 0..<depth {
@@ -101,18 +127,18 @@ private func SpatialTransformer(
     kvs.append(keys)
     let values = Input()
     kvs.append(values)
-    let block = BasicTransformerBlock(
+    let block = LoRABasicTransformerBlock(
       prefix: "\(prefix).transformer_blocks.\(i)", k: k, h: h, b: b, hw: hw, t: t,
       intermediateSize: intermediateSize)
     out = block(out, keys, values)
   }
   out = out.reshaped([b, height, width, k * h]).permuted(0, 3, 1, 2)
-  let projOut = Convolution(groups: 1, filters: ch, filterSize: [1, 1])
+  let projOut = LoRAConvolution(groups: 1, filters: ch, filterSize: [1, 1])
   out = projOut(out) + x
   return Model([x] + kvs, [out])
 }
 
-func BlockLayer(
+private func LoRABlockLayer(
   prefix: String,
   layerStart: Int, skipConnection: Bool, attentionBlock: Int, channels: Int, numHeadChannels: Int,
   batchSize: Int, height: Int, width: Int, embeddingSize: Int, intermediateSize: Int
@@ -123,11 +149,11 @@ func BlockLayer(
   precondition(channels % numHeadChannels == 0)
   let numHeads = channels / numHeadChannels
   let k = numHeadChannels
-  let resBlock = ResBlock(b: batchSize, outChannels: channels, skipConnection: skipConnection)
+  let resBlock = LoRAResBlock(b: batchSize, outChannels: channels, skipConnection: skipConnection)
   var out = resBlock(x, emb)
   if attentionBlock > 0 {
     let c = (0..<(attentionBlock * 2)).map { _ in Input() }
-    let transformer = SpatialTransformer(
+    let transformer = LoRASpatialTransformer(
       prefix: "\(prefix).\(layerStart).1",
       ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width,
       depth: attentionBlock, t: embeddingSize,
@@ -138,7 +164,7 @@ func BlockLayer(
   return Model([x, emb] + kvs, [out])
 }
 
-func MiddleBlock(
+func LoRAMiddleBlock(
   channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
   attentionBlock: Int, x: Model.IO, emb: Model.IO
 ) -> (Model.IO, [Input]) {
@@ -146,24 +172,24 @@ func MiddleBlock(
   let numHeads = channels / numHeadChannels
   let k = numHeadChannels
   let resBlock1 =
-    ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
+    LoRAResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   var out = resBlock1(x, emb)
   let kvs = (0..<(attentionBlock * 2)).map { _ in Input() }
-  let transformer = SpatialTransformer(
+  let transformer = LoRASpatialTransformer(
     prefix: "middle_block.1", ch: channels, k: k, h: numHeads, b: batchSize, height: height,
     width: width, depth: attentionBlock, t: embeddingSize, intermediateSize: channels * 4)
   out = transformer([out] + kvs)
   let resBlock2 =
-    ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
+    LoRAResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   out = resBlock2(out, emb)
   return (out, kvs)
 }
 
-func InputBlocks(
+func LoRAInputBlocks(
   channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
   startWidth: Int, embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO
 ) -> ([Model.IO], Model.IO, [Input]) {
-  let conv2d = Convolution(
+  let conv2d = LoRAConvolution(
     groups: 1, filters: channels[0], filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   var out = conv2d(x)
@@ -177,7 +203,7 @@ func InputBlocks(
   for (i, channel) in channels.enumerated() {
     let attentionBlock = attentionRes[ds, default: 0]
     for _ in 0..<numRepeat {
-      let inputLayer = BlockLayer(
+      let inputLayer = LoRABlockLayer(
         prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
         attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
@@ -191,7 +217,7 @@ func InputBlocks(
       layerStart += 1
     }
     if i != channels.count - 1 {
-      let downsample = Convolution(
+      let downsample = LoRAConvolution(
         groups: 1, filters: channel, filterSize: [3, 3],
         hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [0, 0])))
       out = downsample(out)
@@ -205,7 +231,7 @@ func InputBlocks(
   return (passLayers, out, kvs)
 }
 
-func OutputBlocks(
+func LoRAOutputBlocks(
   channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
   startWidth: Int,
   embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO,
@@ -237,7 +263,7 @@ func OutputBlocks(
     for j in 0..<(numRepeat + 1) {
       out = Concat(axis: 1)(out, inputs[inputIdx])
       inputIdx -= 1
-      let outputLayer = BlockLayer(
+      let outputLayer = LoRABlockLayer(
         prefix: "output_blocks",
         layerStart: layerStart, skipConnection: true,
         attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
@@ -248,7 +274,7 @@ func OutputBlocks(
       kvs.append(contentsOf: c)
       if i > 0 && j == numRepeat {
         out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
-        let conv2d = Convolution(
+        let conv2d = LoRAConvolution(
           groups: 1, filters: channel, filterSize: [3, 3],
           hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
         out = conv2d(out)
@@ -259,7 +285,7 @@ func OutputBlocks(
   return (out, kvs)
 }
 
-func UNetXL(
+func LoRAUNetXL(
   batchSize: Int, startHeight: Int, startWidth: Int, channels: [Int],
   attentionRes: KeyValuePairs<Int, Int>
 ) -> Model {
@@ -268,21 +294,21 @@ func UNetXL(
   let y = Input()
   let middleBlockAttentionBlock = attentionRes.last!.value
   let attentionRes = [Int: Int](uniqueKeysWithValues: attentionRes.map { ($0.key, $0.value) })
-  let timeEmbed = TimeEmbed(modelChannels: channels[0])
-  let labelEmbed = LabelEmbed(modelChannels: channels[0])
+  let timeEmbed = LoRATimeEmbed(modelChannels: channels[0])
+  let labelEmbed = LoRALabelEmbed(modelChannels: channels[0])
   let emb = timeEmbed(t_emb) + labelEmbed(y)
   let middleBlockSizeMult = 1 << (channels.count - 1)
-  let (inputs, inputBlocks, inputKVs) = InputBlocks(
+  let (inputs, inputBlocks, inputKVs) = LoRAInputBlocks(
     channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
     x: x, emb: emb)
   var out = inputBlocks
-  let (middleBlock, middleKVs) = MiddleBlock(
+  let (middleBlock, middleKVs) = LoRAMiddleBlock(
     channels: channels.last!, numHeadChannels: 64, batchSize: batchSize,
     height: startHeight / middleBlockSizeMult, width: startWidth / middleBlockSizeMult,
     embeddingSize: 77, attentionBlock: middleBlockAttentionBlock, x: out, emb: emb)
   out = middleBlock
-  let (outputBlocks, outputKVs) = OutputBlocks(
+  let (outputBlocks, outputKVs) = LoRAOutputBlocks(
     channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
     x: out, emb: emb, inputs: inputs)
@@ -290,30 +316,30 @@ func UNetXL(
   let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
   out = outNorm(out)
   out = Swish()(out)
-  let outConv2d = Convolution(
+  let outConv2d = LoRAConvolution(
     groups: 1, filters: 4, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = outConv2d(out)
-  return Model([x, t_emb, y] + inputKVs + middleKVs + outputKVs, [out])
+  return Model([x, t_emb, y] + inputKVs + middleKVs + outputKVs, [out], trainable: false)
 }
 
-func CrossAttentionFixed(k: Int, h: Int, b: Int, hw: Int, t: Int) -> Model {
+func LoRACrossAttentionFixed(k: Int, h: Int, b: Int, hw: Int, t: Int) -> Model {
   let c = Input()
-  let tokeys = Dense(count: k * h, noBias: true)
-  let tovalues = Dense(count: k * h, noBias: true)
+  let tokeys = LoRADense(count: k * h, noBias: true)
+  let tovalues = LoRADense(count: k * h, noBias: true)
   let keys = tokeys(c).reshaped([b, t, h, k]).transposed(1, 2)
   let values = tovalues(c).reshaped([b, t, h, k]).transposed(1, 2)
   return Model([c], [keys, values])
 }
 
-func BasicTransformerBlockFixed(
+func LoRABasicTransformerBlockFixed(
   prefix: String, k: Int, h: Int, b: Int, hw: Int, t: Int, intermediateSize: Int
 ) -> Model {
-  let attn2 = CrossAttentionFixed(k: k, h: h, b: b, hw: hw, t: t)
+  let attn2 = LoRACrossAttentionFixed(k: k, h: h, b: b, hw: hw, t: t)
   return attn2
 }
 
-func SpatialTransformerFixed(
+func LoRASpatialTransformerFixed(
   prefix: String,
   ch: Int, k: Int, h: Int, b: Int, height: Int, width: Int, depth: Int, t: Int,
   intermediateSize: Int
@@ -322,7 +348,7 @@ func SpatialTransformerFixed(
   var outs = [Model.IO]()
   let hw = height * width
   for i in 0..<depth {
-    let block = BasicTransformerBlockFixed(
+    let block = LoRABasicTransformerBlockFixed(
       prefix: "\(prefix).transformer_blocks.\(i)", k: k, h: h, b: b, hw: hw, t: t,
       intermediateSize: intermediateSize)
     outs.append(block(c))
@@ -330,7 +356,7 @@ func SpatialTransformerFixed(
   return Model([c], outs)
 }
 
-func BlockLayerFixed(
+func LoRABlockLayerFixed(
   prefix: String,
   layerStart: Int, skipConnection: Bool, attentionBlock: Int, channels: Int, numHeadChannels: Int,
   batchSize: Int, height: Int, width: Int, embeddingSize: Int, intermediateSize: Int
@@ -338,7 +364,7 @@ func BlockLayerFixed(
   precondition(channels % numHeadChannels == 0)
   let numHeads = channels / numHeadChannels
   let k = numHeadChannels
-  let transformer = SpatialTransformerFixed(
+  let transformer = LoRASpatialTransformerFixed(
     prefix: "\(prefix).\(layerStart).1",
     ch: channels, k: k, h: numHeads, b: batchSize, height: height, width: width,
     depth: attentionBlock, t: embeddingSize,
@@ -346,21 +372,21 @@ func BlockLayerFixed(
   return transformer
 }
 
-func MiddleBlockFixed(
+func LoRAMiddleBlockFixed(
   channels: Int, numHeadChannels: Int, batchSize: Int, height: Int, width: Int, embeddingSize: Int,
   attentionBlock: Int, c: Model.IO
 ) -> Model.IO {
   precondition(channels % numHeadChannels == 0)
   let numHeads = channels / numHeadChannels
   let k = numHeadChannels
-  let transformer = SpatialTransformerFixed(
+  let transformer = LoRASpatialTransformerFixed(
     prefix: "middle_block.1", ch: channels, k: k, h: numHeads, b: batchSize, height: height,
     width: width, depth: attentionBlock, t: embeddingSize, intermediateSize: channels * 4)
   let out = transformer(c)
   return out
 }
 
-func InputBlocksFixed(
+func LoRAInputBlocksFixed(
   channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
   startWidth: Int,
   embeddingSize: Int, attentionRes: [Int: Int], c: Model.IO
@@ -375,7 +401,7 @@ func InputBlocksFixed(
     let attentionBlock = attentionRes[ds, default: 0]
     for _ in 0..<numRepeat {
       if attentionBlock > 0 {
-        let inputLayer = BlockLayerFixed(
+        let inputLayer = LoRABlockLayerFixed(
           prefix: "input_blocks",
           layerStart: layerStart, skipConnection: previousChannel != channel,
           attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
@@ -396,7 +422,7 @@ func InputBlocksFixed(
   return outs
 }
 
-func OutputBlocksFixed(
+func LoRAOutputBlocksFixed(
   channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
   startWidth: Int,
   embeddingSize: Int, attentionRes: [Int: Int], c: Model.IO
@@ -424,7 +450,7 @@ func OutputBlocksFixed(
     let attentionBlock = attentionRes[ds, default: 0]
     for _ in 0..<(numRepeat + 1) {
       if attentionBlock > 0 {
-        let outputLayer = BlockLayerFixed(
+        let outputLayer = LoRABlockLayerFixed(
           prefix: "output_blocks",
           layerStart: layerStart, skipConnection: true,
           attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
@@ -438,30 +464,30 @@ func OutputBlocksFixed(
   return outs
 }
 
-func UNetXLFixed(
+func LoRAUNetXLFixed(
   batchSize: Int, startHeight: Int, startWidth: Int, channels: [Int],
   attentionRes: KeyValuePairs<Int, Int>
 ) -> Model {
   let c = Input()
   let middleBlockAttentionBlock = attentionRes.last!.value
   let attentionRes = [Int: Int](uniqueKeysWithValues: attentionRes.map { ($0.key, $0.value) })
-  let inputBlocks = InputBlocksFixed(
+  let inputBlocks = LoRAInputBlocksFixed(
     channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
     c: c)
   var out = inputBlocks
   let middleBlockSizeMult = 1 << (channels.count - 1)
-  let middleBlock = MiddleBlockFixed(
+  let middleBlock = LoRAMiddleBlockFixed(
     channels: channels.last!, numHeadChannels: 64, batchSize: batchSize,
     height: startHeight / middleBlockSizeMult, width: startWidth / middleBlockSizeMult,
     embeddingSize: 77, attentionBlock: middleBlockAttentionBlock, c: c)
   out.append(middleBlock)
-  let outputBlocks = OutputBlocksFixed(
+  let outputBlocks = LoRAOutputBlocksFixed(
     channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
     startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
     c: c)
   out.append(contentsOf: outputBlocks)
-  return Model([c], out)
+  return Model([c], out, trainable: false)
 }
 
 let tokenizer0 = CLIPTokenizer(
@@ -470,18 +496,6 @@ let tokenizer0 = CLIPTokenizer(
 let tokenizer1 = CLIPTokenizer(
   vocabulary: "examples/open_clip/vocab_16e6.json",
   merges: "examples/open_clip/bpe_simple_vocab_16e6.txt")
-
-/*
-precondition(tokenizer0.vocabulary.count == tokenizer1.vocabulary.count)
-for (key, value) in tokenizer0.vocabulary {
-  precondition(value == tokenizer1.vocabulary[key])
-}
-
-precondition(tokenizer0.bpeRanks.count == tokenizer1.bpeRanks.count)
-for (key, value) in tokenizer0.bpeRanks {
-  precondition(value == tokenizer1.bpeRanks[key])
-}
-*/
 
 let prompt =
   //  "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k"
@@ -498,63 +512,6 @@ let unconditionalTokens1 = tokenizer1.tokenize(
 
 let graph = DynamicGraph()
 graph.maxConcurrency = .limit(1)
-
-/*
-graph.withNoGrad {
-  var df = DataFrame(fromCSV: "/home/liu/workspace/swift-diffusion/files.txt", automaticUseHeader: false)!
-  df["image"] = df["0"].toLoadImage()
-  df["resize"] = df["image"]!.toImageJitter(Float.self, size: ImageJitter.Size(rows: 768, cols: 768), resize: ImageJitter.Resize(min: 768, max: 768), centerCrop: true, normalize: ImageJitter.Normalize(mean: [127.5, 127.5, 127.5], std: [127.5, 127.5, 127.5]))
-  DynamicGraph.setSeed(0)
-  df.shuffle()
-  let encoder = Encoder(
-    channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 96, startHeight: 96)
-  let decoder = Decoder(
-    channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 96, startHeight: 96)
-  var loadedEncoder = false
-  var loadedDecoder = false
-  for (i, batch) in df["resize", Tensor<Float>.self].enumerated() {
-    let initImage = graph.variable(Tensor<FloatType>(from: batch.reshaped(.NCHW(1, 768, 768, 3))).toGPU(0)).permuted(0, 3, 1, 2).copied()
-    if !loadedEncoder {
-      encoder.compile(inputs: initImage)
-      graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_f32_v1.0.ckpt") {
-        $0.read("encoder", model: encoder)
-      }
-      loadedEncoder = true
-    }
-    let encodedImage = encoder(inputs: initImage)[0].as(of: FloatType.self)[0..<1, 0..<4, 0..<96, 0..<96].copied()
-    if !loadedDecoder {
-      decoder.compile(inputs: encodedImage)
-      graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_f32_v1.0.ckpt") {
-        $0.read("decoder", model: decoder)
-      }
-      loadedDecoder = true
-    }
-    var result = decoder(inputs: encodedImage)[0].as(of: FloatType.self)
-    result = result.toCPU()
-    let u8Img = ccv_dense_matrix_new(768, 768, Int32(CCV_8U | CCV_C3), nil, 0)!
-    for y in 0..<768 {
-      for x in 0..<768 {
-        let (r, g, b) = (result[0, 0, y, x], result[0, 1, y, x], result[0, 2, y, x])
-        u8Img.pointee.data.u8[y * 768 * 3 + x * 3] = UInt8(
-          min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
-        u8Img.pointee.data.u8[y * 768 * 3 + x * 3 + 1] = UInt8(
-          min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
-        u8Img.pointee.data.u8[y * 768 * 3 + x * 3 + 2] = UInt8(
-          min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
-      }
-    }
-    let encodedImageCPU = encodedImage.toCPU()
-    var smallerImg: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
-    ccv_resample(u8Img, &smallerImg, 0, 0.125, 0.125, Int32(CCV_INTER_AREA))
-    for y in 0..<96 {
-      for x in 0..<96 {
-        print("\(encodedImageCPU[0, 0, y, x]),\(encodedImageCPU[0, 1, y, x]),\(encodedImageCPU[0, 2, y, x]),\(encodedImageCPU[0, 3, y, x]),\(smallerImg!.pointee.data.u8[y * 96 * 3 + x * 3]),\(smallerImg!.pointee.data.u8[y * 96 * 3 + x * 3 + 1]),\(smallerImg!.pointee.data.u8[y * 96 * 3 + x * 3 + 2])")
-      }
-    }
-  }
-}
-exit(0)
-*/
 
 let tokensTensor0 = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let tokensTensor1 = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
@@ -580,13 +537,13 @@ let c0 = graph.withNoGrad {
   let tokensTensorGPU = tokensTensor0.toGPU(0)
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
-  let textModel0 = CLIPTextModel(
+  let textModel0 = LoRACLIPTextModel(
     FloatType.self,
     vocabularySize: 49408, maxLength: 77, embeddingSize: 768, numLayers: 11, numHeads: 12,
     batchSize: 2, intermediateSize: 3072, noFinalLayerNorm: true)
   textModel0.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/clip_vit_l14_f32.ckpt") {
-    $0.read("text_model", model: textModel0)
+  graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_lora_training.ckpt") {
+    $0.read("lora_text_model_0", model: textModel0)
   }
   return textModel0(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)[0].as(
     of: FloatType.self
@@ -597,14 +554,16 @@ let (c1, pooled) = graph.withNoGrad {
   let tokensTensorGPU = tokensTensor1.toGPU(0)
   let positionTensorGPU = positionTensor.toGPU(0)
   let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
-  let textModel1 = OpenCLIPTextModel(
+  let textModel1 = LoRAOpenCLIPTextModel(
     vocabularySize: 49408, maxLength: 77, embeddingSize: 1280, numLayers: 32, numHeads: 20,
     batchSize: 2, intermediateSize: 5120)
   let textProjection = graph.variable(.GPU(0), .NC(1280, 1280), of: FloatType.self)
   textModel1.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
   graph.openStore("/home/liu/workspace/swift-diffusion/open_clip_vit_bigg14_f16.ckpt") {
-    $0.read("text_model", model: textModel1)
     $0.read("text_projection", variable: textProjection)
+  }
+  graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_lora_training.ckpt") {
+    $0.read("lora_text_model_1", model: textModel1)
   }
   let c = textModel1(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU).map {
     $0.as(of: FloatType.self)
@@ -656,42 +615,20 @@ let negativeAestheticScore = Tensor<FloatType>(
   from: timeEmbedding(
     timestep: 2.5, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
 
-// let random = Python.import("random")
-// let numpy = Python.import("numpy")
-// let torch = Python.import("torch")
-
 let kvs0 = graph.withNoGrad {
   var crossattn = graph.variable(.GPU(0), .CHW(2, 77, 2048), of: FloatType.self)
   crossattn[0..<2, 0..<77, 0..<768] = c0
   crossattn[0..<2, 0..<77, 768..<2048] = c1
   crossattn[0..<1, 0..<77, 0..<2048].full(0)
-  /*
-  let crossattnNumpy = numpy.load("/home/liu/workspace/swift-diffusion/context.np.npy")
-  let crossattnTensor = try! Tensor<Float>(numpy: crossattnNumpy)
-  let crossattn = graph.variable(Tensor<FloatType>(from: crossattnTensor).toGPU(0))
-  debugPrint(crossattn)
-  */
-  let unetBaseFixed = UNetXLFixed(
+  let unetBaseFixed = LoRAUNetXLFixed(
     batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
     attentionRes: [2: 2, 4: 10])
   unetBaseFixed.maxConcurrency = .limit(1)
   unetBaseFixed.compile(inputs: crossattn)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
-    $0.read("unet_fixed", model: unetBaseFixed)
+  graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_lora_training.ckpt") {
+    $0.read("lora_unet_fixed", model: unetBaseFixed)
   }
   return unetBaseFixed(inputs: crossattn).map { $0.as(of: FloatType.self) }
-}
-
-let kvs1 = graph.withNoGrad {
-  let unetRefinerFixed = UNetXLFixed(
-    batchSize: 2, startHeight: 128, startWidth: 128, channels: [384, 768, 1536, 1536],
-    attentionRes: [2: 4, 4: 4])
-  unetRefinerFixed.maxConcurrency = .limit(1)
-  unetRefinerFixed.compile(inputs: c1)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_refiner_0.9_f16.ckpt") {
-    $0.read("unet_fixed", model: unetRefinerFixed)
-  }
-  return unetRefinerFixed(inputs: c1).map { $0.as(of: FloatType.self) }
 }
 
 public struct DiffusionModel {
@@ -779,22 +716,17 @@ extension DiffusionModel {
   }
 }
 
-DynamicGraph.setSeed(120)
+DynamicGraph.setSeed(20)
 
 let unconditionalGuidanceScale: Float = 5
 let scaleFactor: Float = 0.13025
 let startHeight = 128
 let startWidth = 128
-let refinerTimestep: Float = 300
 let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 30)
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
 // This is for Karras scheduler (used in DPM++ 2M Karras)
 let sigmas = model.karrasSigmas(sigmasForTimesteps[0]...sigmasForTimesteps[999])
-// let sigmas: [Float] = [14.6146, 11.9484,  9.9172,  8.3028,  6.9739,  5.9347,  5.0878,  4.3728,
-//          3.7997,  3.3211,  2.9183,  2.5671,  2.2765,  2.0260,  1.8024,  1.6129,
-//          1.4458,  1.2931,  1.1606,  1.0410,  0.9324,  0.8299,  0.7380,  0.6524,
-//          0.5693,  0.4924,  0.4179,  0.3417,  0.2653,  0.1793,  0.0000]
 
 let startTime = Date()
 let z = graph.withNoGrad {
@@ -807,84 +739,28 @@ let z = graph.withNoGrad {
   vector0[1..<2, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
   vector0[0..<1, 2304..<2816] = graph.variable(targetSize.toGPU(0))
   vector0[1..<2, 2304..<2816] = graph.variable(targetSize.toGPU(0))
-  var vector1 = graph.variable(.GPU(0), .NC(2, 2560), of: FloatType.self)
-  vector1[0..<2, 0..<1280] = pooled
-  vector1[0..<1, 1280..<1792] = graph.variable(originalSize.toGPU(0))
-  vector1[1..<2, 1280..<1792] = graph.variable(originalSize.toGPU(0))
-  vector1[0..<1, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
-  vector1[1..<2, 1792..<2304] = graph.variable(cropCoord.toGPU(0))
-  vector1[0..<1, 2304..<2560] = graph.variable(negativeAestheticScore.toGPU(0))
-  vector1[1..<2, 2304..<2560] = graph.variable(aestheticScore.toGPU(0))
-  /*
-  let vectorNumpy = numpy.load("/home/liu/workspace/swift-diffusion/y.np.npy")
-  let vectorTensor = try! Tensor<Float>(numpy: vectorNumpy)
-  let vector = graph.variable(Tensor<FloatType>(from: vectorTensor).toGPU(0))
-  debugPrint(vector)
-
-  random.seed(42)
-  numpy.random.seed(42)
-  torch.manual_seed(42)
-  torch.cuda.manual_seed_all(42)
-
-  let torchX = torch.randn([1, 4, 128, 128]).numpy()
-  let x_T = graph.variable(Tensor<FloatType>(from: try! Tensor<Float>(numpy: torchX)).toGPU(0))
-  */
   let x_T = graph.variable(.GPU(0), .NCHW(1, 4, 128, 128), of: FloatType.self)
   x_T.randn(std: 1, mean: 0)
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, 128, 128), of: FloatType.self)
   let ts = timeEmbedding(timestep: 0, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000).toGPU(0)
-  /*
-  let streamlit_helpers = Python.import("scripts.demo.streamlit_helpers")
-  var version_dict: [String: PythonObject] = [
-    "H": 1024,
-    "W": 1024,
-    "C": 4,
-    "f": 8,
-    "is_legacy": false,
-    "config": "/home/liu/workspace/generative-models/configs/inference/sd_xl_base.yaml",
-    "ckpt": "/home/liu/workspace/generative-models/checkpoints/sd_xl_base_0.9.safetensors",
-    "is_guided": true,
-  ]
-  let state = streamlit_helpers.init_st(version_dict)
-  let unetModel = state["model"].model
-  let crossattnNumpy = numpy.load("/home/liu/workspace/swift-diffusion/context.np.npy")
-  let crossattnPy = torch.from_numpy(crossattnNumpy).cuda()
-  let vectorPy = torch.from_numpy(vectorNumpy).cuda()
-  */
-  var unet = UNetXL(
+  let unet = LoRAUNetXL(
     batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
     attentionRes: [2: 2, 4: 10])
   unet.maxConcurrency = .limit(1)
   unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector0] + kvs0)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
-    $0.read("unet", model: unet)
+  graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_lora_training.ckpt") {
+    $0.read("lora_unet", model: unet)
   }
   var oldDenoised: DynamicGraph.Tensor<FloatType>? = nil
   // Now do DPM++ 2M Karras sampling. (DPM++ 2S a Karras requires two denoising per step, not ideal for my use case).
   x = sigmas[0] * x
-  var refinerPass = false
   // let timesteps = [999, 965, 932, 899, 865, 832, 799, 765, 732, 699, 666, 632, 599, 566, 532, 499, 466, 432, 399, 366, 333, 299, 266, 233, 199, 166, 133, 99, 66, 33]
   for i in 0..<model.steps {
     let sigma = sigmas[i]
     let timestep = DiffusionModel.timestep(from: sigma, sigmas: sigmasForTimesteps)
-    if timestep <= refinerTimestep && !refinerPass {
-      unet = UNetXL(
-        batchSize: 2, startHeight: 128, startWidth: 128, channels: [384, 768, 1536, 1536],
-        attentionRes: [2: 4, 4: 4])
-      let ts = timeEmbedding(
-        timestep: timestep, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000
-      )
-      .toGPU(0)
-      unet.maxConcurrency = .limit(1)
-      unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector1] + kvs1)
-      graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_refiner_0.9_f16.ckpt") {
-        $0.read("unet", model: unet)
-      }
-      refinerPass = true
-    }
     let ts = timeEmbedding(
-      timestep: timestep, batchSize: 2, embeddingSize: refinerPass ? 384 : 320, maxPeriod: 10_000
+      timestep: timestep, batchSize: 2, embeddingSize: 320, maxPeriod: 10_000
     ).toGPU(0)
     let t = graph.variable(Tensor<FloatType>(from: ts))
     let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
@@ -893,7 +769,7 @@ let z = graph.withNoGrad {
     xIn[1..<2, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
     // let etPy = unetModel(torch.from_numpy(xIn.rawValue.toCPU()).cuda(), torch.full([1], timestep).cuda(), ["crossattn": crossattnPy, "vector": vectorPy])
     // var et = graph.variable(Tensor<FloatType>(from: try! Tensor<Float>(numpy: etPy.detach().cpu().numpy())).toGPU(0))
-    var et = unet(inputs: xIn, refinerPass ? [t, vector1] + kvs1 : [t, vector0] + kvs0)[0].as(
+    var et = unet(inputs: xIn, [t, vector0] + kvs0)[0].as(
       of: FloatType.self)
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: FloatType.self)

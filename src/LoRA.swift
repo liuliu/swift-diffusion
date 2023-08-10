@@ -2,7 +2,7 @@ import NNC
 
 public let LowRank = 16
 
-private func LoRAConvolution(
+public func LoRAConvolution(
   groups: Int, filters: Int, filterSize: [Int], noBias: Bool = false, hint: Hint = Hint(),
   format: Convolution.Format? = nil, name: String = ""
 ) -> Model {
@@ -16,22 +16,22 @@ private func LoRAConvolution(
   let conv2dUp = Convolution(
     groups: groups, filters: filters, filterSize: [1, 1], noBias: true, hint: Hint(stride: [1, 1]),
     format: format, trainable: true, name: "lora_up")
-  let out = conv2d(x) + conv2dUp(conv2dDown(x.to(.Float32))).to(of: x)
+  let out = conv2d(x) + conv2dUp(conv2dDown(x))  // .to(.Float32))).to(of: x)
   return Model([x], [out])
 }
 
-private func LoRADense(count: Int, noBias: Bool = false, name: String = "") -> Model {
+public func LoRADense(count: Int, noBias: Bool = false, name: String = "") -> Model {
   let x = Input()
   let dense = Dense(count: count, noBias: noBias, name: name)
   let denseDown = Dense(count: LowRank, noBias: true, trainable: true, name: "lora_down")
   let denseUp = Dense(count: count, noBias: true, trainable: true, name: "lora_up")
-  let out = dense(x) + denseUp(denseDown(x.to(.Float32))).to(of: x)
+  let out = dense(x) + denseUp(denseDown(x))  // .to(.Float32))).to(of: x)
   return Model([x], [out])
 }
 
 /// Text Model
 
-private func LoRACLIPAttention(k: Int, h: Int, b: Int, t: Int) -> Model {
+public func LoRACLIPAttention(k: Int, h: Int, b: Int, t: Int) -> Model {
   let x = Input()
   let casualAttentionMask = Input()
   let tokeys = LoRADense(count: k * h)
@@ -80,7 +80,7 @@ private func LoRACLIPEncoderLayer(k: Int, h: Int, b: Int, t: Int, intermediateSi
 public func LoRACLIPTextModel<T: TensorNumeric>(
   _ dataType: T.Type,
   vocabularySize: Int, maxLength: Int, embeddingSize: Int, numLayers: Int, numHeads: Int,
-  batchSize: Int, intermediateSize: Int
+  batchSize: Int, intermediateSize: Int, noFinalLayerNorm: Bool = false
 ) -> Model {
   let tokens = Input()
   let positions = Input()
@@ -95,14 +95,16 @@ public func LoRACLIPTextModel<T: TensorNumeric>(
       k: k, h: numHeads, b: batchSize, t: maxLength, intermediateSize: intermediateSize)
     out = encoderLayer(out, casualAttentionMask)
   }
-  let finalLayerNorm = LayerNorm(epsilon: 1e-5, axis: [1])
-  out = finalLayerNorm(out)
+  if !noFinalLayerNorm {
+    let finalLayerNorm = LayerNorm(epsilon: 1e-5, axis: [1])
+    out = finalLayerNorm(out)
+  }
   return Model([tokens, positions, casualAttentionMask], [out], trainable: false)
 }
 
 /// UNet
 
-private func LoRATimeEmbed(modelChannels: Int) -> Model {
+public func LoRATimeEmbed(modelChannels: Int) -> Model {
   let x = Input()
   let fc0 = LoRADense(count: modelChannels * 4)
   var out = fc0(x).swish()
@@ -111,7 +113,7 @@ private func LoRATimeEmbed(modelChannels: Int) -> Model {
   return Model([x], [out])
 }
 
-private func LoRAResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> Model {
+public func LoRAResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> Model {
   let x = Input()
   let emb = Input()
   let inLayerNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
@@ -143,7 +145,7 @@ private func LoRAResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> Mod
   return Model([x, emb], [out])
 }
 
-private func LoRASelfAttention(k: Int, h: Int, b: Int, hw: Int) -> Model {
+public func LoRASelfAttention(k: Int, h: Int, b: Int, hw: Int) -> Model {
   let x = Input()
   let tokeys = LoRADense(count: k * h, noBias: true)
   let toqueries = LoRADense(count: k * h, noBias: true)
@@ -184,7 +186,7 @@ private func LoRACrossAttention(k: Int, h: Int, b: Int, hw: Int, t: Int) -> Mode
   return Model([x, c], [out])
 }
 
-private func LoRAFeedForward(hiddenSize: Int, intermediateSize: Int) -> Model {
+public func LoRAFeedForward(hiddenSize: Int, intermediateSize: Int) -> Model {
   let x = Input()
   let fc10 = LoRADense(count: intermediateSize)
   let fc11 = LoRADense(count: intermediateSize)

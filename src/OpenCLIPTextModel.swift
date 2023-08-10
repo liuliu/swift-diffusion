@@ -11,7 +11,7 @@ func OpenCLIPMLP(hiddenSize: Int, intermediateSize: Int) -> Model {
   return Model([x], [out])
 }
 
-func OpenCLIPEncoderLayer(k: Int, h: Int, b: Int, t: Int, intermediateSize: Int) -> Model {
+public func OpenCLIPEncoderLayer(k: Int, h: Int, b: Int, t: Int, intermediateSize: Int) -> Model {
   let x = Input()
   let casualAttentionMask = Input()
   let layerNorm1 = LayerNorm(epsilon: 1e-5, axis: [1])
