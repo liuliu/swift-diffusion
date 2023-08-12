@@ -131,7 +131,7 @@ private func LoRASpatialTransformer(
       intermediateSize: intermediateSize)
     out = block(out, keys, values)
   }
-  out = out.reshaped([b, height, width, k * h]).permuted(0, 3, 1, 2)
+  out = out.transposed(1, 2).reshaped([b, k * h, height, width])
   let projOut = LoRAConvolution(groups: 1, filters: ch, filterSize: [1, 1])
   out = projOut(out) + x
   return Model([x] + kvs, [out])
