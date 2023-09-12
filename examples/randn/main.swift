@@ -76,13 +76,13 @@ public struct TorchRandomSource: RandomNumberGenerator {
   /// Generate next random double value
   mutating func nextDouble() -> Double {
     let a = next()
-    return Double(a & 9007199254740991) * (1.0 / 9007199254740992.0)
+    return Double(a & 9_007_199_254_740_991) * (1.0 / 9007199254740992.0)
   }
 
   /// Generate next random float value
   mutating func nextFloat() -> Float {
     let a = nextUInt32()
-    return Float(a & 16777215) * (1.0 / 16777216.0)
+    return Float(a & 16_777_215) * (1.0 / 16777216.0)
   }
 
   /// Generate next random value from a standard normal
@@ -106,15 +106,17 @@ public struct TorchRandomSource: RandomNumberGenerator {
   }
 
   /// Generates an array of random values from a normal distribution with given mean and standard deviation.
-  public mutating func normalArrayDouble(count: Int, mean: Double = 0.0, stdev: Double = 1.0) -> [Double]
+  public mutating func normalArrayDouble(count: Int, mean: Double = 0.0, stdev: Double = 1.0)
+    -> [Double]
   {
     (0..<count).map { _ in nextNormal(mean: mean, stdev: stdev) }
   }
 
-  public mutating func normalArray(count: Int, mean: Float = 0.0, stdev: Float = 1.0) -> [Float]
-  {
+  public mutating func normalArray(count: Int, mean: Float = 0.0, stdev: Float = 1.0) -> [Float] {
     guard count >= 16 else {
-      return normalArrayDouble(count: count, mean: Double(mean), stdev: Double(stdev)).map { Float($0) }
+      return normalArrayDouble(count: count, mean: Double(mean), stdev: Double(stdev)).map {
+        Float($0)
+      }
     }
     var data = (0..<count).map { _ in nextFloat() }
     for i in stride(from: 0, to: count - 15, by: 16) {
@@ -147,3 +149,74 @@ public struct TorchRandomSource: RandomNumberGenerator {
 
 var torchRandomSource = TorchRandomSource(seed: 4)
 print(torchRandomSource.normalArray(count: 17))
+
+public struct NVRandomSource {
+  public let seed: UInt64
+  private var offset: UInt32
+
+  /// Initialize with a random seed
+  ///
+  /// - Parameters
+  ///     - seed: Seed for underlying Mersenne Twister 19937 generator
+  /// - Returns random source
+  public init(seed: UInt64) {
+    self.seed = seed
+    offset = 0
+  }
+
+  static private let philoxM: (UInt32, UInt32) = (0xD251_1F53, 0xCD9E_8D57)
+  static private let philoxW: (UInt32, UInt32) = (0x9E37_79B9, 0xBB67_AE85)
+
+  private func philox4Round(counter: inout [[UInt32]], key: [[UInt32]]) {
+    for i in 0..<counter[0].count {
+      let v1: UInt64 = UInt64(counter[0][i]) * UInt64(Self.philoxM.0)
+      let v2: UInt64 = UInt64(counter[2][i]) * UInt64(Self.philoxM.1)
+      counter[0][i] = UInt32(v2 >> 32) ^ counter[1][i] ^ key[0][i]
+      counter[1][i] = UInt32(v2 & 0xffff_ffff)
+      counter[2][i] = UInt32(v1 >> 32) ^ counter[3][i] ^ key[1][i]
+      counter[3][i] = UInt32(v1 & 0xffff_ffff)
+    }
+  }
+
+  private func philox4_32(counter: inout [[UInt32]], key: inout [[UInt32]], rounds: Int = 10) {
+    for _ in 0..<(rounds - 1) {
+      philox4Round(counter: &counter, key: key)
+      for (i, element) in key[0].enumerated() {
+        key[0][i] = element &+ Self.philoxW.0
+      }
+      for (i, element) in key[1].enumerated() {
+        key[1][i] = element &+ Self.philoxW.1
+      }
+    }
+    philox4Round(counter: &counter, key: key)
+  }
+
+  private func boxMuller(_ counter1: [UInt32], _ counter2: [UInt32]) -> [Float] {
+    // Box-Muller transform
+    return zip(counter1, counter2).map {
+      let u: Double = Double($0) * 2.3283064e-10 + (2.3283064e-10 / 2)
+      let v: Double = Double($1) * (2.3283064e-10 * 2.0 * .pi) + (2.3283064e-10 * .pi)
+      let radius = sqrt(-2.0 * log(u))
+      return Float(radius * sin(v))
+    }
+  }
+
+  public mutating func normalArray(count: Int, mean: Float = 0.0, stdev: Float = 1.0) -> [Float] {
+    var counter: [[UInt32]] = [
+      Array(repeating: offset, count: count),
+      Array(repeating: 0, count: count),
+      Array(0..<UInt32(count)),
+      Array(repeating: 0, count: count),
+    ]
+    offset += 1
+    var key: [[UInt32]] = [
+      Array(repeating: UInt32(seed & 0xffff_ffff), count: count),
+      Array(repeating: UInt32(seed >> 32), count: count),
+    ]
+    philox4_32(counter: &counter, key: &key)
+    return boxMuller(counter[0], counter[1])
+  }
+}
+
+var nvRandomSource = NVRandomSource(seed: 0)
+print(nvRandomSource.normalArray(count: 12))
