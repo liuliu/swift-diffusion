@@ -5,6 +5,8 @@ import NNCPythonConversion
 import PNG
 import PythonKit
 
+public typealias FloatType = Float16
+
 let torch = Python.import("torch")
 let Image = Python.import("PIL.Image")
 
@@ -20,13 +22,6 @@ let (model, vis_processors, _) = lavis.models.load_model_and_preprocess(
 
 let image = vis_processors["eval"](raw_image).unsqueeze(0).to(device)
 print(image.shape)
-print(model.opt_model)
-let result = model.generate(["image": image, "prompt": "a photo of"])
-let state_dict = model.visual_encoder.state_dict()
-let model_state_dict = model.state_dict()
-let bert_state_dict = model.Qformer.bert.state_dict()
-let opt_state_dict = model.opt_model.state_dict()
-print(result)
 
 func EvaSelfAttention(prefix: String, k: Int, h: Int, b: Int, t: Int) -> (
   Model, (PythonObject) -> Void
@@ -99,15 +94,16 @@ func EvaResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int, M
   return (Model([x], [out]), reader)
 }
 
-public func EvaVisionTransformer(
+public func EvaVisionTransformer<T: TensorNumeric>(
+  _ dataType: T.Type,
   grid: Int, width: Int, MLP: Int, layers: Int, heads: Int, batchSize: Int
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let conv1 = Convolution(
     groups: 1, filters: width, filterSize: [14, 14], hint: Hint(stride: [14, 14]))
   var out = conv1(x).reshaped([batchSize, width, grid * grid]).transposed(1, 2)
-  let classEmbedding = Parameter<Float>(.GPU(0), .CHW(1, 1, width))
-  let positionalEmbedding = Parameter<Float>(.GPU(0), .CHW(1, grid * grid + 1, width))
+  let classEmbedding = Parameter<T>(.GPU(0), .CHW(1, 1, width))
+  let positionalEmbedding = Parameter<T>(.GPU(0), .CHW(1, grid * grid + 1, width))
   out = Functional.concat(axis: 1, classEmbedding, out)
   out = out + positionalEmbedding
   var readers = [(PythonObject) -> Void]()
@@ -494,49 +490,54 @@ func OPTDecoder<T: TensorNumeric>(
 }
 
 let graph = DynamicGraph()
-let (vit, reader) = EvaVisionTransformer(
+let (vit, _) = EvaVisionTransformer(
+  FloatType.self,
   grid: 26, width: 1408, MLP: 6144, layers: 39, heads: 16, batchSize: 1)
 let ln_vision = LayerNorm(epsilon: 1e-5, axis: [1])
-let (qformer, qformerReader) = BertModel(
+let (qformer, _) = BertModel(
   width: 768, queryEmbeddingLength: 32, imageEmbeddingLength: 26 * 26 + 1, MLP: 768 * 4, layers: 12,
   heads: 12, batchSize: 1, crossAttentionFreq: 2)
-let (opt, optReader) = OPTDecoder(
-  Float.self, vocabularySize: 50272, maxLength: 2050, width: 2560, tokenLength: 47, layers: 32,
+let (opt, _) = OPTDecoder(
+  FloatType.self, vocabularySize: 50272, maxLength: 2050, width: 2560, tokenLength: 47, layers: 32,
   MLP: 10240, heads: 32, batchSize: 1)
 graph.withNoGrad {
-  let xTensor = graph.variable(try! Tensor<Float>(numpy: image.cpu().numpy())).toGPU(0)
-  vit.compile(inputs: xTensor)
-  reader(state_dict)
-  var out = vit(inputs: xTensor)[0].as(of: Float.self)
-  ln_vision.compile(inputs: out)
-  let ln_vision_weight = model_state_dict["ln_vision.weight"].type(torch.float).cpu().numpy()
-  ln_vision.weight.copy(from: try! Tensor<Float>(numpy: ln_vision_weight))
-  let ln_vision_bias = model_state_dict["ln_vision.bias"].type(torch.float).cpu().numpy()
-  ln_vision.bias.copy(from: try! Tensor<Float>(numpy: ln_vision_bias))
-  out = ln_vision(inputs: out)[0].as(of: Float.self)
-  let query_tokens = model_state_dict["query_tokens"].type(torch.float).cpu().numpy()
-  let queryTokensTensor = graph.variable(try! Tensor<Float>(numpy: query_tokens)).reshaped(
-    .NC(32, 768)
+  let xTensor = graph.variable(
+    Tensor<FloatType>(from: try! Tensor<Float>(numpy: image.cpu().numpy()))
   ).toGPU(0)
+  vit.compile(inputs: xTensor)
+  graph.openStore("/home/liu/workspace/swift-diffusion/blip2_eva_vit_q8p.ckpt") {
+    $0.read("vit", model: vit, codec: [.jit, .q8p, .ezm7])
+  }
+  var out = vit(inputs: xTensor)[0].as(of: FloatType.self)
+  ln_vision.compile(inputs: out)
+  graph.openStore("/home/liu/workspace/swift-diffusion/blip2_qformer_f16.ckpt") {
+    $0.read("ln_vision", model: ln_vision)
+  }
+  out = ln_vision(inputs: out)[0].as(of: FloatType.self)
+  let queryTokensTensor = graph.variable(.GPU(0), .NC(32, 768), of: FloatType.self)
   qformer.compile(inputs: queryTokensTensor, out)
-  qformerReader(bert_state_dict)
-  out = qformer(inputs: queryTokensTensor, out)[0].as(of: Float.self)
+  graph.openStore("/home/liu/workspace/swift-diffusion/blip2_qformer_f16.ckpt") {
+    $0.read("query_tokens", variable: queryTokensTensor)
+    $0.read("qformer", model: qformer)
+  }
+  out = qformer(inputs: queryTokensTensor, out)[0].as(of: FloatType.self)
   let optProj = Dense(count: 2560)
-  let opt_proj_weight = model_state_dict["opt_proj.weight"].type(torch.float).cpu().numpy()
-  let opt_proj_bias = model_state_dict["opt_proj.bias"].type(torch.float).cpu().numpy()
   optProj.compile(inputs: out)
-  optProj.weight.copy(from: try! Tensor<Float>(numpy: opt_proj_weight))
-  optProj.bias.copy(from: try! Tensor<Float>(numpy: opt_proj_bias))
-  out = optProj(inputs: out)[0].as(of: Float.self)
-  graph.openStore("/home/liu/workspace/swift-diffusion/blip2_eva_vit_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/blip2_qformer_f16.ckpt") {
+    $0.read("opt_proj", model: optProj)
+  }
+  out = optProj(inputs: out)[0].as(of: FloatType.self)
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/blip2_eva_vit_f16.ckpt") {
     $0.write("vit", model: vit)
   }
-  graph.openStore("/home/liu/workspace/swift-diffusion/blip2_qformer_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/blip2_qformer_f16.ckpt") {
     $0.write("ln_vision", model: ln_vision)
     $0.write("query_tokens", variable: queryTokensTensor)
     $0.write("qformer", model: qformer)
     $0.write("opt_proj", model: optProj)
   }
+  */
   let tokensTensor = graph.variable(.CPU, .C(15), of: Int32.self)
   let positionTensor = graph.variable(.CPU, .C(15 + 32), of: Int32.self)
   tokensTensor[0] = 2
@@ -558,32 +559,37 @@ graph.withNoGrad {
   for i in 0..<(15 + 32) {
     positionTensor[i] = Int32(2 + i)
   }
-  let causalAttentionMask = graph.variable(Tensor<Float>(.CPU, .NHWC(1, 1, 47, 47)))
+  let causalAttentionMask = graph.variable(Tensor<FloatType>(.CPU, .NHWC(1, 1, 47, 47)))
   causalAttentionMask.full(0)
   for i in 0..<46 {
     for j in (i + 1)..<47 {
-      causalAttentionMask[0, 0, i, j] = -Float.greatestFiniteMagnitude
+      causalAttentionMask[0, 0, i, j] = -FloatType.greatestFiniteMagnitude
     }
   }
   let tokensTensorGPU = tokensTensor.toGPU(0)
   let positionTensorGPU = positionTensor.toGPU(0)
   let causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
   opt.compile(inputs: out, tokensTensorGPU, positionTensorGPU, causalAttentionMaskGPU)
-  optReader(opt_state_dict)
+  graph.openStore("/home/liu/workspace/swift-diffusion/opt_2.7b_q6p.ckpt") {
+    $0.read("opt", model: opt, codec: [.jit, .q6p, .ezm7])
+  }
   out = opt(inputs: out, tokensTensorGPU, positionTensorGPU, causalAttentionMaskGPU)[0].as(
-    of: Float.self)
+    of: FloatType.self)
   let lastOut = out[46..<47, 0..<2560]
   let lmHead = Dense(count: 50272, noBias: true)
   lmHead.compile(inputs: lastOut)
-  let lm_head_weight = opt_state_dict["lm_head.weight"].type(torch.float).cpu().numpy()
-  lmHead.weight.copy(from: try! Tensor<Float>(numpy: lm_head_weight))
-  out = lmHead(inputs: lastOut)[0].as(of: Float.self).toCPU()
-  graph.openStore("/home/liu/workspace/swift-diffusion/opt_2.7b_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/opt_2.7b_q6p.ckpt") {
+    $0.read("lm_head", model: lmHead, codec: [.jit, .q6p, .ezm7])
+  }
+  out = lmHead(inputs: lastOut)[0].as(of: FloatType.self).toCPU()
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/opt_2.7b_f16.ckpt") {
     $0.write("opt", model: opt)
     $0.write("lm_head", model: lmHead)
   }
+  */
   var maxIdx: Int = -1
-  var maxVal: Float = -Float.greatestFiniteMagnitude
+  var maxVal: FloatType = -FloatType.greatestFiniteMagnitude
   for i in 0..<50272 {
     if out[0, i] > maxVal {
       maxVal = out[0, i]
