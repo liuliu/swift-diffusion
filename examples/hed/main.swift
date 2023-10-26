@@ -103,17 +103,11 @@ func HedModelVggEmbeds(inputWidth: Int, inputHeight: Int) -> ((PythonObject) -> 
     groups: 1, filters: 1, filterSize: [1, 1],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 0], end: [0, 0])))
 
-   let netScoreOneEmbeds = netScoreOne(vggOneEmbeds)
-   let netScoreTwoEmbeds = netScoreTwo(vggTwoEmbeds)
-   let netScoreThrEmbeds = netScoreThr(vggThrEmbeds)
-   let netScoreFouEmbeds = netScoreFou(vggFouEmbeds)
-   let netScoreFivEmbeds = netScoreFiv(vggFiveEmbeds)
-
-   let scaledNetScoreOneEmbeds = Upsample(.bilinear, widthScale: 1, heightScale: 1)(netScoreOneEmbeds)
-   let scaledNetScoreTwoEmbeds = Upsample(.bilinear, widthScale: 2, heightScale: 2)(netScoreTwoEmbeds)
-   let scaledNetScoreThrEmbeds = Upsample(.bilinear, widthScale: 4, heightScale: 4)(netScoreThrEmbeds)
-   let scaledNetScoreFouEmbeds = Upsample(.bilinear, widthScale: 8, heightScale: 8)(netScoreFouEmbeds)
-   let scaledNetScoreFivEmbeds = Upsample(.bilinear, widthScale: 16, heightScale: 16)(netScoreFivEmbeds)
+   let scaledNetScoreOneEmbeds = Upsample(.bilinear, widthScale: 1, heightScale: 1)(netScoreOne(vggOneEmbeds))
+   let scaledNetScoreTwoEmbeds = Upsample(.bilinear, widthScale: 2, heightScale: 2)(netScoreTwo(vggTwoEmbeds))
+   let scaledNetScoreThrEmbeds = Upsample(.bilinear, widthScale: 4, heightScale: 4)(netScoreThr(vggThrEmbeds))
+   let scaledNetScoreFouEmbeds = Upsample(.bilinear, widthScale: 8, heightScale: 8)(netScoreFou(vggFouEmbeds))
+   let scaledNetScoreFivEmbeds = Upsample(.bilinear, widthScale: 16, heightScale: 16)(netScoreFiv(vggFiveEmbeds))
    let mergedVggEmbedings = Functional.concat(axis: 1, scaledNetScoreOneEmbeds, scaledNetScoreTwoEmbeds, scaledNetScoreThrEmbeds, scaledNetScoreFouEmbeds, scaledNetScoreFivEmbeds)
 
   let netcombineLayerConv2d = Convolution(
