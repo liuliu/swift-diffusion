@@ -10,11 +10,49 @@ let diffusers = Python.import("diffusers")
 let Image = Python.import("PIL.Image")
 let ip_adapter = Python.import("ip_adapter")
 
-let base_model_path = "SG161222/RealVisXL_V1.0"
+// let base_model_path = "SG161222/RealVisXL_V1.0"
+let base_model_path = "runwayml/stable-diffusion-v1-5"
+let vae_model_path = "stabilityai/sd-vae-ft-mse"
 let image_encoder_path = "/home/liu/workspace/IP-Adapter/models/image_encoder"
-let ip_ckpt = "/home/liu/workspace/IP-Adapter/sdxl_models/ip-adapter-plus_sdxl_vit-h.bin"
+// let ip_ckpt = "/home/liu/workspace/IP-Adapter/sdxl_models/ip-adapter-plus_sdxl_vit-h.bin"
+// let ip_ckpt = "/home/liu/workspace/IP-Adapter/models/ip-adapter-plus-face_sd15.bin"
+let ip_ckpt = "/home/liu/workspace/IP-Adapter/models/ip-adapter-plus_sd15.bin"
 let device = "cuda"
 
+let noise_scheduler = diffusers.DDIMScheduler(
+  num_train_timesteps: 1000,
+  beta_start: 0.00085,
+  beta_end: 0.012,
+  beta_schedule: "scaled_linear",
+  clip_sample: false,
+  set_alpha_to_one: false,
+  steps_offset: 1
+)
+let vae = diffusers.AutoencoderKL.from_pretrained(vae_model_path).to(dtype: torch.float16)
+
+// load SD pipeline
+let pipe = diffusers.StableDiffusionPipeline.from_pretrained(
+  base_model_path,
+  torch_dtype: torch.float16,
+  scheduler: noise_scheduler,
+  vae: vae,
+  feature_extractor: Python.None,
+  safety_checker: Python.None
+)
+
+// read image prompt (face, here we use a ai-generation face)
+let image = Image.open("/home/liu/workspace/IP-Adapter/assets/images/ai_face.png")
+image.resize(PythonObject(tupleOf: 256, 256))
+
+// load ip-adapter
+let ip_model = ip_adapter.IPAdapterPlus(pipe, image_encoder_path, ip_ckpt, device, num_tokens: 16)
+
+let images = ip_model.generate(
+  pil_image: image, num_samples: 1, num_inference_steps: 50, seed: 420,
+  prompt: "photo of a beautiful girl wearing casual shirt in a garden")
+images[0].save("/home/liu/workspace/IP-Adapter/grid.png")
+
+/*
 // load SDXL pipeline
 let pipe = diffusers.StableDiffusionXLPipeline.from_pretrained(
   base_model_path,
@@ -33,8 +71,11 @@ image.resize(PythonObject(tupleOf: 512, 512))
 let num_samples = 1
 let images = ip_model.generate(
   pil_image: image, num_samples: num_samples, num_inference_steps: 30, seed: 42)
+*/
 let state_dict = ip_model.image_encoder.state_dict()
+print(ip_model.image_encoder)
 let proj_state_dict = ip_model.image_proj_model.state_dict()
+print(ip_model.image_proj_model)
 let ip_layers_state_dict = ip_model.pipe.unet.state_dict()
 
 var clip_image = ip_model.clip_image_processor(images: image, return_tensors: "pt").pixel_values
@@ -526,21 +567,21 @@ graph.withNoGrad {
   */
   debugPrint(imageEmbeds)
   let (resamplerReader, resampler) = Resampler(
-    width: 1280, outputDim: 2048, heads: 20, grid: 16, queries: 16, layers: 4, batchSize: 1)
+    width: 768, outputDim: 768, heads: 12, grid: 16, queries: 16, layers: 4, batchSize: 1)
   resampler.compile(inputs: imageEmbeds)
   resamplerReader(proj_state_dict)
   let imagePromptEmebeds = resampler(inputs: imageEmbeds)[0].as(of: Float.self)
   debugPrint(imagePromptEmebeds)
-  let c = torch.randn([2, 77, 2048])
+  let c = torch.randn([2, 77, 768])
   let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
   let (readerFixed, unetFixed) = UNetXLFixed(
-    batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
-    attentionRes: [2: 2, 4: 10])
+    batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280, 1280],
+    attentionRes: [1: 1, 2: 1, 4: 1])
   unetFixed.compile(inputs: cTensor)
   readerFixed(ip_layers_state_dict)
   let kvs = unetFixed(inputs: cTensor).map { $0.as(of: Float.self) }
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/ip_adapter_plus_xl_base_open_clip_h14_f32.ckpt"
+    "/home/liu/workspace/swift-diffusion/ip_adapter_plus_sd_v1.x_open_clip_h14_f32.ckpt"
   ) {
     $0.write("resampler", model: resampler)
     $0.write("unet_ip_fixed", model: unetFixed)
