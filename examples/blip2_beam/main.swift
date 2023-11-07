@@ -340,24 +340,49 @@ func BertModel(
   return (Model([x, c], [out]), reader)
 }
 
-func OPTSelfAttention(prefix: String, k: Int, h: Int, b: Int, t: Int) -> (
-  Model, (PythonObject) -> Void
-) {
+func OPTSelfAttention(prefix: String, k: Int, h: Int, b: Int, t: (Int, Int), kvCacheEnabled: Bool)
+  -> (
+    Model, (PythonObject) -> Void
+  )
+{
   let x = Input()
   let causalAttentionMask = Input()
   let tokeys = Dense(count: k * h, name: "k_proj")
   let toqueries = Dense(count: k * h, name: "q_proj")
   let tovalues = Dense(count: k * h, name: "v_proj")
-  let keys = tokeys(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
-  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t, h, k])
+  let kIn: Input?
+  let kOut: Model.IO?
+  let vIn: Input?
+  let vOut: Model.IO?
+  let keys: Model.IO
+  let values: Model.IO
+  if kvCacheEnabled {
+    let kIn0 = Input()
+    let vIn0 = Input()
+    let kOut0 = tokeys(x)
+    let vOut0 = tovalues(x)
+    kIn = kIn0
+    vIn = vIn0
+    keys = Functional.concat(axis: 1, kIn0, kOut0).reshaped([b, t.0, h, k]).permuted(0, 2, 1, 3)
+    values = Functional.concat(axis: 1, vIn0, vOut0).reshaped([b, t.0, h, k]).permuted(0, 2, 1, 3)
+    kOut = kOut0
+    vOut = vOut0
+  } else {
+    kIn = nil
+    kOut = nil
+    vIn = nil
+    vOut = nil
+    keys = tokeys(x).reshaped([b, t.0, h, k]).permuted(0, 2, 1, 3)
+    values = tovalues(x).reshaped([b, t.0, h, k]).permuted(0, 2, 1, 3)
+  }
+  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t.1, h, k])
     .permuted(0, 2, 1, 3)
-  let values = tovalues(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
   var dot = Matmul(transposeB: (2, 3))(queries, keys) + causalAttentionMask
-  dot = dot.reshaped([b * h * t, t])
+  dot = dot.reshaped([b * h * t.1, t.0])
   dot = dot.softmax()
-  dot = dot.reshaped([b, h, t, t])
+  dot = dot.reshaped([b, h, t.1, t.0])
   var out = dot * values
-  out = out.reshaped([b, h, t, k]).transposed(1, 2).reshaped([b * t, h * k])
+  out = out.reshaped([b, h, t.1, k]).transposed(1, 2).reshaped([b * t.1, h * k])
   let unifyheads = Dense(count: k * h, name: "out_proj")
   out = unifyheads(out)
   let reader: (PythonObject) -> Void = { state_dict in
@@ -382,18 +407,44 @@ func OPTSelfAttention(prefix: String, k: Int, h: Int, b: Int, t: Int) -> (
       .numpy()
     unifyheads.bias.copy(from: try! Tensor<Float>(numpy: proj_bias))
   }
-  return (Model([x, causalAttentionMask], [out]), reader)
+  if let kIn = kIn, let kOut = kOut, let vIn = vIn, let vOut = vOut {
+    return (Model([x, causalAttentionMask, kIn, vIn], [out, kOut, vOut]), reader)
+  } else {
+    return (Model([x, causalAttentionMask], [out]), reader)
+  }
 }
 
-func OPTDecodeLayer(prefix: String, k: Int, h: Int, b: Int, t: Int, MLP: Int) -> (
+func OPTDecodeLayer(
+  prefix: String, k: Int, h: Int, b: Int, t: (Int, Int), MLP: Int, kvCacheEnabled: Bool
+) -> (
   Model, (PythonObject) -> Void
 ) {
   let x = Input()
   let causalAttentionMask = Input()
   let layerNorm1 = LayerNorm(epsilon: 1e-5, axis: [1], name: "self_attn_layer_norm")
   var out = layerNorm1(x)
-  let (attention, attnReader) = OPTSelfAttention(prefix: prefix, k: k, h: h, b: b, t: t)
-  out = attention(out, causalAttentionMask) + x
+  let (attention, attnReader) = OPTSelfAttention(
+    prefix: prefix, k: k, h: h, b: b, t: t, kvCacheEnabled: kvCacheEnabled)
+  let kIn: Input?
+  let kOut: Model.IO?
+  let vIn: Input?
+  let vOut: Model.IO?
+  if kvCacheEnabled {
+    let kIn0 = Input()
+    let vIn0 = Input()
+    let tuple = attention(out, causalAttentionMask, kIn0, vIn0)
+    out = tuple[0] + x
+    kIn = kIn0
+    vIn = vIn0
+    kOut = tuple[1]
+    vOut = tuple[2]
+  } else {
+    out = attention(out, causalAttentionMask) + x
+    kIn = nil
+    vIn = nil
+    kOut = nil
+    vOut = nil
+  }
   let residual = out
   let layerNorm2 = LayerNorm(epsilon: 1e-5, axis: [1], name: "final_layer_norm")
   out = layerNorm2(out)
@@ -427,7 +478,11 @@ func OPTDecodeLayer(prefix: String, k: Int, h: Int, b: Int, t: Int, MLP: Int) ->
     proj.weight.copy(from: try! Tensor<Float>(numpy: fc2_weight))
     proj.bias.copy(from: try! Tensor<Float>(numpy: fc2_bias))
   }
-  return (Model([x, causalAttentionMask], [out]), reader)
+  if let kIn = kIn, let kOut = kOut, let vIn = vIn, let vOut = vOut {
+    return (Model([x, causalAttentionMask, kIn, vIn], [out, kOut, vOut]), reader)
+  } else {
+    return (Model([x, causalAttentionMask], [out]), reader)
+  }
 }
 
 public func OPTTextEmbedding<T: TensorNumeric>(
@@ -453,11 +508,14 @@ public func OPTTextEmbedding<T: TensorNumeric>(
 
 func OPTDecoder<T: TensorNumeric>(
   _ dataType: T.Type, vocabularySize: Int, maxLength: Int, width: Int, tokenLength: Int,
-  layers: Int, MLP: Int, heads: Int, batchSize: Int
+  cachedTokenLength: Int,
+  layers: Int, MLP: Int, heads: Int, batchSize: Int, kvCacheEnabled: Bool
 ) -> (Model, (PythonObject) -> Void) {
   let queryEmbed = Input()
   let tokens = Input()
   let positions = Input()
+  var kvs = [Input]()
+  var kvOuts = [Model.IO]()
   let (embedding, embedReader) = OPTTextEmbedding(
     T.self, batchSize: batchSize, vocabularySize: vocabularySize, maxLength: maxLength,
     embeddingSize: width)
@@ -466,9 +524,21 @@ func OPTDecoder<T: TensorNumeric>(
   var readers = [(PythonObject) -> Void]()
   for i in 0..<layers {
     let (layer, reader) = OPTDecodeLayer(
-      prefix: "model.decoder.layers.\(i)", k: width / heads, h: heads, b: batchSize, t: tokenLength,
-      MLP: MLP)
-    out = layer(out, causalAttentionMask)
+      prefix: "model.decoder.layers.\(i)", k: width / heads, h: heads, b: batchSize,
+      t: (cachedTokenLength + tokenLength, tokenLength),
+      MLP: MLP, kvCacheEnabled: kvCacheEnabled)
+    if kvCacheEnabled {
+      let kIn = Input()
+      let vIn = Input()
+      let tuple = layer(out, causalAttentionMask, kIn, vIn)
+      out = tuple[0]
+      kvs.append(kIn)
+      kvs.append(vIn)
+      kvOuts.append(tuple[1])
+      kvOuts.append(tuple[2])
+    } else {
+      out = layer(out, causalAttentionMask)
+    }
     readers.append(reader)
   }
   let finalLayerNorm = LayerNorm(epsilon: 1e-5, axis: [1], name: "final_layer_norm")
@@ -486,7 +556,9 @@ func OPTDecoder<T: TensorNumeric>(
     finalLayerNorm.weight.copy(from: try! Tensor<Float>(numpy: final_layer_norm_weight))
     finalLayerNorm.bias.copy(from: try! Tensor<Float>(numpy: final_layer_norm_bias))
   }
-  return (Model([queryEmbed, tokens, positions, causalAttentionMask], [out]), reader)
+  return (
+    Model([queryEmbed, tokens, positions, causalAttentionMask] + kvs, [out] + kvOuts), reader
+  )
 }
 
 let graph = DynamicGraph()
@@ -498,8 +570,9 @@ let (qformer, _) = BertModel(
   width: 768, queryEmbeddingLength: 32, imageEmbeddingLength: 26 * 26 + 1, MLP: 768 * 4, layers: 12,
   heads: 12, batchSize: 1, crossAttentionFreq: 2)
 let (opt, _) = OPTDecoder(
-  FloatType.self, vocabularySize: 50272, maxLength: 2050, width: 2560, tokenLength: 47, layers: 32,
-  MLP: 10240, heads: 32, batchSize: 1)
+  FloatType.self, vocabularySize: 50272, maxLength: 2050, width: 2560, tokenLength: 47,
+  cachedTokenLength: 0, layers: 32,
+  MLP: 10240, heads: 32, batchSize: 1, kvCacheEnabled: true)
 graph.withNoGrad {
   let xTensor = graph.variable(
     Tensor<FloatType>(from: try! Tensor<Float>(numpy: image.cpu().numpy()))
@@ -569,12 +642,23 @@ graph.withNoGrad {
   let tokensTensorGPU = tokensTensor.toGPU(0)
   let positionTensorGPU = positionTensor.toGPU(0)
   let causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
-  opt.compile(inputs: out, tokensTensorGPU, positionTensorGPU, causalAttentionMaskGPU)
+  var kvs = (0..<64).map { _ in
+    graph.variable(.GPU(0), format: .NCHW, shape: [], of: FloatType.self)
+  }
+  opt.compile(inputs: [out, tokensTensorGPU, positionTensorGPU, causalAttentionMaskGPU] + kvs)
   graph.openStore("/home/liu/workspace/swift-diffusion/opt_2.7b_q6p.ckpt") {
     $0.read("opt", model: opt, codec: [.jit, .q6p, .ezm7])
   }
-  out = opt(inputs: out, tokensTensorGPU, positionTensorGPU, causalAttentionMaskGPU)[0].as(
-    of: FloatType.self)
+  let tuple = opt(inputs: out, [tokensTensorGPU, positionTensorGPU, causalAttentionMaskGPU] + kvs)
+    .map {
+      $0.as(
+        of: FloatType.self)
+    }
+  out = tuple[0]
+  kvs = Array(tuple[1..<65])
+  for kv in kvs {
+    print(kv)
+  }
   let lastOut = out[46..<47, 0..<2560]
   let lmHead = Dense(count: 50272, noBias: true)
   lmHead.compile(inputs: lastOut)
