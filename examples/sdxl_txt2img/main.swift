@@ -149,19 +149,21 @@ func MiddleBlock(
     ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
   var out = resBlock1(x, emb)
   let kvs = (0..<(attentionBlock * 2)).map { _ in Input() }
-  let transformer = SpatialTransformer(
-    prefix: "middle_block.1", ch: channels, k: k, h: numHeads, b: batchSize, height: height,
-    width: width, depth: attentionBlock, t: embeddingSize, intermediateSize: channels * 4)
-  out = transformer([out] + kvs)
-  let resBlock2 =
-    ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
-  out = resBlock2(out, emb)
+  if attentionBlock > 0 {
+    let transformer = SpatialTransformer(
+      prefix: "middle_block.1", ch: channels, k: k, h: numHeads, b: batchSize, height: height,
+      width: width, depth: attentionBlock, t: embeddingSize, intermediateSize: channels * 4)
+    out = transformer([out] + kvs)
+    let resBlock2 =
+      ResBlock(b: batchSize, outChannels: channels, skipConnection: false)
+    out = resBlock2(out, emb)
+  }
   return (out, kvs)
 }
 
 func InputBlocks(
   channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
-  startWidth: Int, embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO
+  startWidth: Int, embeddingSize: Int, attentionRes: [Int: [Int]], x: Model.IO, emb: Model.IO
 ) -> ([Model.IO], Model.IO, [Input]) {
   let conv2d = Convolution(
     groups: 1, filters: channels[0], filterSize: [3, 3],
@@ -175,16 +177,16 @@ func InputBlocks(
   var passLayers = [out]
   var kvs = [Input]()
   for (i, channel) in channels.enumerated() {
-    let attentionBlock = attentionRes[ds, default: 0]
-    for _ in 0..<numRepeat {
+    let attentionBlock = attentionRes[ds, default: Array(repeating: 0, count: numRepeat)]
+    for j in 0..<numRepeat {
       let inputLayer = BlockLayer(
         prefix: "input_blocks",
         layerStart: layerStart, skipConnection: previousChannel != channel,
-        attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
+        attentionBlock: attentionBlock[j], channels: channel, numHeadChannels: numHeadChannels,
         batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       previousChannel = channel
-      let c = (0..<(attentionBlock * 2)).map { _ in Input() }
+      let c = (0..<(attentionBlock[j] * 2)).map { _ in Input() }
       out = inputLayer([out, emb] + c)
       kvs.append(contentsOf: c)
       passLayers.append(out)
@@ -208,7 +210,7 @@ func InputBlocks(
 func OutputBlocks(
   channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
   startWidth: Int,
-  embeddingSize: Int, attentionRes: [Int: Int], x: Model.IO, emb: Model.IO,
+  embeddingSize: Int, attentionRes: [Int: [Int]], x: Model.IO, emb: Model.IO,
   inputs: [Model.IO]
 ) -> (Model.IO, [Input]) {
   var layerStart = 0
@@ -233,17 +235,17 @@ func OutputBlocks(
     let height = heights[i]
     let width = widths[i]
     let ds = dss[i]
-    let attentionBlock = attentionRes[ds, default: 0]
+    let attentionBlock = attentionRes[ds, default: Array(repeating: 0, count: numRepeat + 1)]
     for j in 0..<(numRepeat + 1) {
       out = Concat(axis: 1)(out, inputs[inputIdx])
       inputIdx -= 1
       let outputLayer = BlockLayer(
         prefix: "output_blocks",
         layerStart: layerStart, skipConnection: true,
-        attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
+        attentionBlock: attentionBlock[j], channels: channel, numHeadChannels: numHeadChannels,
         batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
-      let c = (0..<(attentionBlock * 2)).map { _ in Input() }
+      let c = (0..<(attentionBlock[j] * 2)).map { _ in Input() }
       out = outputLayer([out, emb] + c)
       kvs.append(contentsOf: c)
       if i > 0 && j == numRepeat {
@@ -261,30 +263,35 @@ func OutputBlocks(
 
 func UNetXL(
   batchSize: Int, startHeight: Int, startWidth: Int, channels: [Int],
-  attentionRes: KeyValuePairs<Int, Int>
+  inputAttentionRes: KeyValuePairs<Int, [Int]>, middleAttentionBlock: Int,
+  outputAttentionRes: KeyValuePairs<Int, [Int]>
 ) -> Model {
   let x = Input()
   let t_emb = Input()
   let y = Input()
-  let middleBlockAttentionBlock = attentionRes.last!.value
-  let attentionRes = [Int: Int](uniqueKeysWithValues: attentionRes.map { ($0.key, $0.value) })
+  let inputAttentionRes = [Int: [Int]](
+    uniqueKeysWithValues: inputAttentionRes.map { ($0.key, $0.value) })
+  let outputAttentionRes = [Int: [Int]](
+    uniqueKeysWithValues: outputAttentionRes.map { ($0.key, $0.value) })
   let timeEmbed = TimeEmbed(modelChannels: channels[0])
   let labelEmbed = LabelEmbed(modelChannels: channels[0])
   let emb = timeEmbed(t_emb) + labelEmbed(y)
   let middleBlockSizeMult = 1 << (channels.count - 1)
   let (inputs, inputBlocks, inputKVs) = InputBlocks(
     channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77,
+    attentionRes: inputAttentionRes,
     x: x, emb: emb)
   var out = inputBlocks
   let (middleBlock, middleKVs) = MiddleBlock(
     channels: channels.last!, numHeadChannels: 64, batchSize: batchSize,
     height: startHeight / middleBlockSizeMult, width: startWidth / middleBlockSizeMult,
-    embeddingSize: 77, attentionBlock: middleBlockAttentionBlock, x: out, emb: emb)
+    embeddingSize: 77, attentionBlock: middleAttentionBlock, x: out, emb: emb)
   out = middleBlock
   let (outputBlocks, outputKVs) = OutputBlocks(
     channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77,
+    attentionRes: outputAttentionRes,
     x: out, emb: emb, inputs: inputs)
   out = outputBlocks
   let outNorm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-5, reduce: [2, 3])
@@ -363,7 +370,7 @@ func MiddleBlockFixed(
 func InputBlocksFixed(
   channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
   startWidth: Int,
-  embeddingSize: Int, attentionRes: [Int: Int], c: Model.IO
+  embeddingSize: Int, attentionRes: [Int: [Int]], c: Model.IO
 ) -> [Model.IO] {
   var layerStart = 1
   var height = startHeight
@@ -372,13 +379,13 @@ func InputBlocksFixed(
   var ds = 1
   var outs = [Model.IO]()
   for (i, channel) in channels.enumerated() {
-    let attentionBlock = attentionRes[ds, default: 0]
-    for _ in 0..<numRepeat {
-      if attentionBlock > 0 {
+    let attentionBlock = attentionRes[ds, default: Array(repeating: 0, count: numRepeat)]
+    for j in 0..<numRepeat {
+      if attentionBlock[j] > 0 {
         let inputLayer = BlockLayerFixed(
           prefix: "input_blocks",
           layerStart: layerStart, skipConnection: previousChannel != channel,
-          attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
+          attentionBlock: attentionBlock[j], channels: channel, numHeadChannels: numHeadChannels,
           batchSize: batchSize,
           height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
         previousChannel = channel
@@ -399,7 +406,7 @@ func InputBlocksFixed(
 func OutputBlocksFixed(
   channels: [Int], numRepeat: Int, numHeadChannels: Int, batchSize: Int, startHeight: Int,
   startWidth: Int,
-  embeddingSize: Int, attentionRes: [Int: Int], c: Model.IO
+  embeddingSize: Int, attentionRes: [Int: [Int]], c: Model.IO
 ) -> [Model.IO] {
   var layerStart = 0
   var height = startHeight
@@ -421,13 +428,13 @@ func OutputBlocksFixed(
     let height = heights[i]
     let width = widths[i]
     let ds = dss[i]
-    let attentionBlock = attentionRes[ds, default: 0]
-    for _ in 0..<(numRepeat + 1) {
-      if attentionBlock > 0 {
+    let attentionBlock = attentionRes[ds, default: Array(repeating: 0, count: numRepeat + 1)]
+    for j in 0..<(numRepeat + 1) {
+      if attentionBlock[j] > 0 {
         let outputLayer = BlockLayerFixed(
           prefix: "output_blocks",
           layerStart: layerStart, skipConnection: true,
-          attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
+          attentionBlock: attentionBlock[j], channels: channel, numHeadChannels: numHeadChannels,
           batchSize: batchSize,
           height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
         outs.append(outputLayer(c))
@@ -440,25 +447,32 @@ func OutputBlocksFixed(
 
 func UNetXLFixed(
   batchSize: Int, startHeight: Int, startWidth: Int, channels: [Int],
-  attentionRes: KeyValuePairs<Int, Int>
+  inputAttentionRes: KeyValuePairs<Int, [Int]>, middleAttentionBlock: Int,
+  outputAttentionRes: KeyValuePairs<Int, [Int]>
 ) -> Model {
   let c = Input()
-  let middleBlockAttentionBlock = attentionRes.last!.value
-  let attentionRes = [Int: Int](uniqueKeysWithValues: attentionRes.map { ($0.key, $0.value) })
+  let inputAttentionRes = [Int: [Int]](
+    uniqueKeysWithValues: inputAttentionRes.map { ($0.key, $0.value) })
+  let outputAttentionRes = [Int: [Int]](
+    uniqueKeysWithValues: outputAttentionRes.map { ($0.key, $0.value) })
   let inputBlocks = InputBlocksFixed(
     channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77,
+    attentionRes: inputAttentionRes,
     c: c)
   var out = inputBlocks
   let middleBlockSizeMult = 1 << (channels.count - 1)
-  let middleBlock = MiddleBlockFixed(
-    channels: channels.last!, numHeadChannels: 64, batchSize: batchSize,
-    height: startHeight / middleBlockSizeMult, width: startWidth / middleBlockSizeMult,
-    embeddingSize: 77, attentionBlock: middleBlockAttentionBlock, c: c)
-  out.append(middleBlock)
+  if middleAttentionBlock > 0 {
+    let middleBlock = MiddleBlockFixed(
+      channels: channels.last!, numHeadChannels: 64, batchSize: batchSize,
+      height: startHeight / middleBlockSizeMult, width: startWidth / middleBlockSizeMult,
+      embeddingSize: 77, attentionBlock: middleAttentionBlock, c: c)
+    out.append(middleBlock)
+  }
   let outputBlocks = OutputBlocksFixed(
     channels: channels, numRepeat: 2, numHeadChannels: 64, batchSize: batchSize,
-    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77, attentionRes: attentionRes,
+    startHeight: startHeight, startWidth: startWidth, embeddingSize: 77,
+    attentionRes: outputAttentionRes,
     c: c)
   out.append(contentsOf: outputBlocks)
   return Model([c], out)
@@ -673,19 +687,27 @@ let kvs0 = graph.withNoGrad {
   */
   let unetBaseFixed = UNetXLFixed(
     batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
-    attentionRes: [2: 2, 4: 10])
+    inputAttentionRes: [2: [2, 2], 4: [4, 4]], middleAttentionBlock: 0,
+    outputAttentionRes: [2: [2, 1, 1], 4: [4, 4, 10]])
   unetBaseFixed.maxConcurrency = .limit(1)
   unetBaseFixed.compile(inputs: crossattn)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/ssd_1b_f16.ckpt") {
     $0.read("unet_fixed", model: unetBaseFixed)
   }
-  return unetBaseFixed(inputs: crossattn).map { $0.as(of: FloatType.self) }
+  let result = unetBaseFixed(inputs: crossattn).map { $0.as(of: FloatType.self) }
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/ssd_1b_f16.ckpt") {
+    $0.write("unet_fixed", model: unetBaseFixed)
+  }
+  */
+  return result
 }
 
 let kvs1 = graph.withNoGrad {
   let unetRefinerFixed = UNetXLFixed(
     batchSize: 2, startHeight: 128, startWidth: 128, channels: [384, 768, 1536, 1536],
-    attentionRes: [2: 4, 4: 4])
+    inputAttentionRes: [2: [4, 4], 4: [4, 4]], middleAttentionBlock: 4,
+    outputAttentionRes: [2: [4, 4, 4], 4: [4, 4, 4]])
   unetRefinerFixed.maxConcurrency = .limit(1)
   unetRefinerFixed.compile(inputs: c1)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_refiner_0.9_f16.ckpt") {
@@ -785,7 +807,7 @@ let unconditionalGuidanceScale: Float = 5
 let scaleFactor: Float = 0.13025
 let startHeight = 128
 let startWidth = 128
-let refinerTimestep: Float = 300
+let refinerTimestep: Float = 0  // 300
 let model = DiffusionModel(linearStart: 0.00085, linearEnd: 0.012, timesteps: 1_000, steps: 30)
 let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
@@ -854,10 +876,11 @@ let z = graph.withNoGrad {
   */
   var unet = UNetXL(
     batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
-    attentionRes: [2: 2, 4: 10])
+    inputAttentionRes: [2: [2, 2], 4: [4, 4]], middleAttentionBlock: 0,
+    outputAttentionRes: [2: [2, 1, 1], 4: [4, 4, 10]])
   unet.maxConcurrency = .limit(1)
   unet.compile(inputs: [xIn, graph.variable(Tensor<FloatType>(from: ts)), vector0] + kvs0)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_0.9_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/ssd_1b_f16.ckpt") {
     $0.read("unet", model: unet)
   }
   var oldDenoised: DynamicGraph.Tensor<FloatType>? = nil
@@ -871,7 +894,8 @@ let z = graph.withNoGrad {
     if timestep <= refinerTimestep && !refinerPass {
       unet = UNetXL(
         batchSize: 2, startHeight: 128, startWidth: 128, channels: [384, 768, 1536, 1536],
-        attentionRes: [2: 4, 4: 4])
+        inputAttentionRes: [2: [4, 4], 4: [4, 4]], middleAttentionBlock: 4,
+        outputAttentionRes: [2: [4, 4, 4], 4: [4, 4, 4]])
       let ts = timeEmbedding(
         timestep: timestep, batchSize: 2, embeddingSize: 384, maxPeriod: 10_000
       )
@@ -895,6 +919,11 @@ let z = graph.withNoGrad {
     // var et = graph.variable(Tensor<FloatType>(from: try! Tensor<Float>(numpy: etPy.detach().cpu().numpy())).toGPU(0))
     var et = unet(inputs: xIn, refinerPass ? [t, vector1] + kvs1 : [t, vector0] + kvs0)[0].as(
       of: FloatType.self)
+    /*
+    graph.openStore("/home/liu/workspace/swift-diffusion/ssd_1b_f16.ckpt") {
+      $0.write("unet", model: unet)
+    }
+    */
     var etUncond = graph.variable(
       .GPU(0), .NCHW(1, 4, startHeight, startWidth), of: FloatType.self)
     var etCond = graph.variable(
