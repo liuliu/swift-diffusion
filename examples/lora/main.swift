@@ -1,9 +1,9 @@
+import Collections
 import Diffusion
+import Fickling
 import Foundation
 import NNC
 import ZIPFoundation
-import Fickling
-import Collections
 
 public struct Storage {
   var name: String
@@ -62,7 +62,8 @@ public final class SafeTensors {
       }
       strides.reverse()
       let tensorDescriptor = TensorDescriptor(
-        storage: Storage(name: key, size: offsetEnd - offsetStart, dataType: dataType, BF16: dtype == "bf16"),
+        storage: Storage(
+          name: key, size: offsetEnd - offsetStart, dataType: dataType, BF16: dtype == "bf16"),
         storageOffset: offsetStart, shape: shape, strides: strides)
       states[key] = tensorDescriptor
     }
@@ -82,14 +83,16 @@ public final class SafeTensors {
         if tensorDescriptor.storage.BF16 {
           let count = tensorDescriptor.strides[0] * tensorDescriptor.shape[0]
           let u16 = UnsafeMutablePointer<UInt16>.allocate(capacity: count * 2)
-          let bf16 = (address + bufferStart + tensorDescriptor.storageOffset).assumingMemoryBound(to: UInt16.self)
+          let bf16 = (address + bufferStart + tensorDescriptor.storageOffset).assumingMemoryBound(
+            to: UInt16.self)
           for i in 0..<count {
             u16[i * 2] = 0
             u16[i * 2 + 1] = bf16[i]
           }
           tensor = Tensor<Float>(
             .CPU, format: .NCHW, shape: TensorShape(tensorDescriptor.shape),
-            unsafeMutablePointer: UnsafeMutableRawPointer(u16).assumingMemoryBound(to: Float.self), bindLifetimeOf: self
+            unsafeMutablePointer: UnsafeMutableRawPointer(u16).assumingMemoryBound(to: Float.self),
+            bindLifetimeOf: self
           ).copied()
           u16.deallocate()
         } else {
@@ -113,7 +116,7 @@ public final class SafeTensors {
   }
 }
 
-let filename = "/home/liu/workspace/swift-diffusion/adamsArtworkStyle_v01.safetensors"
+let filename = "/home/liu/workspace/swift-diffusion/pytorch_lora_sd_v1.5_weights.safetensors"
 /*
 let archive = Archive(url: URL(fileURLWithPath: filename), accessMode: .read)!
 let entry = archive["archive/data.pkl"]!
@@ -158,12 +161,93 @@ model.forEach { key, value in
 */
 let safeTensors = SafeTensors(url: URL(fileURLWithPath: filename))!
 
-let unetDiffusersMap: [(String, String)] = [("input_blocks.1.0.", "down_blocks.0.resnets.0."), ("input_blocks.1.1.", "down_blocks.0.attentions.0."), ("input_blocks.2.0.", "down_blocks.0.resnets.1."), ("input_blocks.2.1.", "down_blocks.0.attentions.1."), ("output_blocks.0.0.", "up_blocks.0.resnets.0."), ("output_blocks.1.0.", "up_blocks.0.resnets.1."), ("output_blocks.2.0.", "up_blocks.0.resnets.2."), ("input_blocks.3.0.op.", "down_blocks.0.downsamplers.0.conv."), ("output_blocks.2.1.", "up_blocks.0.upsamplers.0."), ("input_blocks.4.0.", "down_blocks.1.resnets.0."), ("input_blocks.4.1.", "down_blocks.1.attentions.0."), ("input_blocks.5.0.", "down_blocks.1.resnets.1."), ("input_blocks.5.1.", "down_blocks.1.attentions.1."), ("output_blocks.3.0.", "up_blocks.1.resnets.0."), ("output_blocks.3.1.", "up_blocks.1.attentions.0."), ("output_blocks.4.0.", "up_blocks.1.resnets.1."), ("output_blocks.4.1.", "up_blocks.1.attentions.1."), ("output_blocks.5.0.", "up_blocks.1.resnets.2."), ("output_blocks.5.1.", "up_blocks.1.attentions.2."), ("input_blocks.6.0.op.", "down_blocks.1.downsamplers.0.conv."), ("output_blocks.5.2.", "up_blocks.1.upsamplers.0."), ("input_blocks.7.0.", "down_blocks.2.resnets.0."), ("input_blocks.7.1.", "down_blocks.2.attentions.0."), ("input_blocks.8.0.", "down_blocks.2.resnets.1."), ("input_blocks.8.1.", "down_blocks.2.attentions.1."), ("output_blocks.6.0.", "up_blocks.2.resnets.0."), ("output_blocks.6.1.", "up_blocks.2.attentions.0."), ("output_blocks.7.0.", "up_blocks.2.resnets.1."), ("output_blocks.7.1.", "up_blocks.2.attentions.1."), ("output_blocks.8.0.", "up_blocks.2.resnets.2."), ("output_blocks.8.1.", "up_blocks.2.attentions.2."), ("input_blocks.9.0.op.", "down_blocks.2.downsamplers.0.conv."), ("output_blocks.8.2.", "up_blocks.2.upsamplers.0."), ("input_blocks.10.0.", "down_blocks.3.resnets.0."), ("input_blocks.11.0.", "down_blocks.3.resnets.1."), ("output_blocks.9.0.", "up_blocks.3.resnets.0."), ("output_blocks.9.1.", "up_blocks.3.attentions.0."), ("output_blocks.10.0.", "up_blocks.3.resnets.1."), ("output_blocks.10.1.", "up_blocks.3.attentions.1."), ("output_blocks.11.0.", "up_blocks.3.resnets.2."), ("output_blocks.11.1.", "up_blocks.3.attentions.2."), ("middle_block.1.", "mid_block.attentions.0."), ("middle_block.0.", "mid_block.resnets.0."), ("middle_block.2.", "mid_block.resnets.1.")]
+let unetDiffusersMap: [(String, String)] = [
+  ("input_blocks.1.0.", "down_blocks.0.resnets.0."),
+  ("input_blocks.1.1.", "down_blocks.0.attentions.0."),
+  ("input_blocks.2.0.", "down_blocks.0.resnets.1."),
+  ("input_blocks.2.1.", "down_blocks.0.attentions.1."),
+  ("output_blocks.0.0.", "up_blocks.0.resnets.0."),
+  ("output_blocks.1.0.", "up_blocks.0.resnets.1."),
+  ("output_blocks.2.0.", "up_blocks.0.resnets.2."),
+  ("input_blocks.3.0.op.", "down_blocks.0.downsamplers.0.conv."),
+  ("output_blocks.2.1.", "up_blocks.0.upsamplers.0."),
+  ("input_blocks.4.0.", "down_blocks.1.resnets.0."),
+  ("input_blocks.4.1.", "down_blocks.1.attentions.0."),
+  ("input_blocks.5.0.", "down_blocks.1.resnets.1."),
+  ("input_blocks.5.1.", "down_blocks.1.attentions.1."),
+  ("output_blocks.3.0.", "up_blocks.1.resnets.0."),
+  ("output_blocks.3.1.", "up_blocks.1.attentions.0."),
+  ("output_blocks.4.0.", "up_blocks.1.resnets.1."),
+  ("output_blocks.4.1.", "up_blocks.1.attentions.1."),
+  ("output_blocks.5.0.", "up_blocks.1.resnets.2."),
+  ("output_blocks.5.1.", "up_blocks.1.attentions.2."),
+  ("input_blocks.6.0.op.", "down_blocks.1.downsamplers.0.conv."),
+  ("output_blocks.5.2.", "up_blocks.1.upsamplers.0."),
+  ("input_blocks.7.0.", "down_blocks.2.resnets.0."),
+  ("input_blocks.7.1.", "down_blocks.2.attentions.0."),
+  ("input_blocks.8.0.", "down_blocks.2.resnets.1."),
+  ("input_blocks.8.1.", "down_blocks.2.attentions.1."),
+  ("output_blocks.6.0.", "up_blocks.2.resnets.0."),
+  ("output_blocks.6.1.", "up_blocks.2.attentions.0."),
+  ("output_blocks.7.0.", "up_blocks.2.resnets.1."),
+  ("output_blocks.7.1.", "up_blocks.2.attentions.1."),
+  ("output_blocks.8.0.", "up_blocks.2.resnets.2."),
+  ("output_blocks.8.1.", "up_blocks.2.attentions.2."),
+  ("input_blocks.9.0.op.", "down_blocks.2.downsamplers.0.conv."),
+  ("output_blocks.8.2.", "up_blocks.2.upsamplers.0."),
+  ("input_blocks.10.0.", "down_blocks.3.resnets.0."),
+  ("input_blocks.11.0.", "down_blocks.3.resnets.1."),
+  ("output_blocks.9.0.", "up_blocks.3.resnets.0."),
+  ("output_blocks.9.1.", "up_blocks.3.attentions.0."),
+  ("output_blocks.10.0.", "up_blocks.3.resnets.1."),
+  ("output_blocks.10.1.", "up_blocks.3.attentions.1."),
+  ("output_blocks.11.0.", "up_blocks.3.resnets.2."),
+  ("output_blocks.11.1.", "up_blocks.3.attentions.2."),
+  ("middle_block.1.", "mid_block.attentions.0."), ("middle_block.0.", "mid_block.resnets.0."),
+  ("middle_block.2.", "mid_block.resnets.1."),
+]
 
-let vaeDiffusersMap: [(String, String)] = [("nin_shortcut", "conv_shortcut"), ("norm_out", "conv_norm_out"), ("mid.attn_1.", "mid_block.attentions.0."), ("encoder.down.0.block.0.", "encoder.down_blocks.0.resnets.0."), ("encoder.down.0.block.1.", "encoder.down_blocks.0.resnets.1."), ("down.0.downsample.", "down_blocks.0.downsamplers.0."), ("up.3.upsample.", "up_blocks.0.upsamplers.0."), ("decoder.up.3.block.0.", "decoder.up_blocks.0.resnets.0."), ("decoder.up.3.block.1.", "decoder.up_blocks.0.resnets.1."), ("decoder.up.3.block.2.", "decoder.up_blocks.0.resnets.2."), ("encoder.down.1.block.0.", "encoder.down_blocks.1.resnets.0."), ("encoder.down.1.block.1.", "encoder.down_blocks.1.resnets.1."), ("down.1.downsample.", "down_blocks.1.downsamplers.0."), ("up.2.upsample.", "up_blocks.1.upsamplers.0."), ("decoder.up.2.block.0.", "decoder.up_blocks.1.resnets.0."), ("decoder.up.2.block.1.", "decoder.up_blocks.1.resnets.1."), ("decoder.up.2.block.2.", "decoder.up_blocks.1.resnets.2."), ("encoder.down.2.block.0.", "encoder.down_blocks.2.resnets.0."), ("encoder.down.2.block.1.", "encoder.down_blocks.2.resnets.1."), ("down.2.downsample.", "down_blocks.2.downsamplers.0."), ("up.1.upsample.", "up_blocks.2.upsamplers.0."), ("decoder.up.1.block.0.", "decoder.up_blocks.2.resnets.0."), ("decoder.up.1.block.1.", "decoder.up_blocks.2.resnets.1."), ("decoder.up.1.block.2.", "decoder.up_blocks.2.resnets.2."), ("encoder.down.3.block.0.", "encoder.down_blocks.3.resnets.0."), ("encoder.down.3.block.1.", "encoder.down_blocks.3.resnets.1."), ("decoder.up.0.block.0.", "decoder.up_blocks.3.resnets.0."), ("decoder.up.0.block.1.", "decoder.up_blocks.3.resnets.1."), ("decoder.up.0.block.2.", "decoder.up_blocks.3.resnets.2."), ("mid.block_1.", "mid_block.resnets.0."), ("mid.block_2.", "mid_block.resnets.1.")]
+let resnetsDiffusersMap: [(String, String)] = [
+  ("in_layers.2", "conv1"), ("emb_layers.1", "time_emb_proj"), ("out_layers.3", "conv2"),
+  ("skip_connection", "conv_shortcut"),
+]
+
+let vaeDiffusersMap: [(String, String)] = [
+  ("nin_shortcut", "conv_shortcut"), ("norm_out", "conv_norm_out"),
+  ("mid.attn_1.", "mid_block.attentions.0."),
+  ("encoder.down.0.block.0.", "encoder.down_blocks.0.resnets.0."),
+  ("encoder.down.0.block.1.", "encoder.down_blocks.0.resnets.1."),
+  ("down.0.downsample.", "down_blocks.0.downsamplers.0."),
+  ("up.3.upsample.", "up_blocks.0.upsamplers.0."),
+  ("decoder.up.3.block.0.", "decoder.up_blocks.0.resnets.0."),
+  ("decoder.up.3.block.1.", "decoder.up_blocks.0.resnets.1."),
+  ("decoder.up.3.block.2.", "decoder.up_blocks.0.resnets.2."),
+  ("encoder.down.1.block.0.", "encoder.down_blocks.1.resnets.0."),
+  ("encoder.down.1.block.1.", "encoder.down_blocks.1.resnets.1."),
+  ("down.1.downsample.", "down_blocks.1.downsamplers.0."),
+  ("up.2.upsample.", "up_blocks.1.upsamplers.0."),
+  ("decoder.up.2.block.0.", "decoder.up_blocks.1.resnets.0."),
+  ("decoder.up.2.block.1.", "decoder.up_blocks.1.resnets.1."),
+  ("decoder.up.2.block.2.", "decoder.up_blocks.1.resnets.2."),
+  ("encoder.down.2.block.0.", "encoder.down_blocks.2.resnets.0."),
+  ("encoder.down.2.block.1.", "encoder.down_blocks.2.resnets.1."),
+  ("down.2.downsample.", "down_blocks.2.downsamplers.0."),
+  ("up.1.upsample.", "up_blocks.2.upsamplers.0."),
+  ("decoder.up.1.block.0.", "decoder.up_blocks.2.resnets.0."),
+  ("decoder.up.1.block.1.", "decoder.up_blocks.2.resnets.1."),
+  ("decoder.up.1.block.2.", "decoder.up_blocks.2.resnets.2."),
+  ("encoder.down.3.block.0.", "encoder.down_blocks.3.resnets.0."),
+  ("encoder.down.3.block.1.", "encoder.down_blocks.3.resnets.1."),
+  ("decoder.up.0.block.0.", "decoder.up_blocks.3.resnets.0."),
+  ("decoder.up.0.block.1.", "decoder.up_blocks.3.resnets.1."),
+  ("decoder.up.0.block.2.", "decoder.up_blocks.3.resnets.2."),
+  ("mid.block_1.", "mid_block.resnets.0."), ("mid.block_2.", "mid_block.resnets.1."),
+]
 
 let jsonDecoder = JSONDecoder()
-var unetMap = try jsonDecoder.decode([String].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/unet.json")))
+var unetMap = try jsonDecoder.decode(
+  [String].self,
+  from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/unet.json")))
 for i in stride(from: 0, to: unetMap.count, by: 2) {
   // Replacing to diffuser terminology, remove first two, then join with _ except the last part.
   for namePairs in unetDiffusersMap {
@@ -172,13 +256,25 @@ for i in stride(from: 0, to: unetMap.count, by: 2) {
       break
     }
   }
+  if unetMap[i].contains(".resnets.") {
+    for namePairs in resnetsDiffusersMap {
+      if unetMap[i].contains(namePairs.0) {
+        unetMap[i] = unetMap[i].replacingOccurrences(of: namePairs.0, with: namePairs.1)
+        break
+      }
+    }
+  }
   let parts = unetMap[i].components(separatedBy: ".")
   unetMap[i] = parts[2..<(parts.count - 1)].joined(separator: "_") + "." + parts[parts.count - 1]
 }
-var textModelMap = try jsonDecoder.decode([String].self, from: Data(contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/text_model.json")))
+var textModelMap = try jsonDecoder.decode(
+  [String].self,
+  from: Data(
+    contentsOf: URL(fileURLWithPath: "/home/liu/workspace/swift-diffusion/text_model.json")))
 for i in stride(from: 0, to: textModelMap.count, by: 2) {
   let parts = textModelMap[i].components(separatedBy: ".")
-  textModelMap[i] = parts[2..<(parts.count - 1)].joined(separator: "_") + "." + parts[parts.count - 1]
+  textModelMap[i] =
+    parts[2..<(parts.count - 1)].joined(separator: "_") + "." + parts[parts.count - 1]
 }
 let keys = safeTensors.states.keys
 var keysSet = Set(keys)
@@ -213,26 +309,35 @@ for key in textModelMapCount.keys {
   }
 }
 let graph = DynamicGraph()
+print(safeTensors.states.count)
 try graph.openStore("/home/liu/workspace/swift-diffusion/lora.ckpt") { store in
   for (key, descriptor) in safeTensors.states {
     let parts = key.components(separatedBy: "_")
-    let newParts = String(parts[2..<parts.count].joined(separator: "_")).components(separatedBy: ".")
+    let newParts = String(parts[2..<parts.count].joined(separator: "_")).components(
+      separatedBy: ".")
     let newKey = newParts[0..<newParts.count - 2].joined(separator: ".") + ".weight"
     if let index = unetMap.firstIndex(of: newKey) {
       if key.hasSuffix("up.weight") {
-        let scalar = try safeTensors.states[String(key.prefix(upTo: key.index(key.endIndex, offsetBy: -14))) + "alpha"].map {
+        let scalar = try safeTensors.states[
+          String(key.prefix(upTo: key.index(key.endIndex, offsetBy: -14))) + "alpha"
+        ].map {
           return try safeTensors.with($0) {
             return Tensor<Float32>(from: $0)[0]
           }
         }
         try safeTensors.with(descriptor) {
-          var f16 = Tensor<Float16>(from: $0)
-          if let scalar = scalar, abs(scalar - Float(f16.shape[1])) > 1e-5 {
-            f16 = ((scalar / Float(f16.shape[1])) * graph.variable(f16)).rawValue
+          var f32 = Tensor<Float32>(from: $0)
+          if let scalar = scalar, abs(scalar - Float(f32.shape[1])) > 1e-5 {
+            f32 = ((scalar / Float(f32.shape[1])) * graph.variable(f32)).rawValue
           }
+          let f16 = Tensor<Float16>(from: f32)
           if unetMapCount[newKey] ?? 0 >= 2 {
-            store.write("__unet__[\(unetMap[index + 1])]__up__", tensor: f16[0..<(f16.shape[0] / 2), 0..<f16.shape[1]].copied())
-            store.write("__unet__[\(unetMap[index + 5])]__up__", tensor: f16[(f16.shape[0] / 2)..<f16.shape[0], 0..<f16.shape[1]].copied())
+            store.write(
+              "__unet__[\(unetMap[index + 1])]__up__",
+              tensor: f16[0..<(f16.shape[0] / 2), 0..<f16.shape[1]].copied())
+            store.write(
+              "__unet__[\(unetMap[index + 5])]__up__",
+              tensor: f16[(f16.shape[0] / 2)..<f16.shape[0], 0..<f16.shape[1]].copied())
           } else {
             store.write("__unet__[\(unetMap[index + 1])]__up__", tensor: f16)
           }
@@ -248,7 +353,9 @@ try graph.openStore("/home/liu/workspace/swift-diffusion/lora.ckpt") { store in
       }
     } else if let index = textModelMap.firstIndex(of: newKey) {
       if key.hasSuffix("up.weight") {
-        let scalar = try safeTensors.states[String(key.prefix(upTo: key.index(key.endIndex, offsetBy: -14))) + "alpha"].map {
+        let scalar = try safeTensors.states[
+          String(key.prefix(upTo: key.index(key.endIndex, offsetBy: -14))) + "alpha"
+        ].map {
           return try safeTensors.with($0) {
             return Tensor<Float32>(from: $0)[0]
           }
@@ -265,6 +372,11 @@ try graph.openStore("/home/liu/workspace/swift-diffusion/lora.ckpt") { store in
           let f16 = Tensor<Float16>(from: $0)
           store.write("__text_model__[\(textModelMap[index + 1])]__down__", tensor: f16)
         }
+      }
+    } else {
+      if key.hasSuffix(".weight") {
+        print(key)
+        fatalError()
       }
     }
   }

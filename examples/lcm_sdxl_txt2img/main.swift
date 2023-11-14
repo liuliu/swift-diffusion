@@ -614,16 +614,16 @@ let kvs0 = graph.withNoGrad {
   crossattn[0..<1, 0..<77, 768..<2048] = c1[1..<2, 0..<77, 0..<1280]
   let unetBaseFixed = UNetXLFixed(
     batchSize: 1, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
-    inputAttentionRes: [2: [2, 2], 4: [10, 10]], middleAttentionBlock: 10,
-    outputAttentionRes: [2: [2, 2, 2], 4: [10, 10, 10]])
+    inputAttentionRes: [2: [2, 2], 4: [4, 4]], middleAttentionBlock: 0,
+    outputAttentionRes: [2: [2, 1, 1], 4: [4, 4, 10]])
   unetBaseFixed.maxConcurrency = .limit(1)
   unetBaseFixed.compile(inputs: crossattn)
-  graph.openStore("/home/liu/workspace/swift-diffusion/lcm_sd_xl_base_1.0_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/lcm_ssd_1b_f16.ckpt") {
     $0.read("unet_fixed", model: unetBaseFixed)
   }
   let result = unetBaseFixed(inputs: crossattn).map { $0.as(of: FloatType.self) }
   /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/ssd_1b_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/lcm_ssd_1b_f16.ckpt") {
     $0.write("unet_fixed", model: unetBaseFixed)
   }
   */
@@ -775,11 +775,11 @@ let z = graph.withNoGrad {
   condProj.compile(inputs: graph.variable(Tensor<FloatType>(from: w).toGPU(0)))
   let unet = UNetXL(
     batchSize: 1, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
-    inputAttentionRes: [2: [2, 2], 4: [10, 10]], middleAttentionBlock: 10,
-    outputAttentionRes: [2: [2, 2, 2], 4: [10, 10, 10]])
+    inputAttentionRes: [2: [2, 2], 4: [4, 4]], middleAttentionBlock: 0,
+    outputAttentionRes: [2: [2, 1, 1], 4: [4, 4, 10]])
   unet.maxConcurrency = .limit(1)
   unet.compile(inputs: [x, graph.variable(Tensor<FloatType>(from: ts)), vector0] + kvs0)
-  graph.openStore("/home/liu/workspace/swift-diffusion/lcm_sd_xl_base_1.0_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/lcm_ssd_1b_f16.ckpt") {
     $0.read("w_cond_proj", model: condProj)
     $0.read("unet", model: unet)
   }
@@ -801,8 +801,8 @@ let z = graph.withNoGrad {
       left: x, right: et, leftScalar: 1.0 / alphaProdT.squareRoot(), rightScalar: -sigma)
     let (cSkip, cOut) = scalingsForBoundaryConditionDiscrete(timestep: timestep)
     print("c_skip \(cSkip), c_out \(cOut)")
-    let denoised = Functional.add(
-      left: predictOriginalSample, right: x, leftScalar: cOut, rightScalar: cSkip)
+    let denoised = predictOriginalSample  // Functional.add(
+    //  left: predictOriginalSample, right: x, leftScalar: cOut, rightScalar: cSkip)
     if i < 4 - 1 {
       let alphaProdTPrev = alphasCumprod[timesteps[i + 1]]
       let betaProdTPrev = 1.0 - alphaProdTPrev
