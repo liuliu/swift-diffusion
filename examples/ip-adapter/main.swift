@@ -16,7 +16,9 @@ let vae_model_path = "stabilityai/sd-vae-ft-mse"
 let image_encoder_path = "/home/liu/workspace/IP-Adapter/models/image_encoder"
 // let ip_ckpt = "/home/liu/workspace/IP-Adapter/sdxl_models/ip-adapter-plus_sdxl_vit-h.bin"
 // let ip_ckpt = "/home/liu/workspace/IP-Adapter/models/ip-adapter-plus-face_sd15.bin"
-let ip_ckpt = "/home/liu/workspace/IP-Adapter/models/ip-adapter-plus_sd15.bin"
+// let ip_ckpt = "/home/liu/workspace/IP-Adapter/models/ip-adapter-plus_sd15.bin"
+// let ip_ckpt = "/home/liu/workspace/IP-Adapter/sdxl_models/ip-adapter-plus-face_sdxl_vit-h.bin"
+let ip_ckpt = "/home/liu/workspace/IP-Adapter/models/ip-adapter-full-face_sd15.bin"
 let device = "cuda"
 
 let noise_scheduler = diffusers.DDIMScheduler(
@@ -28,6 +30,7 @@ let noise_scheduler = diffusers.DDIMScheduler(
   set_alpha_to_one: false,
   steps_offset: 1
 )
+
 let vae = diffusers.AutoencoderKL.from_pretrained(vae_model_path).to(dtype: torch.float16)
 
 // load SD pipeline
@@ -45,7 +48,7 @@ let image = Image.open("/home/liu/workspace/IP-Adapter/assets/images/ai_face.png
 image.resize(PythonObject(tupleOf: 256, 256))
 
 // load ip-adapter
-let ip_model = ip_adapter.IPAdapterPlus(pipe, image_encoder_path, ip_ckpt, device, num_tokens: 16)
+let ip_model = ip_adapter.IPAdapterFull(pipe, image_encoder_path, ip_ckpt, device, num_tokens: 257)
 
 let images = ip_model.generate(
   pil_image: image, num_samples: 1, num_inference_steps: 50, seed: 420,
@@ -72,10 +75,12 @@ let num_samples = 1
 let images = ip_model.generate(
   pil_image: image, num_samples: num_samples, num_inference_steps: 30, seed: 42)
 */
+
 let state_dict = ip_model.image_encoder.state_dict()
 print(ip_model.image_encoder)
 let proj_state_dict = ip_model.image_proj_model.state_dict()
 print(ip_model.image_proj_model)
+print(proj_state_dict.keys())
 let ip_layers_state_dict = ip_model.pipe.unet.state_dict()
 
 var clip_image = ip_model.clip_image_processor(images: image, return_tensors: "pt").pixel_values
@@ -519,6 +524,31 @@ func OutputBlocksFixed(
   return (reader, outs)
 }
 
+func MLPProjModel(width: Int, outputDim: Int) -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  let linear1 = Dense(count: width)
+  var out = linear1(x).GELU()
+  let linear2 = Dense(count: outputDim)
+  out = linear2(out)
+  let layerNorm = LayerNorm(epsilon: 1e-5, axis: [2])
+  out = layerNorm(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let proj_0_weight = state_dict["proj.0.weight"].type(torch.float).cpu().numpy()
+    linear1.weight.copy(from: try! Tensor<Float>(numpy: proj_0_weight))
+    let proj_0_bias = state_dict["proj.0.bias"].type(torch.float).cpu().numpy()
+    linear1.bias.copy(from: try! Tensor<Float>(numpy: proj_0_bias))
+    let proj_2_weight = state_dict["proj.2.weight"].type(torch.float).cpu().numpy()
+    linear2.weight.copy(from: try! Tensor<Float>(numpy: proj_2_weight))
+    let proj_2_bias = state_dict["proj.2.bias"].type(torch.float).cpu().numpy()
+    linear2.bias.copy(from: try! Tensor<Float>(numpy: proj_2_bias))
+    let proj_3_weight = state_dict["proj.3.weight"].type(torch.float).cpu().numpy()
+    layerNorm.weight.copy(from: try! Tensor<Float>(numpy: proj_3_weight))
+    let proj_3_bias = state_dict["proj.3.bias"].type(torch.float).cpu().numpy()
+    layerNorm.bias.copy(from: try! Tensor<Float>(numpy: proj_3_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
 func UNetXLFixed(
   batchSize: Int, startHeight: Int, startWidth: Int, channels: [Int],
   attentionRes: KeyValuePairs<Int, Int>
@@ -566,24 +596,38 @@ graph.withNoGrad {
   }
   */
   debugPrint(imageEmbeds)
+  /*
   let (resamplerReader, resampler) = Resampler(
-    width: 768, outputDim: 768, heads: 12, grid: 16, queries: 16, layers: 4, batchSize: 1)
+    width: 1280, outputDim: 2048, heads: 20, grid: 16, queries: 16, layers: 4, batchSize: 1)
   resampler.compile(inputs: imageEmbeds)
   resamplerReader(proj_state_dict)
   let imagePromptEmebeds = resampler(inputs: imageEmbeds)[0].as(of: Float.self)
   debugPrint(imagePromptEmebeds)
+  */
+  let (projModelReader, projModel) = MLPProjModel(width: 1280, outputDim: 768)
+  projModel.compile(inputs: imageEmbeds)
+  projModelReader(proj_state_dict)
+  let imagePromptEmebeds = projModel(inputs: imageEmbeds)[0].as(of: Float.self)
+  debugPrint(imagePromptEmebeds)
+
   let c = torch.randn([2, 77, 768])
   let cTensor = graph.variable(try! Tensor<Float>(numpy: c.numpy())).toGPU(0)
   let (readerFixed, unetFixed) = UNetXLFixed(
     batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280, 1280],
     attentionRes: [1: 1, 2: 1, 4: 1])
+  /*
+  let (readerFixed, unetFixed) = UNetXLFixed(
+    batchSize: 2, startHeight: 128, startWidth: 128, channels: [320, 640, 1280],
+    attentionRes: [2: 2, 4: 10])
+  */
   unetFixed.compile(inputs: cTensor)
   readerFixed(ip_layers_state_dict)
   let kvs = unetFixed(inputs: cTensor).map { $0.as(of: Float.self) }
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/ip_adapter_plus_sd_v1.x_open_clip_h14_f32.ckpt"
+    "/home/liu/workspace/swift-diffusion/ip_adapter_full_face_sd_v1.x_open_clip_h14_f32.ckpt"
   ) {
-    $0.write("resampler", model: resampler)
+    // $0.write("resampler", model: resampler)
+    $0.write("proj_model", model: projModel)
     $0.write("unet_ip_fixed", model: unetFixed)
   }
 }
