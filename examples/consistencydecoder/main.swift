@@ -32,7 +32,6 @@ model.load_state_dict(
 )
 model = model.cuda()
 let state_dict = model.state_dict()
-print(state_dict.keys())
 decoder_consistency.ckpt = model
 
 let image = consistencydecoder.load_image(
@@ -412,8 +411,51 @@ func ConvUNetVAE<T: TensorNumeric>(_ dataType: T.Type) -> (Model, (PythonObject)
   return (Model([x, t], [out]), reader)
 }
 
+func betasForAlphaBar(timesteps: Int, maxBeta: Double = 0.999) -> [Double] {
+  var betas = [Double]()
+  for i in 0..<timesteps {
+    let t1 = Double(i) / Double(timesteps)
+    let t2 = Double(i + 1) / Double(timesteps)
+    var alphaBarT1 = cos((t1 + 0.008) / 1.008 * .pi / 2)
+    alphaBarT1 = alphaBarT1 * alphaBarT1
+    var alphaBarT2 = cos((t2 + 0.008) / 1.008 * .pi / 2)
+    alphaBarT2 = alphaBarT2 * alphaBarT2
+    betas.append(min(1 - alphaBarT2 / alphaBarT1, maxBeta))
+  }
+  return betas
+}
+
+func roundTimesteps(timesteps: Int, nDistilledSteps: Int, truncateStart: Bool = false) -> [Int] {
+  let space = timesteps / nDistilledSteps
+  var roundedTimesteps = [Int]()
+  for i in 0..<timesteps {
+    var timestep = (i / space + 1) * space
+    if timestep == timesteps {
+      timestep -= space
+    }
+    if !truncateStart {
+      if timestep == 0 {
+        timestep += space
+      }
+    }
+    roundedTimesteps.append(timestep)
+  }
+  return roundedTimesteps
+}
+
+let betas = betasForAlphaBar(timesteps: 1024)
+var cumprod: Double = 1
+let alphasCumprod = betas.map {
+  cumprod *= 1 - $0
+  return cumprod
+}
+let roundedTimesteps = roundTimesteps(timesteps: 1024, nDistilledSteps: 64)
+let schedule = [1.0, 0.75, 0.5, 0.25]
+let sigmaData = 0.5
+
 let f = latent
 let graph = DynamicGraph()
+DynamicGraph.setSeed(40)
 graph.withNoGrad {
   var fTensor = graph.variable(try! Tensor<Float>(numpy: f.detach().cpu().float().numpy())).toGPU(0)
   fTensor = 0.18215 * fTensor
@@ -433,40 +475,52 @@ graph.withNoGrad {
   let noise = graph.variable(.GPU(0), .NCHW(1, 3, 256, 256), of: Float.self)
   noise.randn()
   var xStart = noise
-  var combined = Concat(axis: 1)(
+  let combined = Concat(axis: 1)(
     inputs: DynamicGraph.Tensor<Float16>(from: (1.0002 * 0.9997) * xStart), f8Tensor)[0].as(
       of: Float16.self)
   let tTensor = graph.variable(.CPU, .C(1), of: Int32.self)
   tTensor[0] = 1008
-  var tTensorGPU = tTensor.toGPU(0)
+  let tTensorGPU = tTensor.toGPU(0)
   convVAE.compile(inputs: combined, tTensorGPU)
   graph.openStore("/home/liu/workspace/swift-diffusion/consistencydecoder_f32.ckpt") {
     $0.read("conv_unet_vae", model: convVAE)
   }
   // reader(state_dict)
-  let out0 = DynamicGraph.Tensor<Float>(
-    from: convVAE(inputs: combined, tTensorGPU)[0].as(of: Float16.self)[
-      0..<1, 0..<3, 0..<256, 0..<256
-    ].copied())
-  /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/consistencydecoder_f16.ckpt") {
-    $0.write("conv_unet_vae", model: convVAE)
-  }
-  */
-  debugPrint(out0)
-  xStart = (0.5 * out0 + 0.0057 * xStart).clamped(-1...1)
-  tTensor[0] = 512
-  tTensorGPU = tTensor.toGPU(0)
-  xStart = Functional.add(left: xStart, right: noise, leftScalar: 0.7017, rightScalar: 0.7125)
-  combined = Concat(axis: 1)(inputs: DynamicGraph.Tensor<Float16>(from: 1.2591 * xStart), f8Tensor)[
-    0
-  ].as(of: Float16.self)
-  let out1 = DynamicGraph.Tensor<Float>(
-    from: convVAE(inputs: combined, tTensorGPU)[0].as(of: Float16.self)[
-      0..<1, 0..<3, 0..<256, 0..<256
-    ].copied())
-  xStart = Functional.add(left: out1, right: xStart, leftScalar: 0.4486, rightScalar: 0.2781)
+  let scheduleTimesteps = schedule.map { Int(((1024 - 1) * $0).rounded()) }
+  for (index, i) in scheduleTimesteps.enumerated() {
+    let timestep = roundedTimesteps[i]
+    let alphaCumprod = alphasCumprod[timestep]
+    let sqrtAlphaCumprod = alphaCumprod.squareRoot()
+    let sqrtOneMinusAlphaCumprod = (1 - alphaCumprod).squareRoot()
+    let sqrtRecipAlphaCumprod = (1.0 / alphaCumprod).squareRoot()
+    let sigma = (1.0 / alphaCumprod - 1).squareRoot()
+    let cSkip =
+      sqrtRecipAlphaCumprod * sigmaData * sigmaData / (sigma * sigma + sigmaData * sigmaData)
+    let cOut = sigma * sigmaData / (sigma * sigma + sigmaData * sigmaData).squareRoot()
+    let cIn = sqrtRecipAlphaCumprod / (sigma * sigma + sigmaData * sigmaData).squareRoot()
+    print(
+      "timestep \(timestep) alphaCumprod \(alphaCumprod) sqrtAlphaCumprod \(sqrtAlphaCumprod) cOut \(cOut) cSkip \(cSkip) cIn \(cIn)"
+    )
+    if index > 0 {
+      noise.randn()
+    }
+    xStart = Functional.add(
+      left: xStart, right: noise, leftScalar: Float(sqrtAlphaCumprod),
+      rightScalar: Float(sqrtOneMinusAlphaCumprod))
+    let combined = Concat(axis: 1)(
+      inputs: DynamicGraph.Tensor<Float16>(from: Float(cIn) * xStart), f8Tensor)[0].as(
+        of: Float16.self)
+    tTensor[0] = Int32(timestep)
+    let tTensorGPU = tTensor.toGPU(0)
+    let out = DynamicGraph.Tensor<Float>(
+      from: convVAE(inputs: combined, tTensorGPU)[0].as(of: Float16.self)[
+        0..<1, 0..<3, 0..<256, 0..<256
+      ].copied())
+    xStart = Functional.add(
+      left: out, right: xStart, leftScalar: Float(cOut), rightScalar: Float(cSkip)
+    )
     .clamped(-1...1)
+  }
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 256 * 256)
   xStart = xStart.toCPU()
   for y in 0..<256 {
