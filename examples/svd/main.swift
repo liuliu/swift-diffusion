@@ -16,8 +16,8 @@ let version_dict: [String: PythonObject] = [
   "H": 512,
   "W": 512,
   "C": 4, "f": 8,
-  "config": "/home/liu/workspace/generative-models/configs/inference/svd.yaml",
-  "ckpt": "/home/liu/workspace/generative-models/checkpoints/svd.safetensors",
+  "config": "/home/liu/workspace/generative-models/configs/inference/svd_image_decoder.yaml",
+  "ckpt": "/home/liu/workspace/generative-models/checkpoints/svd_image_decoder.safetensors",
   "options": [
     "discretization": 1,
     "cfg": 2.5,
@@ -490,7 +490,7 @@ func TimePosEmbed(modelChannels: Int) -> (Model, Model, Model) {
   var out = fc0(x).swish()
   let fc2 = Dense(count: modelChannels)
   out = fc2(out)
-  return (fc0, fc2, Model([x], [out]))
+  return (fc0, fc2, Model([x], [out], name: "time_pos_embed"))
 }
 
 func ResBlock(b: Int, outChannels: Int, skipConnection: Bool) -> (
@@ -560,7 +560,7 @@ func TimeResBlock(b: Int, h: Int, w: Int, channels: Int) -> (
   out = out.reshaped([channels, b, h, w]).transposed(0, 1)
   return (
     inLayerNorm, inLayerConv2d, embLayer, outLayerNorm, outLayerConv2d,
-    Model([x, emb], [out])
+    Model([x, emb], [out], name: "time_stack")
   )
 }
 
@@ -930,7 +930,7 @@ func BasicTimeTransformerBlock(
     print("\"diffusion_model.\(prefix).norm3.weight\": [\"\(layerNorm3.weight.name)\"],")
     print("\"diffusion_model.\(prefix).norm3.bias\": [\"\(layerNorm3.bias.name)\"],")
   }
-  return (reader, Model([x, timeEmb, keys, values], [out]))
+  return (reader, Model([x, timeEmb, keys, values], [out], name: "time_stack"))
 }
 
 func SpatialTransformer(
@@ -952,7 +952,7 @@ func SpatialTransformer(
     let emb = Input()
     kvs.append(emb)
     timeEmb = emb
-    mixFactor = Parameter<Float>(.GPU(1), .C(1))
+    mixFactor = Parameter<Float>(.GPU(1), .C(1), name: "time_mixer")
   } else {
     timeEmb = nil
     mixFactor = nil
@@ -1041,7 +1041,7 @@ func BlockLayer(
     timeInLayerNorm, timeInLayerConv2d, timeEmbLayer, timeOutLayerNorm, timeOutLayerConv2d,
     timeResBlock
   ) = TimeResBlock(b: batchSize, h: height, w: width, channels: channels)
-  let mixFactor = Parameter<Float>(.GPU(1), .C(1))
+  let mixFactor = Parameter<Float>(.GPU(1), .C(1), name: "time_mixer")
   out = mixFactor .* out + (1 - mixFactor) .* timeResBlock(out, emb)
   var transformerReader: ((PythonObject) -> Void)? = nil
   if attentionBlock > 0 {
@@ -1256,7 +1256,7 @@ func MiddleBlock(
     timeInLayerNorm1, timeInLayerConv2d1, timeEmbLayer1, timeOutLayerNorm1, timeOutLayerConv2d1,
     timeResBlock1
   ) = TimeResBlock(b: batchSize, h: height, w: width, channels: channels)
-  let mixFactor1 = Parameter<Float>(.GPU(1), .C(1))
+  let mixFactor1 = Parameter<Float>(.GPU(1), .C(1), name: "time_mixer")
   out = mixFactor1 .* out + (1 - mixFactor1) .* timeResBlock1(out, emb)
   let kvs = (0..<(attentionBlock * 4 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
   let (
@@ -1272,7 +1272,7 @@ func MiddleBlock(
     timeInLayerNorm2, timeInLayerConv2d2, timeEmbLayer2, timeOutLayerNorm2, timeOutLayerConv2d2,
     timeResBlock2
   ) = TimeResBlock(b: batchSize, h: height, w: width, channels: channels)
-  let mixFactor2 = Parameter<Float>(.GPU(1), .C(1))
+  let mixFactor2 = Parameter<Float>(.GPU(1), .C(1), name: "time_mixer")
   out = mixFactor2 .* out + (1 - mixFactor2) .* timeResBlock2(out, emb)
   let reader: (PythonObject) -> Void = { state_dict in
     let in_layers_0_0_weight = state_dict["diffusion_model.middle_block.0.in_layers.0.weight"]
@@ -1794,13 +1794,14 @@ func UNetXL(
   return (reader, Model([x, t_emb, y] + inputKVs + middleKVs + outputKVs, [out]))
 }
 
-func CrossAttentionFixed(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model) {
+func CrossAttentionFixed(k: Int, h: Int, b: Int, t: Int, name: String = "") -> (Model, Model, Model)
+{
   let c = Input()
   let tokeys = Dense(count: k * h, noBias: true)
   let tovalues = Dense(count: k * h, noBias: true)
   let keys = tokeys(c).reshaped([b, t, h, k]).transposed(1, 2)
   let values = tovalues(c).reshaped([b, t, h, k]).transposed(1, 2)
-  return (tokeys, tovalues, Model([c], [keys, values]))
+  return (tokeys, tovalues, Model([c], [keys, values], name: name))
 }
 
 func BasicTransformerBlockFixed(
@@ -1856,7 +1857,7 @@ func BasicTimeTransformerBlockFixed(
 ) -> (
   (PythonObject) -> Void, Model
 ) {
-  let (tokeys2, tovalues2, attn2) = CrossAttentionFixed(k: k, h: h, b: b, t: t)
+  let (tokeys2, tovalues2, attn2) = CrossAttentionFixed(k: k, h: h, b: b, t: t, name: "time_stack")
   let reader: (PythonObject) -> Void = { state_dict in
     let attn2_to_k_weight = state_dict[
       "diffusion_model.\(prefix).attn2.to_k.weight"
@@ -2146,4 +2147,9 @@ graph.withNoGrad {
   reader(model_state_dict)
   let pred = unet(inputs: x, [t_emb, y] + kvs)
   debugPrint(pred)
+  graph.openStore("/home/liu/workspace/swift-diffusion/svd_i2v_1.0_f32.ckpt") {
+    $0.write("visual_proj", model: visualProj)
+    $0.write("unet_fixed", model: unetFixed)
+    $0.write("unet", model: unet)
+  }
 }

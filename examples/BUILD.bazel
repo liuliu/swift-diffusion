@@ -535,3 +535,17 @@ swift_binary(
         "@s4nnc//nnc:nnc_python",
     ],
 )
+
+swift_binary(
+    name = "svd_i2v",
+    srcs = ["svd_i2v/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+    ],
+)
