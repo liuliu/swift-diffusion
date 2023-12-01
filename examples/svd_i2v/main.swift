@@ -4,7 +4,7 @@ import Foundation
 import NNC
 import PNG
 
-public typealias FloatType = Float
+public typealias FloatType = Float16
 
 struct PythonObject {}
 
@@ -337,16 +337,16 @@ func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> (Model, Model, Model, Mod
   let tokeys = Dense(count: k * h, noBias: true)
   let toqueries = Dense(count: k * h, noBias: true)
   let tovalues = Dense(count: k * h, noBias: true)
-  let keys = tokeys(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
-  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, hw, h, k])
+  let keys = tokeys(x).to(.Float32).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).to(.Float32).reshaped([b, hw, h, k])
     .permuted(0, 2, 1, 3)
-  let values = tovalues(x).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
+  let values = tovalues(x).to(.Float32).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
   var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * hw, hw])
   dot = dot.softmax()
   dot = dot.reshaped([b, h, hw, hw])
   var out = dot * values
-  out = out.reshaped([b, h, hw, k]).transposed(1, 2).reshaped([b, hw, h * k])
+  out = out.reshaped([b, h, hw, k]).to(of: x).transposed(1, 2).reshaped([b, hw, h * k])
   let unifyheads = Dense(count: k * h)
   out = unifyheads(out)
   return (tokeys, toqueries, tovalues, unifyheads, Model([x], [out]))
@@ -1105,8 +1105,9 @@ graph.withNoGrad {
   let sigmas: [Double] = (0..<25).map {
     pow(maxInvRho + Double($0) / 24 * (minInvRho - maxInvRho), 7)
   }
-  var x = graph.variable(.GPU(0), .NCHW(14, 4, 64, 64), of: FloatType.self)
-  x.randn(std: Float((sigmas[0] * sigmas[0] + 1).squareRoot()))
+  let upcastX = graph.variable(.GPU(0), .NCHW(14, 4, 64, 64), of: Float.self)
+  upcastX.randn(std: Float((sigmas[0] * sigmas[0] + 1).squareRoot()))
+  var x = DynamicGraph.Tensor<FloatType>(from: upcastX)
   let scaleCPU = graph.variable(.CPU, .NCHW(14, 1, 1, 1), of: FloatType.self)
   for i in 0..<14 {
     scaleCPU[i, 0, 0, 0] = FloatType(Float(i) * 1.5 / 13 + 1)
