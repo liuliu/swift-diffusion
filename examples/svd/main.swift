@@ -17,7 +17,7 @@ let version_dict: [String: PythonObject] = [
   "W": 512,
   "C": 4, "f": 8,
   "config": "/home/liu/workspace/generative-models/configs/inference/svd_image_decoder.yaml",
-  "ckpt": "/home/liu/workspace/generative-models/checkpoints/svd_image_decoder.safetensors",
+  "ckpt": "/home/liu/workspace/generative-models/checkpoints/svd_xt_image_decoder.safetensors",
   "options": [
     "discretization": 1,
     "cfg": 2.5,
@@ -619,18 +619,34 @@ func BasicTransformerBlock(
   (PythonObject) -> Void, Model
 ) {
   let x = Input()
-  let keys = Input()
   let values = Input()
   let layerNorm1 = LayerNorm(epsilon: 1e-5, axis: [2])
   var out = layerNorm1(x)
   let (tokeys1, toqueries1, tovalues1, unifyheads1, attn1) = SelfAttention(k: k, h: h, b: b, hw: hw)
   out = attn1(out) + x
   var residual = out
-  let layerNorm2 = LayerNorm(epsilon: 1e-5, axis: [2])
-  out = layerNorm2(out)
-  let (toqueries2, unifyheads2, attn2) = CrossAttentionKeysAndValues(
-    k: k, h: h, b: b, hw: hw, t: t)
-  out = attn2(out, keys, values) + residual
+  let layerNorm2: Model?
+  let toqueries2: Model?
+  let unifyheads2: Model?
+  let keys: Input?
+  if t == 1 {
+    out = values + residual
+    keys = nil
+    layerNorm2 = nil
+    toqueries2 = nil
+    unifyheads2 = nil
+  } else {
+    let layerNorm = LayerNorm(epsilon: 1e-5, axis: [2])
+    out = layerNorm(out)
+    let (toqueries, unifyheads, attn2) = CrossAttentionKeysAndValues(
+      k: k, h: h, b: b, hw: hw, t: t)
+    let keys2 = Input()
+    out = attn2(out, keys2, values) + residual
+    keys = keys2
+    layerNorm2 = layerNorm
+    toqueries2 = toqueries
+    unifyheads2 = unifyheads
+  }
   residual = out
   let layerNorm3 = LayerNorm(epsilon: 1e-5, axis: [2])
   out = layerNorm3(out)
@@ -693,22 +709,37 @@ func BasicTransformerBlock(
     fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ff_net_2_bias))
     print("\"diffusion_model.\(prefix).ff.net.2.weight\": [\"\(fc2.weight.name)\"],")
     print("\"diffusion_model.\(prefix).ff.net.2.bias\": [\"\(fc2.bias.name)\"],")
-    let attn2_to_q_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_q.weight"
-    ].cpu().numpy()
-    toqueries2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_q_weight))
-    print("\"diffusion_model.\(prefix).attn2.to_q.weight\": [\"\(toqueries2.weight.name)\"],")
-    let attn2_to_out_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_out.0.weight"
-    ].cpu().numpy()
-    let attn2_to_out_bias = state_dict[
-      "diffusion_model.\(prefix).attn2.to_out.0.bias"
-    ].cpu().numpy()
-    unifyheads2.parameters(for: .weight).copy(
-      from: try! Tensor<Float>(numpy: attn2_to_out_weight))
-    unifyheads2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn2_to_out_bias))
-    print("\"diffusion_model.\(prefix).attn2.to_out.0.weight\": [\"\(unifyheads2.weight.name)\"],")
-    print("\"diffusion_model.\(prefix).attn2.to_out.0.bias\": [\"\(unifyheads2.bias.name)\"],")
+    if let layerNorm2 = layerNorm2, let toqueries2 = toqueries2, let unifyheads2 = unifyheads2 {
+      let norm2_weight = state_dict[
+        "diffusion_model.\(prefix).norm2.weight"
+      ]
+      .cpu().numpy()
+      let norm2_bias = state_dict[
+        "diffusion_model.\(prefix).norm2.bias"
+      ]
+      .cpu().numpy()
+      layerNorm2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm2_weight))
+      layerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm2_bias))
+      print("\"diffusion_model.\(prefix).norm2.weight\": [\"\(layerNorm2.weight.name)\"],")
+      print("\"diffusion_model.\(prefix).norm2.bias\": [\"\(layerNorm2.bias.name)\"],")
+      let attn2_to_q_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_q.weight"
+      ].cpu().numpy()
+      toqueries2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_q_weight))
+      print("\"diffusion_model.\(prefix).attn2.to_q.weight\": [\"\(toqueries2.weight.name)\"],")
+      let attn2_to_out_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_out.0.weight"
+      ].cpu().numpy()
+      let attn2_to_out_bias = state_dict[
+        "diffusion_model.\(prefix).attn2.to_out.0.bias"
+      ].cpu().numpy()
+      unifyheads2.parameters(for: .weight).copy(
+        from: try! Tensor<Float>(numpy: attn2_to_out_weight))
+      unifyheads2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn2_to_out_bias))
+      print(
+        "\"diffusion_model.\(prefix).attn2.to_out.0.weight\": [\"\(unifyheads2.weight.name)\"],")
+      print("\"diffusion_model.\(prefix).attn2.to_out.0.bias\": [\"\(unifyheads2.bias.name)\"],")
+    }
     let norm1_weight = state_dict[
       "diffusion_model.\(prefix).norm1.weight"
     ]
@@ -721,18 +752,6 @@ func BasicTransformerBlock(
     layerNorm1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm1_bias))
     print("\"diffusion_model.\(prefix).norm1.weight\": [\"\(layerNorm1.weight.name)\"],")
     print("\"diffusion_model.\(prefix).norm1.bias\": [\"\(layerNorm1.bias.name)\"],")
-    let norm2_weight = state_dict[
-      "diffusion_model.\(prefix).norm2.weight"
-    ]
-    .cpu().numpy()
-    let norm2_bias = state_dict[
-      "diffusion_model.\(prefix).norm2.bias"
-    ]
-    .cpu().numpy()
-    layerNorm2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm2_weight))
-    layerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm2_bias))
-    print("\"diffusion_model.\(prefix).norm2.weight\": [\"\(layerNorm2.weight.name)\"],")
-    print("\"diffusion_model.\(prefix).norm2.bias\": [\"\(layerNorm2.bias.name)\"],")
     let norm3_weight = state_dict[
       "diffusion_model.\(prefix).norm3.weight"
     ]
@@ -746,7 +765,11 @@ func BasicTransformerBlock(
     print("\"diffusion_model.\(prefix).norm3.weight\": [\"\(layerNorm3.weight.name)\"],")
     print("\"diffusion_model.\(prefix).norm3.bias\": [\"\(layerNorm3.bias.name)\"],")
   }
-  return (reader, Model([x, keys, values], [out]))
+  if let keys = keys {
+    return (reader, Model([x, keys, values], [out]))
+  } else {
+    return (reader, Model([x, values], [out]))
+  }
 }
 
 func BasicTimeTransformerBlock(
@@ -756,7 +779,6 @@ func BasicTimeTransformerBlock(
 ) {
   let x = Input()
   let timeEmb = Input()
-  let keys = Input()
   let values = Input()
   var out = x.transposed(0, 1) + timeEmb.reshaped([1, b, k * h])
   let normIn = LayerNorm(epsilon: 1e-5, axis: [2])
@@ -767,11 +789,28 @@ func BasicTimeTransformerBlock(
   let (tokeys1, toqueries1, tovalues1, unifyheads1, attn1) = SelfAttention(k: k, h: h, b: hw, hw: b)
   out = attn1(layerNorm1(out)) + out
   var residual = out
-  let layerNorm2 = LayerNorm(epsilon: 1e-5, axis: [2])
-  out = layerNorm2(out)
-  let (toqueries2, unifyheads2, attn2) = CrossAttentionKeysAndValues(
-    k: k, h: h, b: hw, hw: b, t: t)
-  out = attn2(out, keys, values) + residual
+  let layerNorm2: Model?
+  let toqueries2: Model?
+  let unifyheads2: Model?
+  let keys: Input?
+  if t == 1 {
+    out = values + residual
+    keys = nil
+    layerNorm2 = nil
+    toqueries2 = nil
+    unifyheads2 = nil
+  } else {
+    let layerNorm = LayerNorm(epsilon: 1e-5, axis: [2])
+    out = layerNorm(out)
+    let keys2 = Input()
+    let (toqueries, unifyheads, attn2) = CrossAttentionKeysAndValues(
+      k: k, h: h, b: hw, hw: b, t: t)
+    out = attn2(out, keys2, values) + residual
+    keys = keys2
+    layerNorm2 = layerNorm
+    toqueries2 = toqueries
+    unifyheads2 = unifyheads
+  }
   residual = out
   let layerNorm3 = LayerNorm(epsilon: 1e-5, axis: [2])
   out = layerNorm3(out)
@@ -877,22 +916,37 @@ func BasicTimeTransformerBlock(
     fc2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ff_net_2_bias))
     print("\"diffusion_model.\(prefix).ff.net.2.weight\": [\"\(fc2.weight.name)\"],")
     print("\"diffusion_model.\(prefix).ff.net.2.bias\": [\"\(fc2.bias.name)\"],")
-    let attn2_to_q_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_q.weight"
-    ].cpu().numpy()
-    toqueries2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_q_weight))
-    print("\"diffusion_model.\(prefix).attn2.to_q.weight\": [\"\(toqueries2.weight.name)\"],")
-    let attn2_to_out_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_out.0.weight"
-    ].cpu().numpy()
-    let attn2_to_out_bias = state_dict[
-      "diffusion_model.\(prefix).attn2.to_out.0.bias"
-    ].cpu().numpy()
-    unifyheads2.parameters(for: .weight).copy(
-      from: try! Tensor<Float>(numpy: attn2_to_out_weight))
-    unifyheads2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn2_to_out_bias))
-    print("\"diffusion_model.\(prefix).attn2.to_out.0.weight\": [\"\(unifyheads2.weight.name)\"],")
-    print("\"diffusion_model.\(prefix).attn2.to_out.0.bias\": [\"\(unifyheads2.bias.name)\"],")
+    if let layerNorm2 = layerNorm2, let toqueries2 = toqueries2, let unifyheads2 = unifyheads2 {
+      let norm2_weight = state_dict[
+        "diffusion_model.\(prefix).norm2.weight"
+      ]
+      .cpu().numpy()
+      let norm2_bias = state_dict[
+        "diffusion_model.\(prefix).norm2.bias"
+      ]
+      .cpu().numpy()
+      layerNorm2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm2_weight))
+      layerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm2_bias))
+      print("\"diffusion_model.\(prefix).norm2.weight\": [\"\(layerNorm2.weight.name)\"],")
+      print("\"diffusion_model.\(prefix).norm2.bias\": [\"\(layerNorm2.bias.name)\"],")
+      let attn2_to_q_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_q.weight"
+      ].cpu().numpy()
+      toqueries2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: attn2_to_q_weight))
+      print("\"diffusion_model.\(prefix).attn2.to_q.weight\": [\"\(toqueries2.weight.name)\"],")
+      let attn2_to_out_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_out.0.weight"
+      ].cpu().numpy()
+      let attn2_to_out_bias = state_dict[
+        "diffusion_model.\(prefix).attn2.to_out.0.bias"
+      ].cpu().numpy()
+      unifyheads2.parameters(for: .weight).copy(
+        from: try! Tensor<Float>(numpy: attn2_to_out_weight))
+      unifyheads2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn2_to_out_bias))
+      print(
+        "\"diffusion_model.\(prefix).attn2.to_out.0.weight\": [\"\(unifyheads2.weight.name)\"],")
+      print("\"diffusion_model.\(prefix).attn2.to_out.0.bias\": [\"\(unifyheads2.bias.name)\"],")
+    }
     let norm1_weight = state_dict[
       "diffusion_model.\(prefix).norm1.weight"
     ]
@@ -905,18 +959,6 @@ func BasicTimeTransformerBlock(
     layerNorm1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm1_bias))
     print("\"diffusion_model.\(prefix).norm1.weight\": [\"\(layerNorm1.weight.name)\"],")
     print("\"diffusion_model.\(prefix).norm1.bias\": [\"\(layerNorm1.bias.name)\"],")
-    let norm2_weight = state_dict[
-      "diffusion_model.\(prefix).norm2.weight"
-    ]
-    .cpu().numpy()
-    let norm2_bias = state_dict[
-      "diffusion_model.\(prefix).norm2.bias"
-    ]
-    .cpu().numpy()
-    layerNorm2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: norm2_weight))
-    layerNorm2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: norm2_bias))
-    print("\"diffusion_model.\(prefix).norm2.weight\": [\"\(layerNorm2.weight.name)\"],")
-    print("\"diffusion_model.\(prefix).norm2.bias\": [\"\(layerNorm2.bias.name)\"],")
     let norm3_weight = state_dict[
       "diffusion_model.\(prefix).norm3.weight"
     ]
@@ -930,7 +972,11 @@ func BasicTimeTransformerBlock(
     print("\"diffusion_model.\(prefix).norm3.weight\": [\"\(layerNorm3.weight.name)\"],")
     print("\"diffusion_model.\(prefix).norm3.bias\": [\"\(layerNorm3.bias.name)\"],")
   }
-  return (reader, Model([x, timeEmb, keys, values], [out], name: "time_stack"))
+  if let keys = keys {
+    return (reader, Model([x, timeEmb, keys, values], [out], name: "time_stack"))
+  } else {
+    return (reader, Model([x, timeEmb, values], [out], name: "time_stack"))
+  }
 }
 
 func SpatialTransformer(
@@ -958,25 +1004,45 @@ func SpatialTransformer(
     mixFactor = nil
   }
   for i in 0..<depth {
-    let keys = Input()
-    kvs.append(keys)
-    let values = Input()
-    kvs.append(values)
-    let (reader, block) = BasicTransformerBlock(
-      prefix: "\(prefix).transformer_blocks.\(i)", k: k, h: h, b: b, hw: hw, t: t,
-      intermediateSize: intermediateSize)
-    out = block(out, keys, values)
-    readers.append(reader)
-    if let timeEmb = timeEmb, let mixFactor = mixFactor {
+    if t == 1 {
+      let values = Input()
+      kvs.append(values)
+      let (reader, block) = BasicTransformerBlock(
+        prefix: "\(prefix).transformer_blocks.\(i)", k: k, h: h, b: b, hw: hw, t: t,
+        intermediateSize: intermediateSize)
+      out = block(out, values)
+      readers.append(reader)
+    } else {
       let keys = Input()
       kvs.append(keys)
       let values = Input()
       kvs.append(values)
-      let (reader, block) = BasicTimeTransformerBlock(
-        prefix: "\(prefix).time_stack.\(i)", k: k, h: h, b: b, hw: hw, t: t,
+      let (reader, block) = BasicTransformerBlock(
+        prefix: "\(prefix).transformer_blocks.\(i)", k: k, h: h, b: b, hw: hw, t: t,
         intermediateSize: intermediateSize)
-      out = mixFactor .* out + (1 - mixFactor) .* block(out, timeEmb, keys, values)
+      out = block(out, keys, values)
       readers.append(reader)
+    }
+    if let timeEmb = timeEmb, let mixFactor = mixFactor {
+      if t == 1 {
+        let values = Input()
+        kvs.append(values)
+        let (reader, block) = BasicTimeTransformerBlock(
+          prefix: "\(prefix).time_stack.\(i)", k: k, h: h, b: b, hw: hw, t: t,
+          intermediateSize: intermediateSize)
+        out = mixFactor .* out + (1 - mixFactor) .* block(out, timeEmb, values)
+        readers.append(reader)
+      } else {
+        let keys = Input()
+        kvs.append(keys)
+        let values = Input()
+        kvs.append(values)
+        let (reader, block) = BasicTimeTransformerBlock(
+          prefix: "\(prefix).time_stack.\(i)", k: k, h: h, b: b, hw: hw, t: t,
+          intermediateSize: intermediateSize)
+        out = mixFactor .* out + (1 - mixFactor) .* block(out, timeEmb, keys, values)
+        readers.append(reader)
+      }
     }
   }
   out = out.reshaped([b, height, width, k * h]).permuted(0, 3, 1, 2)
@@ -1045,7 +1111,12 @@ func BlockLayer(
   out = mixFactor .* out + (1 - mixFactor) .* timeResBlock(out, emb)
   var transformerReader: ((PythonObject) -> Void)? = nil
   if attentionBlock > 0 {
-    let c = (0..<(attentionBlock * 4 + 1)).map { _ in Input() }
+    let c: [Input]
+    if embeddingSize == 1 {
+      c = (0..<(attentionBlock * 2 + 1)).map { _ in Input() }
+    } else {
+      c = (0..<(attentionBlock * 4 + 1)).map { _ in Input() }
+    }
     let transformer: Model
     (
       transformerReader, transformer
@@ -1258,7 +1329,12 @@ func MiddleBlock(
   ) = TimeResBlock(b: batchSize, h: height, w: width, channels: channels)
   let mixFactor1 = Parameter<Float>(.GPU(1), .C(1), name: "time_mixer")
   out = mixFactor1 .* out + (1 - mixFactor1) .* timeResBlock1(out, emb)
-  let kvs = (0..<(attentionBlock * 4 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
+  let kvs: [Input]
+  if embeddingSize == 1 {
+    kvs = (0..<(attentionBlock * 2 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
+  } else {
+    kvs = (0..<(attentionBlock * 4 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
+  }
   let (
     transformerReader, transformer
   ) = SpatialTransformer(
@@ -1587,7 +1663,12 @@ func InputBlocks(
         batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
       previousChannel = channel
-      let c = (0..<(attentionBlock * 4 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
+      let c: [Input]
+      if embeddingSize == 1 {
+        c = (0..<(attentionBlock * 2 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
+      } else {
+        c = (0..<(attentionBlock * 4 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
+      }
       out = inputLayer([out, emb] + c)
       kvs.append(contentsOf: c)
       passLayers.append(out)
@@ -1675,7 +1756,12 @@ func OutputBlocks(
         attentionBlock: attentionBlock, channels: channel, numHeadChannels: numHeadChannels,
         batchSize: batchSize,
         height: height, width: width, embeddingSize: embeddingSize, intermediateSize: channel * 4)
-      let c = (0..<(attentionBlock * 4 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
+      let c: [Input]
+      if embeddingSize == 1 {
+        c = (0..<(attentionBlock * 2 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
+      } else {
+        c = (0..<(attentionBlock * 4 + (attentionBlock > 0 ? 1 : 0))).map { _ in Input() }
+      }
       out = outputLayer([out, emb] + c)
       kvs.append(contentsOf: c)
       readers.append(reader)
@@ -1804,25 +1890,57 @@ func CrossAttentionFixed(k: Int, h: Int, b: Int, t: Int, name: String = "") -> (
   return (tokeys, tovalues, Model([c], [keys, values], name: name))
 }
 
+func Attention1Fixed(k: Int, h: Int, b: Int, t: Int, name: String = "") -> (Model, Model, Model) {
+  let c = Input()
+  let tovalues = Dense(count: k * h, noBias: true)
+  let unifyheads = Dense(count: k * h)
+  let values = unifyheads(tovalues(c))
+  return (tovalues, unifyheads, Model([c], [values], name: name))
+}
+
 func BasicTransformerBlockFixed(
   prefix: String, k: Int, h: Int, b: Int, hw: Int, t: Int, intermediateSize: Int
 ) -> (
   (PythonObject) -> Void, Model
 ) {
-  let (tokeys2, tovalues2, attn2) = CrossAttentionFixed(k: k, h: h, b: b, t: t)
-  let reader: (PythonObject) -> Void = { state_dict in
-    let attn2_to_k_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_k.weight"
-    ].cpu().numpy()
-    tokeys2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_k_weight))
-    // print("\"diffusion_model.\(prefix).attn2.to_k.weight\": [\"\(tokeys2.weight.name)\"],")
-    let attn2_to_v_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_v.weight"
-    ].cpu().numpy()
-    tovalues2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
-    // print("\"diffusion_model.\(prefix).attn2.to_v.weight\": [\"\(tovalues2.weight.name)\"],")
+  if t == 1 {
+    let (tovalues2, unifyheads2, attn2) = Attention1Fixed(k: k, h: h, b: b, t: t)
+    let reader: (PythonObject) -> Void = { state_dict in
+      // print("\"diffusion_model.\(prefix).attn2.to_k.weight\": [\"\(tokeys2.weight.name)\"],")
+      let attn2_to_v_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_v.weight"
+      ].cpu().numpy()
+      tovalues2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
+      // print("\"diffusion_model.\(prefix).attn2.to_v.weight\": [\"\(tovalues2.weight.name)\"],")
+      let attn2_to_out_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_out.0.weight"
+      ].cpu().numpy()
+      let attn2_to_out_bias = state_dict[
+        "diffusion_model.\(prefix).attn2.to_out.0.bias"
+      ].cpu().numpy()
+      unifyheads2.parameters(for: .weight).copy(
+        from: try! Tensor<Float>(numpy: attn2_to_out_weight))
+      unifyheads2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn2_to_out_bias))
+      // print("\"diffusion_model.\(prefix).attn2.to_out.0.weight\": [\"\(unifyheads2.weight.name)\"],")
+      // print("\"diffusion_model.\(prefix).attn2.to_out.0.bias\": [\"\(unifyheads2.bias.name)\"],")
+    }
+    return (reader, attn2)
+  } else {
+    let (tokeys2, tovalues2, attn2) = CrossAttentionFixed(k: k, h: h, b: b, t: t)
+    let reader: (PythonObject) -> Void = { state_dict in
+      let attn2_to_k_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_k.weight"
+      ].cpu().numpy()
+      tokeys2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_k_weight))
+      // print("\"diffusion_model.\(prefix).attn2.to_k.weight\": [\"\(tokeys2.weight.name)\"],")
+      let attn2_to_v_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_v.weight"
+      ].cpu().numpy()
+      tovalues2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
+      // print("\"diffusion_model.\(prefix).attn2.to_v.weight\": [\"\(tovalues2.weight.name)\"],")
+    }
+    return (reader, attn2)
   }
-  return (reader, attn2)
 }
 
 func TimePosEmbedTransformerBlockFixed(
@@ -1857,20 +1975,46 @@ func BasicTimeTransformerBlockFixed(
 ) -> (
   (PythonObject) -> Void, Model
 ) {
-  let (tokeys2, tovalues2, attn2) = CrossAttentionFixed(k: k, h: h, b: b, t: t, name: "time_stack")
-  let reader: (PythonObject) -> Void = { state_dict in
-    let attn2_to_k_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_k.weight"
-    ].cpu().numpy()
-    tokeys2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_k_weight))
-    // print("\"diffusion_model.\(prefix).attn2.to_k.weight\": [\"\(tokeys2.weight.name)\"],")
-    let attn2_to_v_weight = state_dict[
-      "diffusion_model.\(prefix).attn2.to_v.weight"
-    ].cpu().numpy()
-    tovalues2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
-    // print("\"diffusion_model.\(prefix).attn2.to_v.weight\": [\"\(tovalues2.weight.name)\"],")
+  if t == 1 {
+    let (tovalues2, unifyheads2, attn2) = Attention1Fixed(
+      k: k, h: h, b: b, t: t, name: "time_stack")
+    let reader: (PythonObject) -> Void = { state_dict in
+      // print("\"diffusion_model.\(prefix).attn2.to_k.weight\": [\"\(tokeys2.weight.name)\"],")
+      let attn2_to_v_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_v.weight"
+      ].cpu().numpy()
+      tovalues2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
+      // print("\"diffusion_model.\(prefix).attn2.to_v.weight\": [\"\(tovalues2.weight.name)\"],")
+      let attn2_to_out_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_out.0.weight"
+      ].cpu().numpy()
+      let attn2_to_out_bias = state_dict[
+        "diffusion_model.\(prefix).attn2.to_out.0.bias"
+      ].cpu().numpy()
+      unifyheads2.parameters(for: .weight).copy(
+        from: try! Tensor<Float>(numpy: attn2_to_out_weight))
+      unifyheads2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: attn2_to_out_bias))
+      // print("\"diffusion_model.\(prefix).attn2.to_out.0.weight\": [\"\(unifyheads2.weight.name)\"],")
+      // print("\"diffusion_model.\(prefix).attn2.to_out.0.bias\": [\"\(unifyheads2.bias.name)\"],")
+    }
+    return (reader, attn2)
+  } else {
+    let (tokeys2, tovalues2, attn2) = CrossAttentionFixed(
+      k: k, h: h, b: b, t: t, name: "time_stack")
+    let reader: (PythonObject) -> Void = { state_dict in
+      let attn2_to_k_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_k.weight"
+      ].cpu().numpy()
+      tokeys2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_k_weight))
+      // print("\"diffusion_model.\(prefix).attn2.to_k.weight\": [\"\(tokeys2.weight.name)\"],")
+      let attn2_to_v_weight = state_dict[
+        "diffusion_model.\(prefix).attn2.to_v.weight"
+      ].cpu().numpy()
+      tovalues2.weight.copy(from: try! Tensor<Float>(numpy: attn2_to_v_weight))
+      // print("\"diffusion_model.\(prefix).attn2.to_v.weight\": [\"\(tovalues2.weight.name)\"],")
+    }
+    return (reader, attn2)
   }
-  return (reader, attn2)
 }
 
 func SpatialTransformerFixed(
@@ -2147,7 +2291,7 @@ graph.withNoGrad {
   reader(model_state_dict)
   let pred = unet(inputs: x, [t_emb, y] + kvs)
   debugPrint(pred)
-  graph.openStore("/home/liu/workspace/swift-diffusion/svd_i2v_1.0_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/svd_i2v_xt_1.0_f32.ckpt") {
     $0.write("visual_proj", model: visualProj)
     $0.write("unet_fixed", model: unetFixed)
     $0.write("unet", model: unet)

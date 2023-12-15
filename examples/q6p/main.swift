@@ -3,15 +3,19 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/lcm_ssd_1b_f16.ckpt", flags: .truncateWhenClose
+  "/home/liu/workspace/swift-diffusion/svd_i2v_1.0_f16.ckpt", flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/lcm_ssd_1b_q6p_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/svd_i2v_1.0_q6p_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
       guard let tensor = store.read(key) else { continue }
+      if key.contains("visual_proj") {
+        $0.write(key, tensor: tensor)
+        continue
+      }
       let shape = tensor.shape
       print("write \(key) \(tensor)")
       var n = 0
