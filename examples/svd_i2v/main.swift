@@ -337,6 +337,7 @@ func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> (Model, Model, Model, Mod
   let tokeys = Dense(count: k * h, noBias: true)
   let toqueries = Dense(count: k * h, noBias: true)
   let tovalues = Dense(count: k * h, noBias: true)
+  /*
   let keys = tokeys(x).to(.Float32).reshaped([b, hw, h, k]).permuted(0, 2, 1, 3)
   let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).to(.Float32).reshaped([b, hw, h, k])
     .permuted(0, 2, 1, 3)
@@ -347,6 +348,12 @@ func SelfAttention(k: Int, h: Int, b: Int, hw: Int) -> (Model, Model, Model, Mod
   dot = dot.reshaped([b, h, hw, hw])
   var out = dot * values
   out = out.reshaped([b, h, hw, k]).to(of: x).transposed(1, 2).reshaped([b, hw, h * k])
+  */
+  let keys = tokeys(x).reshaped([b, hw, h, k]).identity()
+  let queries = toqueries(x).reshaped([b, hw, h, k]).identity().identity()
+  let values = tovalues(x).reshaped([b, hw, h, k])
+  let scaledDotProductAttention = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot())
+  var out = scaledDotProductAttention(queries, keys, values).reshaped([b, hw, k * h])
   let unifyheads = Dense(count: k * h)
   out = unifyheads(out)
   return (tokeys, toqueries, tovalues, unifyheads, Model([x], [out]))
@@ -1249,7 +1256,6 @@ graph.withNoGrad {
     } else {
       x = x - Float(sigma) * d
     }
-    debugPrint(x)
   }
   let z = 1.0 / scaleFactor * x
   let decoder = Decoder(
