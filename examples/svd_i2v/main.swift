@@ -1226,9 +1226,10 @@ graph.withNoGrad {
   for i in 0..<14 {
     scaleCPU[i, 0, 0, 0] = FloatType(Float(i) * 1.5 / 13 + 1)
   }
+  let startTime = Date()
   let scale = scaleCPU.toGPU(0)
+  DynamicGraph.setProfiler(true)
   for i in 0..<25 {
-    print("\(i)")
     let sigma: Double = sigmas[i]
     let cSkip: Double = 1.0 / (sigma * sigma + 1.0)
     let cOut: Double = -sigma / (sigma * sigma + 1.0).squareRoot()
@@ -1247,7 +1248,6 @@ graph.withNoGrad {
     xIn.full(0)
     xIn[0..<14, 0..<4, 0..<64, 0..<64] = Float(cIn) * x
     var etUncond = unet(inputs: xIn, [t_emb, vector] + kvs0)[0].as(of: FloatType.self)
-    print("cSkip \(cSkip) cOut \(cOut) cIn \(cIn) cNoise \(cNoise) sigma \(sigma)")
     var et = etUncond + scale .* (etCond - etUncond)
     et = Float(cOut) * et + Float(cSkip) * x
     let d = Float(1.0 / sigma) * (x - et)
@@ -1257,6 +1257,8 @@ graph.withNoGrad {
       x = x - Float(sigma) * d
     }
   }
+  DynamicGraph.setProfiler(false)
+  print("\(Date().timeIntervalSince(startTime))s")
   let z = 1.0 / scaleFactor * x
   let decoder = Decoder(
     channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 64,
