@@ -224,7 +224,8 @@ func DepthHead() -> ((PythonObject) -> Void, Model) {
   out3 = layer4_rn(out3)
 
   let (refinenet4Reader, refinenet4) = ResidualConvUnit(prefix: "scratch.refinenet4.resConfUnit2")
-  out3 = Upsample(.bilinear, widthScale: 37.0 / 19.0, heightScale: 37.0 / 19.0)(refinenet4(out3))
+  out3 = Upsample(.bilinear, widthScale: 37.0 / 19.0, heightScale: 37.0 / 19.0, alignCorners: true)(
+    refinenet4(out3))
   let refinenet4OutConv = Convolution(groups: 1, filters: 256, filterSize: [1, 1])
   out3 = refinenet4OutConv(out3)
   let (refinenet3Unit1Reader, refinenet3Unit1) = ResidualConvUnit(
@@ -232,7 +233,8 @@ func DepthHead() -> ((PythonObject) -> Void, Model) {
   out2 = out3 + refinenet3Unit1(out2)
   let (refinenet3Unit2Reader, refinenet3Unit2) = ResidualConvUnit(
     prefix: "scratch.refinenet3.resConfUnit2")
-  out2 = Upsample(.bilinear, widthScale: 2, heightScale: 2)(refinenet3Unit2(out2))
+  out2 = Upsample(.bilinear, widthScale: 2, heightScale: 2, alignCorners: true)(
+    refinenet3Unit2(out2))
   let refinenet3OutConv = Convolution(groups: 1, filters: 256, filterSize: [1, 1])
   out2 = refinenet3OutConv(out2)
   let (refinenet2Unit1Reader, refinenet2Unit1) = ResidualConvUnit(
@@ -240,7 +242,8 @@ func DepthHead() -> ((PythonObject) -> Void, Model) {
   out1 = out2 + refinenet2Unit1(out1)
   let (refinenet2Unit2Reader, refinenet2Unit2) = ResidualConvUnit(
     prefix: "scratch.refinenet2.resConfUnit2")
-  out1 = Upsample(.bilinear, widthScale: 2, heightScale: 2)(refinenet2Unit2(out1))
+  out1 = Upsample(.bilinear, widthScale: 2, heightScale: 2, alignCorners: true)(
+    refinenet2Unit2(out1))
   let refinenet2OutConv = Convolution(groups: 1, filters: 256, filterSize: [1, 1])
   out1 = refinenet2OutConv(out1)
   let (refinenet1Unit1Reader, refinenet1Unit1) = ResidualConvUnit(
@@ -248,15 +251,17 @@ func DepthHead() -> ((PythonObject) -> Void, Model) {
   out0 = out1 + refinenet1Unit1(out0)
   let (refinenet1Unit2Reader, refinenet1Unit2) = ResidualConvUnit(
     prefix: "scratch.refinenet1.resConfUnit2")
-  out0 = Upsample(.bilinear, widthScale: 2, heightScale: 2)(refinenet1Unit2(out0))
+  out0 = Upsample(.bilinear, widthScale: 2, heightScale: 2, alignCorners: true)(
+    refinenet1Unit2(out0))
   let refinenet1OutConv = Convolution(groups: 1, filters: 256, filterSize: [1, 1])
   out0 = refinenet1OutConv(out0)
 
   let outputConv1 = Convolution(
     groups: 1, filters: 128, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
-  out0 = Upsample(.bilinear, widthScale: 518.0 / 296.0, heightScale: 518.0 / 296.0)(
-    outputConv1(out0))
+  out0 = Upsample(
+    .bilinear, widthScale: 518.0 / 296.0, heightScale: 518.0 / 296.0, alignCorners: true)(
+      outputConv1(out0))
 
   let outputConv20 = Convolution(
     groups: 1, filters: 32, filterSize: [3, 3],
