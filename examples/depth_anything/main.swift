@@ -31,7 +31,7 @@ let transform = transforms.Compose([
   depth_anything_util_transform.PrepareForNet(),
 ])
 
-let raw_image = cv2.imread("/home/liu/workspace/swift-diffusion/kandinsky.png")
+let raw_image = cv2.imread("/home/liu/workspace/Depth-Anything/assets/examples/demo1.png")
 var image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB) / 255.0
 
 image = transform(["image": image])["image"]
@@ -122,23 +122,35 @@ func DinoResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int) 
 }
 
 func DinoVisionTransformer(
-  grid: Int, width: Int, layers: Int, heads: Int, batchSize: Int, intermediateLayers: Int
+  gridX: Int, gridY: Int, width: Int, layers: Int, heads: Int, batchSize: Int,
+  intermediateLayers: Int
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
-  let classEmbedding = Input()
-  let positionalEmbedding = Input()
+  let classEmbedding = Parameter<Float>(.GPU(0), .CHW(1, 1, 1024), initBound: 1, name: "cls_token")
+  let positionalEmbedding = Parameter<Float>(
+    .GPU(0), .CHW(1, 37 * 37 + 1, 1024), initBound: 1, name: "pos_embed")
+  let clsPositionalEmbedding = positionalEmbedding.reshaped([1, 1, 1024])
+  let patchPositionalEmbedding = positionalEmbedding.reshaped(
+    [1, 37 * 37, 1024], offset: [0, 1, 0], strides: [(37 * 37 + 1) * 1024, 1024, 1]
+  ).transposed(1, 2).reshaped([1, 1024, 37, 37])
+  let scaledPatchPositionalEmbedding = Upsample(
+    .bilinear, widthScale: Float(gridX) / 37, heightScale: Float(gridY) / 37)(
+      patchPositionalEmbedding
+    ).reshaped([1, 1024, gridX * gridY]).transposed(1, 2)
+  let posEmb = Functional.concat(axis: 1, clsPositionalEmbedding, scaledPatchPositionalEmbedding)
+
   let conv1 = Convolution(
     groups: 1, filters: width, filterSize: [14, 14], hint: Hint(stride: [14, 14]))
-  var out = conv1(x).reshaped([batchSize, width, grid * grid]).transposed(1, 2)
+  var out = conv1(x).reshaped([batchSize, width, gridX * gridY]).transposed(1, 2)
   out = Functional.concat(axis: 1, classEmbedding, out)
-  out = out + positionalEmbedding
+  out = out + posEmb
   var readers = [(PythonObject) -> Void]()
   var outs = [Model.IO]()
   for i in 0..<layers {
     let (reader, block) = DinoResidualAttentionBlock(
       prefix: "blocks.\(i)", k: width / heads, h: heads, b: batchSize,
-      t: grid * grid + 1)
-    out = block(out.reshaped([batchSize, grid * grid + 1, width]))
+      t: gridX * gridY + 1)
+    out = block(out.reshaped([batchSize, gridX * gridY + 1, width]))
     if i >= layers - intermediateLayers {
       outs.append(out)
     }
@@ -147,6 +159,10 @@ func DinoVisionTransformer(
   let lnPost = LayerNorm(epsilon: 1e-6, axis: [1])
   outs = outs.map { lnPost($0) }
   let reader: (PythonObject) -> Void = { state_dict in
+    let class_embedding = state_dict["cls_token"].type(torch.float).cpu().numpy()
+    classEmbedding.weight.copy(from: try! Tensor<Float>(numpy: class_embedding))
+    let positional_embedding = state_dict["pos_embed"].type(torch.float).cpu().numpy()
+    positionalEmbedding.weight.copy(from: try! Tensor<Float>(numpy: positional_embedding))
     let conv1_weight = state_dict["patch_embed.proj.weight"].type(torch.float).cpu().numpy()
     conv1.weight.copy(from: try! Tensor<Float>(numpy: conv1_weight))
     let conv1_bias = state_dict["patch_embed.proj.bias"].type(torch.float).cpu().numpy()
@@ -159,7 +175,7 @@ func DinoVisionTransformer(
     lnPost.weight.copy(from: try! Tensor<Float>(numpy: ln_post_weight))
     lnPost.bias.copy(from: try! Tensor<Float>(numpy: ln_post_bias))
   }
-  return (reader, Model([x, classEmbedding, positionalEmbedding], outs))
+  return (reader, Model([x], outs))
 }
 
 func ResidualConvUnit(prefix: String) -> ((PythonObject) -> Void, Model) {
@@ -185,7 +201,7 @@ func ResidualConvUnit(prefix: String) -> ((PythonObject) -> Void, Model) {
   return (reader, Model([x], [out]))
 }
 
-func DepthHead() -> ((PythonObject) -> Void, Model) {
+func DepthHead(gridX: Int, gridY: Int) -> ((PythonObject) -> Void, Model) {
   let x0 = Input()
   let proj0 = Convolution(groups: 1, filters: 256, filterSize: [1, 1])
   let conv0 = ConvolutionTranspose(
@@ -224,8 +240,10 @@ func DepthHead() -> ((PythonObject) -> Void, Model) {
   out3 = layer4_rn(out3)
 
   let (refinenet4Reader, refinenet4) = ResidualConvUnit(prefix: "scratch.refinenet4.resConfUnit2")
-  out3 = Upsample(.bilinear, widthScale: 37.0 / 19.0, heightScale: 37.0 / 19.0, alignCorners: true)(
-    refinenet4(out3))
+  out3 = Upsample(
+    .bilinear, widthScale: Float(gridX) / Float((gridX + 1) / 2),
+    heightScale: Float(gridY) / Float((gridY + 1) / 2), alignCorners: true)(
+      refinenet4(out3))
   let refinenet4OutConv = Convolution(groups: 1, filters: 256, filterSize: [1, 1])
   out3 = refinenet4OutConv(out3)
   let (refinenet3Unit1Reader, refinenet3Unit1) = ResidualConvUnit(
@@ -260,7 +278,7 @@ func DepthHead() -> ((PythonObject) -> Void, Model) {
     groups: 1, filters: 128, filterSize: [3, 3],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out0 = Upsample(
-    .bilinear, widthScale: 518.0 / 296.0, heightScale: 518.0 / 296.0, alignCorners: true)(
+    .bilinear, widthScale: 14.0 / 8.0, heightScale: 14.0 / 8.0, alignCorners: true)(
       outputConv1(out0))
 
   let outputConv20 = Convolution(
@@ -376,9 +394,12 @@ func DepthHead() -> ((PythonObject) -> Void, Model) {
   return (reader, Model([x0, x1, x2, x3], [out0]))
 }
 
+let gridX = Int(image.shape[3])! / 14
+let gridY = Int(image.shape[2])! / 14
 let (reader, vit) = DinoVisionTransformer(
-  grid: 37, width: 1024, layers: 24, heads: 16, batchSize: 1, intermediateLayers: 4)
-let (dptReader, depthHead) = DepthHead()
+  gridX: gridX, gridY: gridY, width: 1024, layers: 24, heads: 16, batchSize: 1,
+  intermediateLayers: 4)
+let (dptReader, depthHead) = DepthHead(gridX: gridX, gridY: gridY)
 
 let random = Python.import("random")
 random.seed(42)
@@ -387,6 +408,7 @@ torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
 let x = image.cpu()
+print(image.shape)
 let y = depth_anything(x.cuda())
 print(y)
 let graph = DynamicGraph()
@@ -395,38 +417,46 @@ let state_dict = depth_anything.pretrained.state_dict()
 let dpt_state_dict = depth_anything.depth_head.state_dict()
 
 graph.withNoGrad {
-  let class_embedding = state_dict["cls_token"].type(torch.float).cpu().numpy()
-  let classEmbedding = graph.variable(try! Tensor<Float>(numpy: class_embedding)).reshaped(
-    .CHW(1, 1, 1024)
-  ).toGPU(0)
-  let positional_embedding = state_dict["pos_embed"].type(torch.float).cpu().numpy()
-  let positionalEmbedding = graph.variable(try! Tensor<Float>(numpy: positional_embedding))
-    .reshaped(.CHW(1, 37 * 37 + 1, 1024)).toGPU(0)
-  let _ = vit(inputs: xTensor, classEmbedding, positionalEmbedding)
+  let _ = vit(inputs: xTensor)
   reader(state_dict)
-  let outs = vit(inputs: xTensor, classEmbedding, positionalEmbedding).map { $0.as(of: Float.self) }
-  let x0 = outs[0][1..<1370, 0..<1024].transposed(0, 1).reshaped(.NCHW(1, 1024, 37, 37)).copied()
-  let x1 = outs[1][1..<1370, 0..<1024].transposed(0, 1).reshaped(.NCHW(1, 1024, 37, 37)).copied()
-  let x2 = outs[2][1..<1370, 0..<1024].transposed(0, 1).reshaped(.NCHW(1, 1024, 37, 37)).copied()
-  let x3 = outs[3][1..<1370, 0..<1024].transposed(0, 1).reshaped(.NCHW(1, 1024, 37, 37)).copied()
+  let outs = vit(inputs: xTensor).map { $0.as(of: Float.self) }
+  graph.openStore("/home/liu/workspace/swift-diffusion/dino_v2_f32.ckpt") {
+    $0.write("vit", model: vit)
+  }
+  print(outs)
+  let x0 = outs[0][1..<(gridX * gridY + 1), 0..<1024].transposed(0, 1).reshaped(
+    .NCHW(1, 1024, gridY, gridX)
+  ).copied()
+  let x1 = outs[1][1..<(gridX * gridY + 1), 0..<1024].transposed(0, 1).reshaped(
+    .NCHW(1, 1024, gridY, gridX)
+  ).copied()
+  let x2 = outs[2][1..<(gridX * gridY + 1), 0..<1024].transposed(0, 1).reshaped(
+    .NCHW(1, 1024, gridY, gridX)
+  ).copied()
+  let x3 = outs[3][1..<(gridX * gridY + 1), 0..<1024].transposed(0, 1).reshaped(
+    .NCHW(1, 1024, gridY, gridX)
+  ).copied()
   let _ = depthHead(inputs: x0, x1, x2, x3)
   dptReader(dpt_state_dict)
   let out = depthHead(inputs: x0, x1, x2, x3)[0].as(of: Float.self).toCPU()
+  graph.openStore("/home/liu/workspace/swift-diffusion/depth_anything_v1.0_f32.ckpt") {
+    $0.write("depth_head", model: depthHead)
+  }
   debugPrint(out)
-  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 518 * 518)
-  for y in 0..<518 {
-    for x in 0..<518 {
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: gridY * 14 * gridX * 14)
+  for y in 0..<(gridY * 14) {
+    for x in 0..<(gridX * 14) {
       let rgb = out[0, 0, y, x]
-      rgba[y * 518 + x].r = UInt8(
+      rgba[y * gridX * 14 + x].r = UInt8(
         min(max(Int(rgb), 0), 255))
-      rgba[y * 518 + x].g = UInt8(
+      rgba[y * gridX * 14 + x].g = UInt8(
         min(max(Int(rgb), 0), 255))
-      rgba[y * 518 + x].b = UInt8(
+      rgba[y * gridX * 14 + x].b = UInt8(
         min(max(Int(rgb), 0), 255))
     }
   }
   let png = PNG.Data.Rectangular(
-    packing: rgba, size: (518, 518),
+    packing: rgba, size: (gridX * 14, gridY * 14),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
   try! png.compress(path: "/home/liu/workspace/swift-diffusion/kandinsky_depth.png", level: 4)
 }
