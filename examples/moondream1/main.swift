@@ -21,9 +21,6 @@ let model_id = "vikhyatk/moondream1"
 let model = transformers.AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code: true)
 let tokenizer = transformers.CodeGenTokenizerFast.from_pretrained(model_id)
 
-print(model.text_model)
-
-/*
 let enc_image = model.encode_image(raw_image)
 
 print(
@@ -31,20 +28,21 @@ print(
     enc_image,
     "Describe this image and its style in a very detailed manner, follow the format of describing: what, who, where, when, how. You don't need to fill in all if they are irrelevant. Please remove What, Who, Where, When, How prefixes and make it one paragraph.",
     tokenizer))
-*/
 
 var input_ids = tokenizer("hello world ", return_tensors: "pt", add_special_tokens: false).input_ids
 input_ids = torch.cat([torch.tensor([[tokenizer.bos_token_id]]), input_ids], dim: 1)
+// print(input_ids)
 let input_embeds = model.text_model.text_emb(input_ids)
+/*
 print(
   model.text_model.model.generate(
     inputs_embeds: input_embeds, bos_token_id: tokenizer.bos_token_id,
     pad_token_id: tokenizer.pad_token_id, max_new_tokens: 1))
+*/
 print(input_embeds)
 
 let vision_encoder_state_dict = model.vision_encoder.state_dict()
 let text_model_state_dict = model.text_model.state_dict()
-print(text_model_state_dict.keys())
 
 func SigLIPSelfAttention(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model, Model, Model) {
   let x = Input()
@@ -375,6 +373,7 @@ numpy.random.seed(42)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
+/*
 let x = torch.randn([1, 3, 378, 378])
 print(
   model.vision_encoder.model(
@@ -432,3 +431,15 @@ graph.withNoGrad {
   }
   print("index \(minS)")
 }
+*/
+
+let gpt2tokenizer = GPT2Tokenizer(
+  vocabulary: "/home/liu/vocab.json", merges: "/home/liu/merges.txt")
+
+print(
+  gpt2tokenizer.tokenize(
+    text:
+      "</image>\n\nQuestion: Describe this image and its style in a very detailed manner, follow the format of describing: what, who, where, when, how. You don't need to fill in all if they are irrelevant. Please remove What, Who, Where, When, How prefixes and make it one paragraph.\n\nAnswer:",
+    addSpecialTokens: false))
+
+print(gpt2tokenizer.tokenize(text: "<image>", addSpecialTokens: false))
