@@ -21,8 +21,9 @@ let model_id = "vikhyatk/moondream1"
 let model = transformers.AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code: true)
 let tokenizer = transformers.CodeGenTokenizerFast.from_pretrained(model_id)
 
-print(model)
+print(model.text_model)
 
+/*
 let enc_image = model.encode_image(raw_image)
 
 print(
@@ -30,9 +31,20 @@ print(
     enc_image,
     "Describe this image and its style in a very detailed manner, follow the format of describing: what, who, where, when, how. You don't need to fill in all if they are irrelevant. Please remove What, Who, Where, When, How prefixes and make it one paragraph.",
     tokenizer))
+*/
+
+var input_ids = tokenizer("hello world ", return_tensors: "pt", add_special_tokens: false).input_ids
+input_ids = torch.cat([torch.tensor([[tokenizer.bos_token_id]]), input_ids], dim: 1)
+let input_embeds = model.text_model.text_emb(input_ids)
+print(
+  model.text_model.model.generate(
+    inputs_embeds: input_embeds, bos_token_id: tokenizer.bos_token_id,
+    pad_token_id: tokenizer.pad_token_id, max_new_tokens: 1))
+print(input_embeds)
 
 let vision_encoder_state_dict = model.vision_encoder.state_dict()
-print(vision_encoder_state_dict.keys())
+let text_model_state_dict = model.text_model.state_dict()
+print(text_model_state_dict.keys())
 
 func SigLIPSelfAttention(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model, Model, Model) {
   let x = Input()
@@ -194,6 +206,169 @@ func MoondreamVisionProjection() -> ((PythonObject) -> Void, Model) {
   return (reader, Model([x], [out]))
 }
 
+func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int, rotaryDim: Int) -> (
+  Model, (PythonObject) -> Void
+) {
+  let x = Input()
+  let costheta = Input()
+  let sintheta = Input()
+  let tokeys = Dense(count: k * hk, name: "k_proj")
+  let toqueries = Dense(count: k * h, name: "q_proj")
+  let tovalues = Dense(count: k * hk, name: "v_proj")
+  var keys = tokeys(x).reshaped([b, t, hk, k])
+  var queries = toqueries(x).reshaped([b, t, h, k])
+  let values = tovalues(x).reshaped([b, t, hk, k])
+  let keysRot0 = keys.reshaped(
+    [b, t, hk, rotaryDim / 2], offset: [0, 0, 0, 0], strides: [t * hk * k, hk * k, k, 1])
+  let keysRot1 = keys.reshaped(
+    [b, t, hk, rotaryDim / 2], offset: [0, 0, 0, rotaryDim / 2],
+    strides: [t * hk * k, hk * k, k, 1])
+  let keysPass = keys.reshaped(
+    [b, t, hk, k - rotaryDim], offset: [0, 0, 0, rotaryDim], strides: [t * hk * k, hk * k, k, 1])
+  let queriesRot0 = queries.reshaped(
+    [b, t, h, rotaryDim / 2], offset: [0, 0, 0, 0], strides: [t * h * k, h * k, k, 1])
+  let queriesRot1 = queries.reshaped(
+    [b, t, h, rotaryDim / 2], offset: [0, 0, 0, rotaryDim / 2], strides: [t * h * k, h * k, k, 1])
+  let queriesPass = queries.reshaped(
+    [b, t, h, k - rotaryDim], offset: [0, 0, 0, rotaryDim], strides: [t * h * k, h * k, k, 1])
+  queries = Functional.concat(
+    axis: 3, queriesRot0 .* costheta - queriesRot1 .* sintheta,
+    queriesRot0 .* sintheta + queriesRot1 .* costheta, queriesPass)
+  keys = Functional.concat(
+    axis: 3, keysRot0 .* costheta - keysRot1 .* sintheta,
+    keysRot0 .* sintheta + keysRot1 .* costheta, keysPass)
+  var out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot(), isCausal: true)(
+    queries, keys, values
+  ).reshaped([b * t, h * k])
+  let unifyheads = Dense(count: k * h, name: "out_proj")
+  out = unifyheads(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let wqkv_weight = state_dict["\(prefix).mixer.Wqkv.weight"].type(torch.float).cpu().numpy()
+    let wqkv_bias = state_dict["\(prefix).mixer.Wqkv.bias"].type(torch.float).cpu().numpy()
+    toqueries.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: wqkv_weight[..<(k * h), ...])))
+    toqueries.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: wqkv_bias[..<(k * h)])))
+    tokeys.weight.copy(
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: wqkv_weight[(k * h)..<(2 * k * h), ...])))
+    tokeys.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: wqkv_bias[(k * h)..<(2 * k * h)])))
+    tovalues.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: wqkv_weight[(2 * k * h)..., ...])))
+    tovalues.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: wqkv_bias[(2 * k * h)...])))
+    let proj_weight = state_dict["\(prefix).mixer.out_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    unifyheads.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: proj_weight)))
+    let proj_bias = state_dict["\(prefix).mixer.out_proj.bias"].type(torch.float).cpu()
+      .numpy()
+    unifyheads.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: proj_bias)))
+  }
+  return (Model([x, costheta, sintheta], [out]), reader)
+}
+
+func FeedForward(hiddenSize: Int, intermediateSize: Int, name: String = "") -> (Model, Model, Model)
+{
+  let x = Input()
+  let w1 = Dense(count: intermediateSize)
+  var out = GELU()(w1(x))
+  let w2 = Dense(count: hiddenSize)
+  out = w2(out)
+  return (w1, w2, Model([x], [out], name: name))
+}
+
+func TransformerBlock(
+  prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int, MLP: Int, rotaryDim: Int
+) -> (
+  Model, (PythonObject) -> Void
+) {
+  let x = Input()
+  let costheta = Input()
+  let sintheta = Input()
+  let norm1 = LayerNorm(epsilon: 1e-5, axis: [1], name: "attention_norm")
+  var out = norm1(x)
+  let (attention, attnReader) = SelfAttention(
+    prefix: prefix, k: k, h: h, hk: hk, b: b, t: t, rotaryDim: rotaryDim)
+  let residual = out
+  out = attention(out, costheta, sintheta) + x
+  let (w1, w2, ffn) = FeedForward(hiddenSize: h * k, intermediateSize: MLP, name: "ffn")
+  out = out + ffn(residual)
+  let reader: (PythonObject) -> Void = { state_dict in
+    attnReader(state_dict)
+    let norm1_weight = state_dict["\(prefix).ln.weight"].type(torch.float)
+      .cpu().numpy()
+    norm1.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm1_weight)))
+    let norm1_bias = state_dict["\(prefix).ln.bias"].type(torch.float)
+      .cpu().numpy()
+    norm1.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm1_bias)))
+    let w1_weight = state_dict["\(prefix).mlp.fc1.weight"].type(torch.float).cpu()
+      .numpy()
+    w1.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: w1_weight)))
+    let w1_bias = state_dict["\(prefix).mlp.fc1.bias"].type(torch.float).cpu()
+      .numpy()
+    w1.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: w1_bias)))
+    let w2_weight = state_dict["\(prefix).mlp.fc2.weight"].type(torch.float).cpu()
+      .numpy()
+    w2.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: w2_weight)))
+    let w2_bias = state_dict["\(prefix).mlp.fc2.bias"].type(torch.float).cpu()
+      .numpy()
+    w2.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: w2_bias)))
+  }
+  return (Model([x, costheta, sintheta], [out]), reader)
+}
+
+public func TextEmbedding<T: TensorNumeric>(
+  _ dataType: T.Type, batchSize: Int, vocabularySize: Int, embeddingSize: Int
+) -> (Model, (PythonObject) -> Void) {
+  let tokens = Input()
+  let tokenEmbed = Embedding(
+    T.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: "tok_embeddings")
+  let embedding = tokenEmbed(tokens)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let vocab = state_dict["tok_embeddings.weight"].type(torch.float).cpu().numpy()
+    tokenEmbed.parameters.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: vocab)))
+  }
+  return (Model([tokens], [embedding]), reader)
+}
+
+func Transformer<T: TensorNumeric>(
+  _ dataType: T.Type, vocabularySize: Int, width: Int, tokenLength: Int,
+  layers: Int, MLP: Int, rotaryDim: Int, heads: Int, batchSize: Int
+) -> (Model, (PythonObject) -> Void) {
+  let textEmb = Input()
+  let costheta = Input()
+  let sintheta = Input()
+  var out: Model.IO = textEmb
+  var readers = [(PythonObject) -> Void]()
+  for i in 0..<layers {
+    let (layer, reader) = TransformerBlock(
+      prefix: "model.transformer.h.\(i)", k: width / heads, h: heads, hk: heads, b: batchSize,
+      t: tokenLength,
+      MLP: MLP, rotaryDim: rotaryDim)
+    out = layer(out, costheta, sintheta)
+    readers.append(reader)
+  }
+  let norm = LayerNorm(epsilon: 1e-5, axis: [1], name: "norm")
+  out = norm(out)
+  let output = Dense(count: vocabularySize, name: "output")
+  out = output(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    for reader in readers {
+      reader(state_dict)
+    }
+    let norm_weight = state_dict["model.lm_head.ln.weight"].type(torch.float).cpu().numpy()
+    norm.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm_weight)))
+    let norm_bias = state_dict["model.lm_head.ln.bias"].type(torch.float).cpu().numpy()
+    norm.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm_bias)))
+    let output_weight = state_dict["model.lm_head.linear.weight"].type(torch.float).cpu().numpy()
+    output.weight.copy(from: try! Tensor<Float16>(from: Tensor<Float>(numpy: output_weight)))
+    let output_bias = state_dict["model.lm_head.linear.bias"].type(torch.float).cpu().numpy()
+    output.bias.copy(from: try! Tensor<Float16>(from: Tensor<Float>(numpy: output_bias)))
+  }
+  return (Model([textEmb, costheta, sintheta], [out]), reader)
+}
+
 let random = Python.import("random")
 random.seed(42)
 numpy.random.seed(42)
@@ -209,6 +384,13 @@ let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let (reader, vit) = SigLIPVisionTransformer(
   gridX: 27, gridY: 27, width: 1152, layers: 27, heads: 16, MLP: 4304, batchSize: 1)
 let (projReader, proj) = MoondreamVisionProjection()
+let inputsEmbedsTensor = graph.variable(
+  Tensor<Float16>(from: try! Tensor<Float>(numpy: input_embeds.numpy()))
+).toGPU(0).reshaped(.WC(4, 2048))
+
+let (phi, phiReader) = Transformer(
+  Float16.self, vocabularySize: 51_200, width: 2048, tokenLength: 4, layers: 24, MLP: 2048 * 4,
+  rotaryDim: 32, heads: 32, batchSize: 1)
 
 graph.withNoGrad {
   let _ = vit(inputs: xTensor)
@@ -218,4 +400,35 @@ graph.withNoGrad {
   projReader(vision_encoder_state_dict)
   outs = proj(inputs: outs[0]).map { $0.as(of: Float.self) }
   print(outs)
+
+  let costhetaTensor = graph.variable(.CPU, .NHWC(1, 4, 1, 16), of: Float.self)
+  let sinthetaTensor = graph.variable(.CPU, .NHWC(1, 4, 1, 16), of: Float.self)
+  for i in 0..<4 {
+    for k in 0..<16 {
+      let theta = Double(i) * 1.0 / pow(10_000, Double(k) * 2 / 32)
+      let sintheta = sin(theta)
+      let costheta = cos(theta)
+      costhetaTensor[0, i, 0, k] = Float(costheta)
+      sinthetaTensor[0, i, 0, k] = Float(sintheta)
+    }
+  }
+  let costhetaTensorGPU = DynamicGraph.Tensor<Float16>(from: costhetaTensor).toGPU(0)
+  let sinthetaTensorGPU = DynamicGraph.Tensor<Float16>(from: sinthetaTensor).toGPU(0)
+  debugPrint(costhetaTensor)
+  debugPrint(sinthetaTensor)
+  let _ = phi(inputs: inputsEmbedsTensor, costhetaTensorGPU, sinthetaTensorGPU)
+  phiReader(text_model_state_dict)
+  let output = phi(inputs: inputsEmbedsTensor, costhetaTensorGPU, sinthetaTensorGPU).map {
+    $0.as(of: Float16.self)
+  }
+  let digit = output[0].rawValue.toCPU()
+  var minVal = digit[3, 0]
+  var minS = 0
+  for i in 1..<51_200 {
+    if digit[3, i] > minVal {
+      minVal = digit[3, i]
+      minS = i
+    }
+  }
+  print("index \(minS)")
 }
