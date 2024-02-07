@@ -241,14 +241,19 @@ public struct GPT2Tokenizer {
     }
   }
   public let vocabulary: [String: Int32]
+  public let decoder: [Int32: String]
   public let bpeRanks: [Pair: Int]
   public let unknownToken: Int32
   public let startToken: Int32
   public let endToken: Int32
   public init(vocabulary: String, merges: String) {
     let vocabJSONData = try! Data(contentsOf: URL(fileURLWithPath: vocabulary))
-    let decoder = JSONDecoder()
-    self.vocabulary = try! decoder.decode([String: Int32].self, from: vocabJSONData)
+    self.vocabulary = try! JSONDecoder().decode([String: Int32].self, from: vocabJSONData)
+    var decoder = [Int32: String]()
+    for (k, v) in self.vocabulary {
+      decoder[v] = k
+    }
+    self.decoder = decoder
     let bpeMerges = (try! String(contentsOf: URL(fileURLWithPath: merges), encoding: .utf8))
       .trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "\n")[
         1...]
@@ -291,6 +296,25 @@ public struct GPT2Tokenizer {
     }
     return Dictionary(uniqueKeysWithValues: zip(bs, cs.map { String(Unicode.Scalar($0)!) }))
   }()
+
+  private static let byteDecoder: [Int: String] = {
+    let byteEncoder = Self.byteEncoder
+    var byteDecoder = [Int: String]()
+    for (k, v) in byteEncoder {
+      byteDecoder[Int(v.unicodeScalars.first!.value)] = String(Unicode.Scalar(k)!)
+    }
+    return byteDecoder
+  }()
+
+  public func decode(_ tokens: [Int32]) -> String {
+    tokens.map({
+      let token = decoder[$0, default: ""]
+      guard !token.isEmpty else { return "" }
+      return token.unicodeScalars.map({
+        Self.byteDecoder[Int($0.value), default: "\($0)"]
+      }).joined()
+    }).joined()
+  }
 
   public func tokenize(text: String, addSpecialTokens: Bool = true)
     -> [Int32]

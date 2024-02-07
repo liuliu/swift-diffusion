@@ -581,8 +581,8 @@ swift_binary(
 )
 
 swift_binary(
-    name = "moondream1",
-    srcs = ["moondream1/main.swift"],
+    name = "moondream1_converter",
+    srcs = ["moondream1_converter/main.swift"],
     data = [
     ],
     deps = [
@@ -592,5 +592,20 @@ swift_binary(
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
         "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
+    name = "moondream1",
+    srcs = ["moondream1/main.swift"],
+    data = [
+        "moondream1/merges.txt",
+        "moondream1/vocab.json",
+    ],
+    deps = [
+        "//:diffusion",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
     ],
 )
