@@ -3,9 +3,9 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
 git_repository(
     name = "s4nnc",
-    commit = "f4a6c3255163a2acc9b75e8e850fd8e346667bae",
+    commit = "3dd3be78b820601c6d0523eeb5fff10e1498849f",
     remote = "https://github.com/liuliu/s4nnc.git",
-    shallow_since = "1707181049 -0500",
+    shallow_since = "1707291063 -0500",
 )
 
 load("@s4nnc//:deps.bzl", "s4nnc_deps")

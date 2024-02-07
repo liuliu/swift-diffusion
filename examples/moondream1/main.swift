@@ -123,18 +123,23 @@ func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: (Int, Int
   keys = Functional.concat(
     axis: 3, keysRot0 .* costheta - keysRot1 .* sintheta,
     keysRot0 .* sintheta + keysRot1 .* costheta, keysPass)
-  let kOut = Functional.concat(axis: 1, kIn, keys)
-  let vOut = Functional.concat(axis: 1, vIn, values)
+  let kOut = keys.moved(
+    to: kIn.reshaped(
+      [b, t.1, hk, k], offset: [0, t.0 - t.1, 0, 0], strides: [t.0 * hk * k, hk * k, k, 1]))
+  let vOut = values.moved(
+    to: vIn.reshaped(
+      [b, t.1, hk, k], offset: [0, t.0 - t.1, 0, 0], strides: [t.0 * hk * k, hk * k, k, 1]))
   var out = ScaledDotProductAttention(
     scale: 1.0 / Float(k).squareRoot(), isCausal: true, hasAttentionMask: true)(
-      queries, kOut, vOut, causalAttentionMask
+      queries, kIn, vIn, causalAttentionMask
     ).reshaped([b * t.1, h * k])
+  out.add(dependencies: [kOut, vOut])
   let unifyheads = Dense(count: k * h, name: "out_proj")
   out = unifyheads(out)
   let reader: (PythonObject) -> Void = { _ in
   }
   return (
-    Model([x, costheta, sintheta, causalAttentionMask, kIn, vIn], [out, kOut, vOut]), reader
+    Model([x, costheta, sintheta, causalAttentionMask, kIn, vIn], [out]), reader
   )
 }
 
@@ -164,16 +169,13 @@ func TransformerBlock(
   let (attention, _) = SelfAttention(
     prefix: prefix, k: k, h: h, hk: hk, b: b, t: t, rotaryDim: rotaryDim)
   let residual = out
-  let tuple = attention(out, costheta, sintheta, causalAttentionMask, kIn, vIn)
-  out = tuple[0] + x
-  let kOut = tuple[1]
-  let vOut = tuple[2]
+  out = attention(out, costheta, sintheta, causalAttentionMask, kIn, vIn) + x
   let (_, _, ffn) = FeedForward(hiddenSize: h * k, intermediateSize: MLP, name: "ffn")
   out = out + ffn(residual)
   let reader: (PythonObject) -> Void = { _ in
   }
   return (
-    Model([x, costheta, sintheta, causalAttentionMask, kIn, vIn], [out, kOut, vOut]), reader
+    Model([x, costheta, sintheta, causalAttentionMask, kIn, vIn], [out]), reader
   )
 }
 
@@ -186,7 +188,6 @@ func Transformer<T: TensorNumeric>(
   let sintheta = Input()
   let causalAttentionMask = Input()
   var kvs = [Input]()
-  var kvOuts = [Model.IO]()
   var out: Model.IO = textEmb
   for i in 0..<layers {
     let (layer, _) = TransformerBlock(
@@ -194,12 +195,9 @@ func Transformer<T: TensorNumeric>(
       t: (cachedTokenLength + tokenLength, tokenLength), MLP: MLP, rotaryDim: rotaryDim)
     let kIn = Input()
     let vIn = Input()
-    let tuple = layer(out, costheta, sintheta, causalAttentionMask, kIn, vIn)
-    out = tuple[0]
+    out = layer(out, costheta, sintheta, causalAttentionMask, kIn, vIn)
     kvs.append(kIn)
     kvs.append(vIn)
-    kvOuts.append(tuple[1])
-    kvOuts.append(tuple[2])
   }
   let norm = LayerNorm(epsilon: 1e-5, axis: [1], name: "norm")
   out = norm(out)
@@ -207,7 +205,7 @@ func Transformer<T: TensorNumeric>(
   out = output(out)
   let reader: (PythonObject) -> Void = { _ in
   }
-  return (Model([textEmb, costheta, sintheta, causalAttentionMask] + kvs, [out] + kvOuts), reader)
+  return (Model([textEmb, costheta, sintheta, causalAttentionMask] + kvs, [out]), reader)
 }
 
 let u8Img = ccv_dense_matrix_new(512, 512, Int32(CCV_8U | CCV_C3), nil, 0)!
@@ -299,8 +297,8 @@ graph.withNoGrad {
   }
   graph.maxConcurrency = .limit(1)
   phi.maxConcurrency = .limit(1)
-  var kvs = (0..<48).map { _ in
-    graph.variable(.GPU(0), format: .NHWC, shape: [], of: FloatType.self)
+  let kvs = (0..<48).map { _ in
+    graph.variable(.GPU(0), .NHWC(1, 1025, 32, 64), of: FloatType.self)
   }
   var costhetaTensor = graph.variable(.CPU, .NHWC(1, seqLen, 1, 16), of: Float.self)
   var sinthetaTensor = graph.variable(.CPU, .NHWC(1, seqLen, 1, 16), of: Float.self)
@@ -324,15 +322,18 @@ graph.withNoGrad {
   var causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
   var costhetaTensorGPU = DynamicGraph.Tensor<FloatType>(from: costhetaTensor).toGPU(0)
   var sinthetaTensorGPU = DynamicGraph.Tensor<FloatType>(from: sinthetaTensor).toGPU(0)
+  var currentKvs = kvs.map {
+    $0.reshaped(.NHWC(1, seqLen, 32, 64))
+  }
   phi.compile(
     (cachedTokenLength: 0, tokenLength: inputEmb.shape[0]),
-    inputs: [inputEmb, costhetaTensorGPU, sinthetaTensorGPU, causalAttentionMask] + kvs)
+    inputs: [inputEmb, costhetaTensorGPU, sinthetaTensorGPU, causalAttentionMask] + currentKvs)
   graph.openStore("/home/liu/workspace/swift-diffusion/moondream1_f32.ckpt") {
     $0.read("phi", model: phi)
   }
   var tuple = phi(
     (cachedTokenLength: 0, tokenLength: inputEmb.shape[0]), inputs: inputEmb,
-    [costhetaTensorGPU, sinthetaTensorGPU, causalAttentionMaskGPU] + kvs
+    [costhetaTensorGPU, sinthetaTensorGPU, causalAttentionMaskGPU] + currentKvs
   ).map { $0.as(of: FloatType.self) }
   var nextToken = tuple[0].rawValue.toCPU()
   var topV = nextToken[seqLen - 1, 0]
@@ -345,13 +346,6 @@ graph.withNoGrad {
   }
   var ids = [Int32(topK)]
   print(ids)
-  kvs = Array(tuple[1...])
-  let kvs100 = kvs.map {
-    let v = graph.variable(
-      .GPU(0), .NHWC($0.shape[0], 1024, $0.shape[2], $0.shape[3]), of: FloatType.self)
-    v.full(0)
-    return v
-  }
   causalAttentionMask = graph.variable(
     .CPU, .NHWC(1, 1, 1, 1025), of: FloatType.self)
   causalAttentionMask.full(0)
@@ -361,16 +355,17 @@ graph.withNoGrad {
     inputs: [
       inputEmb.reshaped(.WC(1, 2048)), costhetaTensorGPU.reshaped(.NHWC(1, 1, 1, 16)),
       sinthetaTensorGPU.reshaped(.NHWC(1, 1, 1, 16)), causalAttentionMaskGPU,
-    ] + kvs100, isEager: true)
-  let maxTokens = 128
+    ] + kvs, isEager: true)
+  var maxTokens = 128
   var output = tokenizer.decode(ids)
-  for _ in 0..<maxTokens {
+  let startTime = Date()
+  for i in 0..<maxTokens {
     let tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [1], of: Int32.self)
     tokensTensor[0] = Int32(topK)
     let inputEmb = Functional.indexSelect(input: textEmb, index: tokensTensor.toGPU(0))
     costhetaTensor = graph.variable(.CPU, .NHWC(1, 1, 1, 16), of: Float.self)
     sinthetaTensor = graph.variable(.CPU, .NHWC(1, 1, 1, 16), of: Float.self)
-    let cachedTokenLength = kvs[0].shape[1]
+    let cachedTokenLength = currentKvs[0].shape[1]
     for k in 0..<16 {
       let theta = Double(cachedTokenLength) * 1.0 / pow(10_000, Double(k) * 2 / 32)
       let sintheta = sin(theta)
@@ -384,11 +379,13 @@ graph.withNoGrad {
     causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
     costhetaTensorGPU = DynamicGraph.Tensor<FloatType>(from: costhetaTensor).toGPU(0)
     sinthetaTensorGPU = DynamicGraph.Tensor<FloatType>(from: sinthetaTensor).toGPU(0)
+    currentKvs = kvs.map {
+      $0.reshaped(.NHWC(1, cachedTokenLength + 1, 32, 64))
+    }
     tuple = phi(
       (cachedTokenLength: cachedTokenLength, tokenLength: 1), inputs: inputEmb,
-      [costhetaTensorGPU, sinthetaTensorGPU, causalAttentionMaskGPU] + kvs
+      [costhetaTensorGPU, sinthetaTensorGPU, causalAttentionMaskGPU] + currentKvs
     ).map { $0.as(of: FloatType.self) }
-    kvs = Array(tuple[1...])
     nextToken = tuple[0].rawValue.toCPU()
     topV = nextToken[0, 0]
     topK = 0
@@ -402,7 +399,9 @@ graph.withNoGrad {
     output += tokenizer.decode([Int32(topK)])
     print(output)
     if output.hasSuffix(eos) {
+      maxTokens = i + 1
       break
     }
   }
+  print("\(Double(maxTokens) / Date().timeIntervalSince(startTime)) tok/s")
 }
