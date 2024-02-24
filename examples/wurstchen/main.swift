@@ -120,6 +120,7 @@ let sampled = models_b.stage_a.decode(sampled_b).float()
 inference_utils.save_images(sampled)
 */
 
+/*
 let x = torch.randn([2, 16, 24, 24]).cuda()
 let clip_text = torch.randn([2, 77, 1280]).cuda()
 let clip_text_pooled = torch.zeros([2, 1, 1280]).cuda()
@@ -133,6 +134,7 @@ print(result)
 let state_dict = models_c.generator.state_dict()
 
 // print(state_dict.keys())
+*/
 /*
 let x = torch.randn([2, 4, 256, 256]).cuda()
 let effnet = torch.randn([2, 16, 24, 24]).cuda()
@@ -144,7 +146,6 @@ let state_dict = models_b.generator.state_dict()
 
 // print(state_dict.keys())
 */
-/*
 let x = torch.randn([2, 3, 1024, 1024]).cuda()
 let (y, _, _, _) = models_b.stage_a.encode(x).tuple4
 let result = models_b.stage_a.decode(y)
@@ -152,7 +153,6 @@ let result = models_b.stage_a.decode(y)
 let state_dict = models_b.stage_a.state_dict()
 
 // print(state_dict.keys())
-*/
 
 func ResBlock(prefix: String, batchSize: Int, channels: Int, skip: Bool) -> (
   Model, (PythonObject) -> Void
@@ -683,8 +683,8 @@ func StageAResBlock(prefix: String, channels: Int) -> (Model, (PythonObject) -> 
     + gammas.reshaped([1, 1, 1, 1], offset: [0, 0, 0, 1], strides: [6, 6, 6, 1])
   let depthwise = Convolution(
     groups: channels, filters: channels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
-  out = x + depthwise(out)
+    hint: Hint(stride: [1, 1]))
+  out = x + depthwise(out.padded(.replication, begin: [0, 0, 1, 1], end: [0, 0, 1, 1]))
     .* gammas.reshaped([1, 1, 1, 1], offset: [0, 0, 0, 2], strides: [6, 6, 6, 1])
   let norm2 = LayerNorm(epsilon: 1e-6, axis: [1], elementwiseAffine: false)
   let xTemp =
@@ -846,7 +846,6 @@ func rEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod:
 
 let graph = DynamicGraph()
 graph.withNoGrad {
-  /*
   let x = graph.variable(try! Tensor<Float>(numpy: x.float().cpu().numpy())).toGPU(0)
   let (stageAEncoder, stageAEncoderReader) = StageAEncoder(batchSize: 2)
   stageAEncoder.compile(inputs: x)
@@ -857,7 +856,6 @@ graph.withNoGrad {
   stageADecoderReader(state_dict)
   let out = stageADecoder(inputs: y)[0].as(of: Float.self)
   debugPrint(out)
-  */
   /*
   let rTimeEmbed = rEmbedding(timesteps: 0.9936, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
   let rZeros = rEmbedding(timesteps: 0, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
@@ -881,6 +879,7 @@ graph.withNoGrad {
     of: Float.self)
   debugPrint(out)
   */
+  /*
   let rTimeEmbed = rEmbedding(timesteps: 0.9936, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
   let rZeros = rEmbedding(timesteps: 0, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
   var rEmbed = Tensor<Float>(.CPU, .NC(2, 192))
@@ -900,6 +899,7 @@ graph.withNoGrad {
   let out = stageC(inputs: x, rEmbedVariable, clipText, clipTextPooled, clipImg)[0].as(
     of: Float.self)
   debugPrint(out)
+  */
 }
 
 // print(models_b.stage_a.up_blocks)
