@@ -6,6 +6,7 @@ import PythonKit
 let inference_utils = Python.import("inference.utils")
 let core_utils = Python.import("core.utils")
 let train = Python.import("train")
+let modules = Python.import("modules")
 
 let torch = Python.import("torch")
 let yaml = Python.import("yaml")
@@ -54,6 +55,14 @@ models_b = train.WurstCoreB.Models(
   tokenizer: models_c.tokenizer, text_model: models_c.text_model
 )
 models_b.generator.float().eval().requires_grad_(false)
+
+let effnet = modules.effnet.EfficientNetEncoder().to(device)
+effnet.load_state_dict(
+  core_utils.load_or_fail("/home/liu/workspace/StableCascade/models/effnet_encoder.safetensors"))
+effnet.float().eval().requires_grad_(false)
+let effnet_state_dict = effnet.state_dict()
+print(effnet)
+print(effnet_state_dict.keys())
 
 let batch_size = 4
 let caption =
@@ -146,6 +155,7 @@ let state_dict = models_b.generator.state_dict()
 
 // print(state_dict.keys())
 */
+/*
 let x = torch.randn([2, 3, 1024, 1024]).cuda()
 let (y, _, _, _) = models_b.stage_a.encode(x).tuple4
 let result = models_b.stage_a.decode(y)
@@ -153,6 +163,10 @@ let result = models_b.stage_a.decode(y)
 let state_dict = models_b.stage_a.state_dict()
 
 // print(state_dict.keys())
+*/
+let x = torch.randn([2, 3, 768, 768]).cuda()
+let result = effnet(x)
+print(result)
 
 func ResBlock(prefix: String, batchSize: Int, channels: Int, skip: Bool) -> (
   Model, (PythonObject) -> Void
@@ -844,9 +858,357 @@ func rEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod:
   return embedding
 }
 
+func FusedMBConv(
+  prefix: String, outChannels: Int, stride: Int, filterSize: Int, skip: Bool,
+  expandChannels: Int? = nil
+) -> (Model, (PythonObject) -> Void) {
+  let x = Input()
+  var out: Model.IO = x
+  let expandConv: Model?
+  let convOut: Model
+  if let expandChannels = expandChannels {
+    let conv = Convolution(
+      groups: 1, filters: expandChannels, filterSize: [filterSize, filterSize],
+      hint: Hint(
+        stride: [stride, stride],
+        border: Hint.Border(
+          begin: [(filterSize - 1) / 2, (filterSize - 1) / 2],
+          end: [(filterSize - 1) / 2, (filterSize - 1) / 2])))
+    out = conv(out).swish()
+    expandConv = conv
+    convOut = Convolution(
+      groups: 1, filters: outChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+    out = convOut(out)
+  } else {
+    expandConv = nil
+    convOut = Convolution(
+      groups: 1, filters: outChannels, filterSize: [filterSize, filterSize],
+      hint: Hint(
+        stride: [stride, stride],
+        border: Hint.Border(
+          begin: [(filterSize - 1) / 2, (filterSize - 1) / 2],
+          end: [(filterSize - 1) / 2, (filterSize - 1) / 2])))
+    out = convOut(out).swish()
+  }
+  if skip {
+    out = x + out
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    if let expandConv = expandConv, let expandChannels = expandChannels {
+      let block_0_0_weight = state_dict["\(prefix).block.0.0.weight"].float().cpu()
+      let block_0_1_weight = state_dict["\(prefix).block.0.1.weight"].float().cpu()
+      let block_0_1_running_mean = state_dict["\(prefix).block.0.1.running_mean"].float().cpu()
+      let block_0_1_running_var = state_dict["\(prefix).block.0.1.running_var"].float().cpu()
+      let block_0_1_bias = state_dict["\(prefix).block.0.1.bias"].float().cpu()
+      let w_conv_0 = block_0_0_weight.view(expandChannels, -1)
+      let w_bn_0 = torch.diag(
+        block_0_1_weight.div(torch.sqrt(1e-3 + block_0_1_running_var)))
+      let fused_weight_0 = torch.mm(w_bn_0, w_conv_0).numpy()
+      expandConv.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_0))
+      let b_bn_0 =
+        block_0_1_bias
+        - block_0_1_weight.mul(block_0_1_running_mean).div(
+          torch.sqrt(block_0_1_running_var + 1e-3))
+      expandConv.bias.copy(from: try! Tensor<Float>(numpy: b_bn_0.numpy()))
+
+      let block_1_0_weight = state_dict["\(prefix).block.1.0.weight"].float().cpu()
+      let block_1_1_weight = state_dict["\(prefix).block.1.1.weight"].float().cpu()
+      let block_1_1_running_mean = state_dict["\(prefix).block.1.1.running_mean"].float().cpu()
+      let block_1_1_running_var = state_dict["\(prefix).block.1.1.running_var"].float().cpu()
+      let block_1_1_bias = state_dict["\(prefix).block.1.1.bias"].float().cpu()
+      let w_conv_1 = block_1_0_weight.view(outChannels, -1)
+      let w_bn_1 = torch.diag(
+        block_1_1_weight.div(torch.sqrt(1e-3 + block_1_1_running_var)))
+      let fused_weight_1 = torch.mm(w_bn_1, w_conv_1).numpy()
+      convOut.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_1))
+      let b_bn_1 =
+        block_1_1_bias
+        - block_1_1_weight.mul(block_1_1_running_mean).div(
+          torch.sqrt(block_1_1_running_var + 1e-3))
+      convOut.bias.copy(from: try! Tensor<Float>(numpy: b_bn_1.numpy()))
+
+    } else {
+      let block_0_0_weight = state_dict["\(prefix).block.0.0.weight"].float().cpu()
+      let block_0_1_weight = state_dict["\(prefix).block.0.1.weight"].float().cpu()
+      let block_0_1_running_mean = state_dict["\(prefix).block.0.1.running_mean"].float().cpu()
+      let block_0_1_running_var = state_dict["\(prefix).block.0.1.running_var"].float().cpu()
+      let block_0_1_bias = state_dict["\(prefix).block.0.1.bias"].float().cpu()
+      let w_conv = block_0_0_weight.view(outChannels, -1)
+      let w_bn = torch.diag(
+        block_0_1_weight.div(torch.sqrt(1e-3 + block_0_1_running_var)))
+      let fused_weight = torch.mm(w_bn, w_conv).numpy()
+      convOut.weight.copy(from: try! Tensor<Float>(numpy: fused_weight))
+      let b_bn =
+        block_0_1_bias
+        - block_0_1_weight.mul(block_0_1_running_mean).div(
+          torch.sqrt(block_0_1_running_var + 1e-3))
+      convOut.bias.copy(from: try! Tensor<Float>(numpy: b_bn.numpy()))
+    }
+  }
+  return (Model([x], [out]), reader)
+}
+
+func MBConv(
+  prefix: String, stride: Int, filterSize: Int, inChannels: Int, expandChannels: Int,
+  outChannels: Int
+) -> (Model, (PythonObject) -> Void) {
+  let x = Input()
+  var out: Model.IO = x
+  let expandConv: Model?
+  if expandChannels != inChannels {
+    let conv = Convolution(
+      groups: 1, filters: expandChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+    out = conv(out).swish()
+    expandConv = conv
+  } else {
+    expandConv = nil
+  }
+
+  let depthwise = Convolution(
+    groups: expandChannels, filters: expandChannels, filterSize: [filterSize, filterSize],
+    hint: Hint(
+      stride: [stride, stride],
+      border: Hint.Border(
+        begin: [(filterSize - 1) / 2, (filterSize - 1) / 2],
+        end: [(filterSize - 1) / 2, (filterSize - 1) / 2])))
+  out = depthwise(out).swish()
+
+  // Squeeze and Excitation
+  var scale = out.reduced(.mean, axis: [2, 3])
+  let fc1 = Convolution(
+    groups: 1, filters: inChannels / 4, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  scale = fc1(scale).swish()
+  let fc2 = Convolution(
+    groups: 1, filters: expandChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  scale = fc2(scale).sigmoid()
+  out = scale .* out
+
+  let convOut = Convolution(
+    groups: 1, filters: outChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  out = convOut(out)
+
+  if inChannels == outChannels && stride == 1 {
+    out = x + out
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    let blockStart: Int
+    if let expandConv = expandConv {
+      let block_0_0_weight = state_dict["\(prefix).block.0.0.weight"].float().cpu()
+      let block_0_1_weight = state_dict["\(prefix).block.0.1.weight"].float().cpu()
+      let block_0_1_running_mean = state_dict["\(prefix).block.0.1.running_mean"].float().cpu()
+      let block_0_1_running_var = state_dict["\(prefix).block.0.1.running_var"].float().cpu()
+      let block_0_1_bias = state_dict["\(prefix).block.0.1.bias"].float().cpu()
+      let w_conv_0 = block_0_0_weight.view(expandChannels, -1)
+      let w_bn_0 = torch.diag(
+        block_0_1_weight.div(torch.sqrt(1e-3 + block_0_1_running_var)))
+      let fused_weight_0 = torch.mm(w_bn_0, w_conv_0).numpy()
+      expandConv.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_0))
+      let b_bn_0 =
+        block_0_1_bias
+        - block_0_1_weight.mul(block_0_1_running_mean).div(
+          torch.sqrt(block_0_1_running_var + 1e-3))
+      expandConv.bias.copy(from: try! Tensor<Float>(numpy: b_bn_0.numpy()))
+      blockStart = 1
+    } else {
+      blockStart = 0
+    }
+
+    let block_1_0_weight = state_dict["\(prefix).block.\(blockStart).0.weight"].float().cpu()
+    let block_1_1_weight = state_dict["\(prefix).block.\(blockStart).1.weight"].float().cpu()
+    let block_1_1_running_mean = state_dict["\(prefix).block.\(blockStart).1.running_mean"].float()
+      .cpu()
+    let block_1_1_running_var = state_dict["\(prefix).block.\(blockStart).1.running_var"].float()
+      .cpu()
+    let block_1_1_bias = state_dict["\(prefix).block.\(blockStart).1.bias"].float().cpu()
+    let w_conv_1 = block_1_0_weight.view(expandChannels, -1)
+    let w_bn_1 = torch.diag(
+      block_1_1_weight.div(torch.sqrt(1e-3 + block_1_1_running_var)))
+    let fused_weight_1 = torch.mm(w_bn_1, w_conv_1).numpy()
+    depthwise.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_1))
+    let b_bn_1 =
+      block_1_1_bias
+      - block_1_1_weight.mul(block_1_1_running_mean).div(
+        torch.sqrt(block_1_1_running_var + 1e-3))
+    depthwise.bias.copy(from: try! Tensor<Float>(numpy: b_bn_1.numpy()))
+
+    let block_2_fc1_weight = state_dict["\(prefix).block.\(blockStart + 1).fc1.weight"].float()
+      .cpu()
+    fc1.weight.copy(from: try! Tensor<Float>(numpy: block_2_fc1_weight.numpy()))
+    let block_2_fc1_bias = state_dict["\(prefix).block.\(blockStart + 1).fc1.bias"].float().cpu()
+    fc1.bias.copy(from: try! Tensor<Float>(numpy: block_2_fc1_bias.numpy()))
+    let block_2_fc2_weight = state_dict["\(prefix).block.\(blockStart + 1).fc2.weight"].float()
+      .cpu()
+    fc2.weight.copy(from: try! Tensor<Float>(numpy: block_2_fc2_weight.numpy()))
+    let block_2_fc2_bias = state_dict["\(prefix).block.\(blockStart + 1).fc2.bias"].float().cpu()
+    fc2.bias.copy(from: try! Tensor<Float>(numpy: block_2_fc2_bias.numpy()))
+
+    let block_3_0_weight = state_dict["\(prefix).block.\(blockStart + 2).0.weight"].float().cpu()
+    let block_3_1_weight = state_dict["\(prefix).block.\(blockStart + 2).1.weight"].float().cpu()
+    let block_3_1_running_mean = state_dict["\(prefix).block.\(blockStart + 2).1.running_mean"]
+      .float().cpu()
+    let block_3_1_running_var = state_dict["\(prefix).block.\(blockStart + 2).1.running_var"]
+      .float().cpu()
+    let block_3_1_bias = state_dict["\(prefix).block.\(blockStart + 2).1.bias"].float().cpu()
+    let w_conv_3 = block_3_0_weight.view(outChannels, -1)
+    let w_bn_3 = torch.diag(
+      block_3_1_weight.div(torch.sqrt(1e-3 + block_3_1_running_var)))
+    let fused_weight_3 = torch.mm(w_bn_3, w_conv_3).numpy()
+    convOut.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_3))
+    let b_bn_3 =
+      block_3_1_bias
+      - block_3_1_weight.mul(block_3_1_running_mean).div(
+        torch.sqrt(block_3_1_running_var + 1e-3))
+    convOut.bias.copy(from: try! Tensor<Float>(numpy: b_bn_3.numpy()))
+  }
+  return (Model([x], [out]), reader)
+}
+
+func EfficientNetEncoder() -> (Model, (PythonObject) -> Void) {
+  let x = Input()
+  let conv = Convolution(
+    groups: 1, filters: 24, filterSize: [3, 3],
+    hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+  var out = conv(x).swish()
+  var readers = [(PythonObject) -> Void]()
+  // 1.
+  let (backbone_1_0, backbone_1_0_reader) = FusedMBConv(
+    prefix: "backbone.1.0", outChannels: 24, stride: 1, filterSize: 3, skip: true)
+  out = backbone_1_0(out)
+  readers.append(backbone_1_0_reader)
+  let (backbone_1_1, backbone_1_1_reader) = FusedMBConv(
+    prefix: "backbone.1.1", outChannels: 24, stride: 1, filterSize: 3, skip: true)
+  out = backbone_1_1(out)
+  readers.append(backbone_1_1_reader)
+  // 2.
+  let (backbone_2_0, backbone_2_0_reader) = FusedMBConv(
+    prefix: "backbone.2.0", outChannels: 48, stride: 2, filterSize: 3, skip: false,
+    expandChannels: 96)
+  out = backbone_2_0(out)
+  readers.append(backbone_2_0_reader)
+  for i in 1..<4 {
+    let (backbone_2_x, backbone_2_x_reader) = FusedMBConv(
+      prefix: "backbone.2.\(i)", outChannels: 48, stride: 1, filterSize: 3, skip: true,
+      expandChannels: 192)
+    out = backbone_2_x(out)
+    readers.append(backbone_2_x_reader)
+  }
+  // 3.
+  let (backbone_3_0, backbone_3_0_reader) = FusedMBConv(
+    prefix: "backbone.3.0", outChannels: 64, stride: 2, filterSize: 3, skip: false,
+    expandChannels: 192)
+  out = backbone_3_0(out)
+  readers.append(backbone_3_0_reader)
+  for i in 1..<4 {
+    let (backbone_3_x, backbone_3_x_reader) = FusedMBConv(
+      prefix: "backbone.3.\(i)", outChannels: 64, stride: 1, filterSize: 3, skip: true,
+      expandChannels: 256)
+    out = backbone_3_x(out)
+    readers.append(backbone_3_x_reader)
+  }
+  // 4.
+  let (backbone_4_0, backbone_4_0_reader) = MBConv(
+    prefix: "backbone.4.0", stride: 2, filterSize: 3, inChannels: 64, expandChannels: 256,
+    outChannels: 128)
+  out = backbone_4_0(out)
+  readers.append(backbone_4_0_reader)
+  for i in 1..<6 {
+    let (backbone_4_x, backbone_4_x_reader) = MBConv(
+      prefix: "backbone.4.\(i)", stride: 1, filterSize: 3, inChannels: 128, expandChannels: 512,
+      outChannels: 128)
+    out = backbone_4_x(out)
+    readers.append(backbone_4_x_reader)
+  }
+  // 5.
+  let (backbone_5_0, backbone_5_0_reader) = MBConv(
+    prefix: "backbone.5.0", stride: 1, filterSize: 3, inChannels: 128, expandChannels: 768,
+    outChannels: 160)
+  out = backbone_5_0(out)
+  readers.append(backbone_5_0_reader)
+  for i in 1..<9 {
+    let (backbone_5_x, backbone_5_x_reader) = MBConv(
+      prefix: "backbone.5.\(i)", stride: 1, filterSize: 3, inChannels: 160, expandChannels: 960,
+      outChannels: 160)
+    out = backbone_5_x(out)
+    readers.append(backbone_5_x_reader)
+  }
+  // 6.
+  let (backbone_6_0, backbone_6_0_reader) = MBConv(
+    prefix: "backbone.6.0", stride: 2, filterSize: 3, inChannels: 160, expandChannels: 960,
+    outChannels: 256)
+  out = backbone_6_0(out)
+  readers.append(backbone_6_0_reader)
+  for i in 1..<15 {
+    let (backbone_6_x, backbone_6_x_reader) = MBConv(
+      prefix: "backbone.6.\(i)", stride: 1, filterSize: 3, inChannels: 256, expandChannels: 1536,
+      outChannels: 256)
+    out = backbone_6_x(out)
+    readers.append(backbone_6_x_reader)
+  }
+  let convOut = Convolution(
+    groups: 1, filters: 1280, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  out = convOut(out).swish()
+  let mapper = Convolution(
+    groups: 1, filters: 16, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
+  out = mapper(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let backbone_0_0_weight = state_dict["backbone.0.0.weight"].float().cpu()
+    let backbone_0_1_weight = state_dict["backbone.0.1.weight"].float().cpu()
+    let backbone_0_1_running_mean = state_dict["backbone.0.1.running_mean"].float().cpu()
+    let backbone_0_1_running_var = state_dict["backbone.0.1.running_var"].float().cpu()
+    let backbone_0_1_bias = state_dict["backbone.0.1.bias"].float().cpu()
+    let w_conv = backbone_0_0_weight.view(24, -1)
+    let w_bn = torch.diag(
+      backbone_0_1_weight.div(torch.sqrt(1e-3 + backbone_0_1_running_var)))
+    let fused_weight = torch.mm(w_bn, w_conv).numpy()
+    conv.weight.copy(from: try! Tensor<Float>(numpy: fused_weight))
+    let b_bn =
+      backbone_0_1_bias
+      - backbone_0_1_weight.mul(backbone_0_1_running_mean).div(
+        torch.sqrt(backbone_0_1_running_var + 1e-3))
+    conv.bias.copy(from: try! Tensor<Float>(numpy: b_bn.numpy()))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let backbone_7_0_weight = state_dict["backbone.7.0.weight"].float().cpu()
+    let backbone_7_1_weight = state_dict["backbone.7.1.weight"].float().cpu()
+    let backbone_7_1_running_mean = state_dict["backbone.7.1.running_mean"].float().cpu()
+    let backbone_7_1_running_var = state_dict["backbone.7.1.running_var"].float().cpu()
+    let backbone_7_1_bias = state_dict["backbone.7.1.bias"].float().cpu()
+    let w_conv_7 = backbone_7_0_weight.view(1280, -1)
+    let w_bn_7 = torch.diag(
+      backbone_7_1_weight.div(torch.sqrt(1e-3 + backbone_7_1_running_var)))
+    let fused_weight_7 = torch.mm(w_bn_7, w_conv_7).numpy()
+    convOut.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_7))
+    let b_bn_7 =
+      backbone_7_1_bias
+      - backbone_7_1_weight.mul(backbone_7_1_running_mean).div(
+        torch.sqrt(backbone_7_1_running_var + 1e-3))
+    convOut.bias.copy(from: try! Tensor<Float>(numpy: b_bn_7.numpy()))
+    let mapper_0_weight = state_dict["mapper.0.weight"].float().cpu()
+    let mapper_1_running_mean = state_dict["mapper.1.running_mean"].float().cpu()
+    let mapper_1_running_var = state_dict["mapper.1.running_var"].float().cpu()
+    let w_conv_mapper = mapper_0_weight.view(16, -1)
+    let w_bn_mapper = torch.diag(
+      torch.ones([1]).div(torch.sqrt(1e-5 + mapper_1_running_var)))
+    let fused_weight_mapper = torch.mm(w_bn_mapper, w_conv_mapper).numpy()
+    mapper.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_mapper))
+    let b_bn_mapper =
+      -mapper_1_running_mean.div(
+        torch.sqrt(mapper_1_running_var + 1e-5))
+    mapper.bias.copy(from: try! Tensor<Float>(numpy: b_bn_mapper.numpy()))
+  }
+  return (Model([x], [out]), reader)
+}
+
 let graph = DynamicGraph()
 graph.withNoGrad {
   let x = graph.variable(try! Tensor<Float>(numpy: x.float().cpu().numpy())).toGPU(0)
+  let (effnet, effnetReader) = EfficientNetEncoder()
+  effnet.compile(inputs: x)
+  effnetReader(effnet_state_dict)
+  let out = effnet(inputs: x)[0].as(of: Float.self)
+  debugPrint(out)
+  /*
   let (stageAEncoder, stageAEncoderReader) = StageAEncoder(batchSize: 2)
   stageAEncoder.compile(inputs: x)
   stageAEncoderReader(state_dict)
@@ -856,6 +1218,7 @@ graph.withNoGrad {
   stageADecoderReader(state_dict)
   let out = stageADecoder(inputs: y)[0].as(of: Float.self)
   debugPrint(out)
+  */
   /*
   let rTimeEmbed = rEmbedding(timesteps: 0.9936, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
   let rZeros = rEmbedding(timesteps: 0, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
