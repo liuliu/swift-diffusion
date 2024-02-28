@@ -4,7 +4,7 @@ import NNC
 import PNG
 
 public enum PythonObject {}
-public typealias FloatType = Float32
+public typealias FloatType = Float16
 
 func ResBlock(prefix: String, batchSize: Int, channels: Int, skip: Bool) -> (
   Model, (PythonObject) -> Void
@@ -30,9 +30,10 @@ func ResBlock(prefix: String, batchSize: Int, channels: Int, skip: Bool) -> (
   out = convIn(out).GELU()
   let Gx = out.reduced(.norm2, axis: [2, 3])
   let Nx = Gx .* (1 / Gx.reduced(.mean, axis: [1])) + 1e-6
-  let gamma = Parameter<Float>(
+  let gamma = Parameter<FloatType>(
     .GPU(0), .NCHW(1, channels * 4, 1, 1), initBound: 1, name: "resblock")
-  let beta = Parameter<Float>(.GPU(0), .NCHW(1, channels * 4, 1, 1), initBound: 1, name: "resblock")
+  let beta = Parameter<FloatType>(
+    .GPU(0), .NCHW(1, channels * 4, 1, 1), initBound: 1, name: "resblock")
   out = gamma .* (out .* Nx) + beta + out
   let convOut = Convolution(
     groups: 1, filters: channels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
@@ -68,8 +69,9 @@ func TimestepBlock(
           strides: [timeEmbedSize * (tConds.count + 1), 1]))
     otherMappers.append(otherMapper)
   }
-  let out =
-    x
+  var out: Model.IO = x
+  out =
+    out
     .* (1
       + gate.reshaped(
         [batchSize, channels, 1, 1], offset: [0, 0, 0, 0], strides: [channels * 2, 1, 1, 1]))
@@ -502,7 +504,7 @@ func StageB(batchSize: Int, cIn: Int, height: Int, width: Int, effnetHeight: Int
 
 func StageAResBlock(prefix: String, channels: Int) -> (Model, (PythonObject) -> Void) {
   let x = Input()
-  let gammas = Parameter<Float>(.GPU(0), .NCHW(1, 1, 1, 6), initBound: 1)
+  let gammas = Parameter<FloatType>(.GPU(0), .NCHW(1, 1, 1, 6), initBound: 1)
   let norm1 = LayerNorm(epsilon: 1e-6, axis: [1], elementwiseAffine: false)
   var out =
     norm1(x) .* (1 + gammas.reshaped([1, 1, 1, 1], offset: [0, 0, 0, 0], strides: [6, 6, 6, 1]))
@@ -960,16 +962,16 @@ graph.withNoGrad {
   clipImg.full(0)
   let (stageCFixed, _) = StageCFixed(batchSize: 2, t: 77 + 8)
   stageCFixed.compile(inputs: clipText, clipTextPooled, clipImg)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f16_f32.ckpt") {
     $0.read("stage_c_fixed", model: stageCFixed)
   }
   let stageCKvs = stageCFixed(inputs: clipText, clipTextPooled, clipImg).map {
     $0.as(of: FloatType.self)
   }
   let (stageC, _) = StageC(batchSize: 2, height: 24, width: 24, t: 77 + 8)
-  var rEmbedVariable = graph.variable(rEmbed).toGPU(0)
+  var rEmbedVariable = graph.variable(Tensor<FloatType>(from: rEmbed)).toGPU(0)
   stageC.compile(inputs: [input, rEmbedVariable] + stageCKvs)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f16_f32.ckpt") {
     $0.read("stage_c", model: stageC)
   }
   for i in 0..<stageCSteps {
@@ -977,7 +979,7 @@ graph.withNoGrad {
       timesteps: Float(schedule.noise(alphaCumprod: stageCAlphasCumprod[i])), batchSize: 2,
       embeddingSize: 64, maxPeriod: 10_000)
     rEmbed[0..<2, 0..<64] = rTimeEmbed
-    let rEmbedVariable = graph.variable(rEmbed).toGPU(0)
+    let rEmbedVariable = graph.variable(Tensor<FloatType>(from: rEmbed)).toGPU(0)
     input[0..<1, 0..<16, 0..<24, 0..<24] = x
     input[1..<2, 0..<16, 0..<24, 0..<24] = x
     let out = stageC(inputs: x, [rEmbedVariable] + stageCKvs)[0].as(
@@ -1001,7 +1003,7 @@ graph.withNoGrad {
   x.randn(std: 1, mean: 0)
   let (stageBFixed, _) = StageBFixed(
     batchSize: 2, height: 256, width: 256, effnetHeight: 24, effnetWidth: 24)
-  let pixels = graph.variable(.GPU(0), .NCHW(2, 3, 8, 8), of: Float.self)
+  let pixels = graph.variable(.GPU(0), .NCHW(2, 3, 8, 8), of: FloatType.self)
   pixels.full(0)
   stageBFixed.compile(inputs: effnet, pixels, clipTextPooled)
   graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f32.ckpt") {
@@ -1012,7 +1014,7 @@ graph.withNoGrad {
   }
   let (stageB, _) = StageB(
     batchSize: 2, cIn: 4, height: 256, width: 256, effnetHeight: 24, effnetWidth: 24)
-  rEmbedVariable = graph.variable(rEmbed).toGPU(0)
+  rEmbedVariable = graph.variable(Tensor<FloatType>(from: rEmbed)).toGPU(0)
   input = graph.variable(.GPU(0), .NCHW(2, 4, 256, 256), of: FloatType.self)
   stageB.compile(inputs: [input, rEmbedVariable] + stageBKvs)
   graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f32.ckpt") {
@@ -1023,7 +1025,7 @@ graph.withNoGrad {
       timesteps: Float(schedule.noise(alphaCumprod: stageBAlphasCumprod[i])), batchSize: 2,
       embeddingSize: 64, maxPeriod: 10_000)
     rEmbed[0..<2, 0..<64] = rTimeEmbed
-    let rEmbedVariable = graph.variable(rEmbed).toGPU(0)
+    let rEmbedVariable = graph.variable(Tensor<FloatType>(from: rEmbed)).toGPU(0)
     input[0..<1, 0..<4, 0..<256, 0..<256] = x
     input[1..<2, 0..<4, 0..<256, 0..<256] = x
     let out = stageB(inputs: input, [rEmbedVariable] + stageBKvs)[0].as(
