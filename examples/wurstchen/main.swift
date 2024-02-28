@@ -1,172 +1,10 @@
+import Diffusion
 import Foundation
 import NNC
-import NNCPythonConversion
-import PythonKit
+import PNG
 
-let inference_utils = Python.import("inference.utils")
-let core_utils = Python.import("core.utils")
-let train = Python.import("train")
-let modules = Python.import("modules")
-
-let torch = Python.import("torch")
-let yaml = Python.import("yaml")
-
-let device = torch.device("cuda:0")
-
-let loaded_config_c = yaml.safe_load(
-  """
-  # GLOBAL STUFF
-  model_version: 3.6B
-  dtype: bfloat16
-
-  effnet_checkpoint_path: /home/liu/workspace/StableCascade/models/effnet_encoder.safetensors
-  previewer_checkpoint_path: /home/liu/workspace/StableCascade/models/previewer.safetensors
-  generator_checkpoint_path: /home/liu/workspace/StableCascade/models/stage_c_bf16.safetensors
-  """)
-let core_c = train.WurstCoreC(config_dict: loaded_config_c, device: device, training: false)
-
-let loaded_config_b = yaml.safe_load(
-  """
-  # GLOBAL STUFF
-  model_version: 3B
-  dtype: bfloat16
-
-  # For demonstration purposes in reconstruct_images.ipynb
-  webdataset_path: file:inference/imagenet_1024.tar
-  batch_size: 4
-  image_size: 1024
-  grad_accum_steps: 1
-
-  effnet_checkpoint_path: /home/liu/workspace/StableCascade/models/effnet_encoder.safetensors
-  stage_a_checkpoint_path: /home/liu/workspace/StableCascade/models/stage_a.safetensors
-  generator_checkpoint_path: /home/liu/workspace/StableCascade/models/stage_b_bf16.safetensors
-  """)
-let core_b = train.WurstCoreB(config_dict: loaded_config_b, device: device, training: false)
-
-let extras_c = core_c.setup_extras_pre()
-let models_c = core_c.setup_models(extras_c)
-models_c.text_model.float().eval()
-models_c.generator.float().eval().requires_grad_(false)
-
-let extras_b = core_b.setup_extras_pre()
-var models_b = core_b.setup_models(extras_b, skip_clip: true)
-models_b = train.WurstCoreB.Models(
-  generator: models_b.generator, effnet: models_b.effnet, stage_a: models_b.stage_a,
-  tokenizer: models_c.tokenizer, text_model: models_c.text_model
-)
-models_b.generator.float().eval().requires_grad_(false)
-
-let batch_size = 4
-let caption =
-  "Cinematic photo of an anthropomorphic polar bear sitting in a cafe reading a book and having a coffee"
-let (stage_c_latent_shape, stage_b_latent_shape) = inference_utils.calculate_latent_sizes(
-  1024, 1024, batch_size: batch_size
-).tuple2
-
-// Stage C Parameters
-extras_c.sampling_configs["cfg"] = 4
-extras_c.sampling_configs["shift"] = 2
-extras_c.sampling_configs["timesteps"] = 20
-extras_c.sampling_configs["t_start"] = 1.0
-
-// Stage B Parameters
-extras_b.sampling_configs["cfg"] = 1.1
-extras_b.sampling_configs["shift"] = 1
-extras_b.sampling_configs["timesteps"] = 10
-extras_b.sampling_configs["t_start"] = 1.0
-
-// PREPARE CONDITIONS
-let batch: [PythonObject: PythonObject] = [
-  "captions": PythonObject([caption, caption, caption, caption])
-]
-let conditions = core_c.get_conditions(
-  batch, models_c, extras_c, is_eval: true, is_unconditional: false, eval_image_embeds: false)
-let unconditions = core_c.get_conditions(
-  batch, models_c, extras_c, is_eval: true, is_unconditional: true, eval_image_embeds: false)
-let conditions_b = core_b.get_conditions(
-  batch, models_b, extras_b, is_eval: true, is_unconditional: false)
-let unconditions_b = core_b.get_conditions(
-  batch, models_b, extras_b, is_eval: true, is_unconditional: true)
-
-torch.set_grad_enabled(false)
-/*
-torch.set_autocast_gpu_dtype(torch.bfloat16)
-torch.set_autocast_enabled(true)
-torch.autocast_increment_nesting()
-torch.set_autocast_cache_enabled(true)
-*/
-torch.manual_seed(42)
-
-/*
-let sampling_c = extras_c.gdf.sample(
-  models_c.generator, conditions, stage_c_latent_shape, unconditions, device: device, cfg: extras_c.sampling_configs["cfg"], sampler: extras_c.sampling_configs["sampler"], shift: extras_c.sampling_configs["shift"], timesteps: extras_c.sampling_configs["timesteps"], t_start: extras_c.sampling_configs["t_start"]
-)
-var sampled_c: PythonObject? = nil
-for _ in 0..<Int(extras_c.sampling_configs["timesteps"])! {
-  sampled_c = sampling_c.__next__().tuple3.0
-}
-
-conditions_b["effnet"] = sampled_c!
-unconditions_b["effnet"] = torch.zeros_like(sampled_c)
-
-let sampling_b = extras_b.gdf.sample(
-  models_b.generator, conditions_b, stage_b_latent_shape, unconditions_b, device: device, cfg: extras_c.sampling_configs["cfg"], sampler: extras_c.sampling_configs["sampler"], shift: extras_c.sampling_configs["shift"], timesteps: extras_c.sampling_configs["timesteps"], t_start: extras_c.sampling_configs["t_start"]
-)
-var sampled_b: PythonObject? = nil
-for _ in 0..<Int(extras_b.sampling_configs["timesteps"])! {
-  sampled_b = sampling_b.__next__().tuple3.0
-}
-let sampled = models_b.stage_a.decode(sampled_b).float()
-
-inference_utils.save_images(sampled)
-*/
-
-/*
-let effnet = modules.effnet.EfficientNetEncoder().to(device)
-effnet.load_state_dict(
-  core_utils.load_or_fail("/home/liu/workspace/StableCascade/models/effnet_encoder.safetensors"))
-effnet.float().eval().requires_grad_(false)
-let effnet_state_dict = effnet.state_dict()
-
-let x = torch.randn([2, 16, 24, 24]).cuda()
-let clip_text = torch.randn([2, 77, 1280]).cuda()
-let clip_text_pooled = torch.zeros([2, 1, 1280]).cuda()
-let clip_img = torch.zeros([2, 1, 768]).cuda()
-let r = 0.9936 * torch.ones([2]).cuda()
-let result = models_c.generator(x, r, clip_text, clip_text_pooled, clip_img)
-print(result)
-
-// First, get weights from core_c.
-
-let state_dict = models_c.generator.state_dict()
-
-let img = torch.randn([2, 3, 768, 768]).cuda()
-let imgResult = effnet(img)
-// print(result)
-
-// print(state_dict.keys())
-*/
-/*
-let x = torch.randn([2, 4, 256, 256]).cuda()
-let effnet = torch.randn([2, 16, 24, 24]).cuda()
-let clip_text_pooled = torch.zeros([2, 1, 1280]).cuda()
-let r = 0.9936 * torch.ones([2]).cuda()
-let result = models_b.generator(x, r, effnet, clip_text_pooled)
-print(result)
-
-let state_dict = models_b.generator.state_dict()
-
-// print(state_dict.keys())
-*/
-/*
-let x = torch.randn([2, 3, 1024, 1024]).cuda()
-let (y, _, _, _) = models_b.stage_a.encode(x).tuple4
-let result = models_b.stage_a.decode(y)
-
-let state_dict = models_b.stage_a.state_dict()
-
-// print(state_dict.keys())
-*/
+public enum PythonObject {}
+public typealias FloatType = Float32
 
 func ResBlock(prefix: String, batchSize: Int, channels: Int, skip: Bool) -> (
   Model, (PythonObject) -> Void
@@ -200,22 +38,6 @@ func ResBlock(prefix: String, batchSize: Int, channels: Int, skip: Bool) -> (
     groups: 1, filters: channels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = convOut(out) + x
   let reader: (PythonObject) -> Void = { state_dict in
-    let depthwise_weight = state_dict["\(prefix).depthwise.weight"].float().cpu().numpy()
-    depthwise.weight.copy(from: try! Tensor<Float>(numpy: depthwise_weight))
-    let depthwise_bias = state_dict["\(prefix).depthwise.bias"].float().cpu().numpy()
-    depthwise.bias.copy(from: try! Tensor<Float>(numpy: depthwise_bias))
-    let channelwise_0_weight = state_dict["\(prefix).channelwise.0.weight"].float().cpu().numpy()
-    convIn.weight.copy(from: try! Tensor<Float>(numpy: channelwise_0_weight))
-    let channelwise_0_bias = state_dict["\(prefix).channelwise.0.bias"].float().cpu().numpy()
-    convIn.bias.copy(from: try! Tensor<Float>(numpy: channelwise_0_bias))
-    let channelwise_2_gamma = state_dict["\(prefix).channelwise.2.gamma"].float().cpu().numpy()
-    gamma.weight.copy(from: try! Tensor<Float>(numpy: channelwise_2_gamma))
-    let channelwise_2_beta = state_dict["\(prefix).channelwise.2.beta"].float().cpu().numpy()
-    beta.weight.copy(from: try! Tensor<Float>(numpy: channelwise_2_beta))
-    let channelwise_4_weight = state_dict["\(prefix).channelwise.4.weight"].float().cpu().numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: channelwise_4_weight))
-    let channelwise_4_bias = state_dict["\(prefix).channelwise.4.bias"].float().cpu().numpy()
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: channelwise_4_bias))
   }
   if let xSkip = xSkip {
     return (Model([x, xSkip], [out]), reader)
@@ -254,17 +76,6 @@ func TimestepBlock(
     + gate.reshaped(
       [batchSize, channels, 1, 1], offset: [0, channels, 0, 0], strides: [channels * 2, 1, 1, 1])
   let reader: (PythonObject) -> Void = { state_dict in
-    let mapper_weight = state_dict["\(prefix).mapper.weight"].float().cpu().numpy()
-    mapper.weight.copy(from: try! Tensor<Float>(numpy: mapper_weight))
-    let mapper_bias = state_dict["\(prefix).mapper.bias"].float().cpu().numpy()
-    mapper.bias.copy(from: try! Tensor<Float>(numpy: mapper_bias))
-    for (otherMapper, tCond) in zip(otherMappers, tConds) {
-      let mapper_t_cond_weight = state_dict["\(prefix).mapper_\(tCond).weight"].float().cpu()
-        .numpy()
-      otherMapper.weight.copy(from: try! Tensor<Float>(numpy: mapper_t_cond_weight))
-      let mapper_t_cond_bias = state_dict["\(prefix).mapper_\(tCond).bias"].float().cpu().numpy()
-      otherMapper.bias.copy(from: try! Tensor<Float>(numpy: mapper_t_cond_bias))
-    }
   }
   return (Model([x, rEmbed], [out]), reader)
 }
@@ -293,24 +104,6 @@ func MultiHeadAttention(prefix: String, k: Int, h: Int, b: Int, hw: Int, t: Int)
   let unifyheads = Dense(count: k * h, name: "unifyheads")
   out = unifyheads(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let in_proj_weight = state_dict["\(prefix).attention.attn.in_proj_weight"].float().cpu().numpy()
-    let in_proj_bias = state_dict["\(prefix).attention.attn.in_proj_bias"].float().cpu().numpy()
-    toqueries.weight.copy(
-      from: try! Tensor<Float>(numpy: in_proj_weight[..<(k * h), ...]))
-    toqueries.bias.copy(from: try! Tensor<Float>(numpy: in_proj_bias[..<(k * h)]))
-    tokeys.weight.copy(
-      from: try! Tensor<Float>(numpy: in_proj_weight[(k * h)..<(2 * k * h), ...]))
-    tokeys.bias.copy(
-      from: try! Tensor<Float>(numpy: in_proj_bias[(k * h)..<(2 * k * h)]))
-    tovalues.weight.copy(
-      from: try! Tensor<Float>(numpy: in_proj_weight[(2 * k * h)..., ...]))
-    tovalues.bias.copy(
-      from: try! Tensor<Float>(numpy: in_proj_bias[(2 * k * h)...]))
-    let out_proj_weight = state_dict["\(prefix).attention.attn.out_proj.weight"].float().cpu()
-      .numpy()
-    let out_proj_bias = state_dict["\(prefix).attention.attn.out_proj.bias"].float().cpu().numpy()
-    unifyheads.weight.copy(from: try! Tensor<Float>(numpy: out_proj_weight))
-    unifyheads.bias.copy(from: try! Tensor<Float>(numpy: out_proj_bias))
   }
   return (Model([x, key, value], [out]), reader)
 }
@@ -346,20 +139,6 @@ func AttnBlockFixed(prefix: String, batchSize: Int, channels: Int, nHead: Int, t
   let keys = tokeys(kvOut).reshaped([batchSize, t, nHead, k]).transposed(1, 2)
   let values = tovalues(kvOut).reshaped([batchSize, t, nHead, k]).transposed(1, 2)
   let reader: (PythonObject) -> Void = { state_dict in
-    let kv_mapper_1_weight = state_dict["\(prefix).kv_mapper.1.weight"].float().cpu().numpy()
-    kvMapper.weight.copy(from: try! Tensor<Float>(numpy: kv_mapper_1_weight))
-    let kv_mapper_1_bias = state_dict["\(prefix).kv_mapper.1.bias"].float().cpu().numpy()
-    kvMapper.bias.copy(from: try! Tensor<Float>(numpy: kv_mapper_1_bias))
-    let in_proj_weight = state_dict["\(prefix).attention.attn.in_proj_weight"].float().cpu().numpy()
-    let in_proj_bias = state_dict["\(prefix).attention.attn.in_proj_bias"].float().cpu().numpy()
-    tokeys.weight.copy(
-      from: try! Tensor<Float>(numpy: in_proj_weight[channels..<(2 * channels), ...]))
-    tokeys.bias.copy(
-      from: try! Tensor<Float>(numpy: in_proj_bias[channels..<(2 * channels)]))
-    tovalues.weight.copy(
-      from: try! Tensor<Float>(numpy: in_proj_weight[(2 * channels)..., ...]))
-    tovalues.bias.copy(
-      from: try! Tensor<Float>(numpy: in_proj_bias[(2 * channels)...]))
   }
   return (Model([kv], [keys, values]), reader)
 }
@@ -404,20 +183,6 @@ func StageCFixed(batchSize: Int, t: Int) -> (Model, (PythonObject) -> Void) {
     for reader in readers {
       reader(state_dict)
     }
-    let clip_txt_mapper_weight = state_dict["clip_txt_mapper.weight"].float().cpu().numpy()
-    clipTextMapper.weight.copy(from: try! Tensor<Float>(numpy: clip_txt_mapper_weight))
-    let clip_txt_mapper_bias = state_dict["clip_txt_mapper.bias"].float().cpu().numpy()
-    clipTextMapper.bias.copy(from: try! Tensor<Float>(numpy: clip_txt_mapper_bias))
-    let clip_txt_pooled_mapper_weight = state_dict["clip_txt_pooled_mapper.weight"].float().cpu()
-      .numpy()
-    clipTextPooledMapper.weight.copy(from: try! Tensor<Float>(numpy: clip_txt_pooled_mapper_weight))
-    let clip_txt_pooled_mapper_bias = state_dict["clip_txt_pooled_mapper.bias"].float().cpu()
-      .numpy()
-    clipTextPooledMapper.bias.copy(from: try! Tensor<Float>(numpy: clip_txt_pooled_mapper_bias))
-    let clip_img_mapper_weight = state_dict["clip_img_mapper.weight"].float().cpu().numpy()
-    clipImgMapper.weight.copy(from: try! Tensor<Float>(numpy: clip_img_mapper_weight))
-    let clip_img_mapper_bias = state_dict["clip_img_mapper.bias"].float().cpu().numpy()
-    clipImgMapper.bias.copy(from: try! Tensor<Float>(numpy: clip_img_mapper_bias))
   }
   return (Model([clipText, clipTextPooled, clipImg], outs), reader)
 }
@@ -442,14 +207,6 @@ func StageC(batchSize: Int, height: Int, width: Int, t: Int) -> (Model, (PythonO
       let downscaler = Convolution(
         groups: 1, filters: 2048, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
       out = downscaler(out)
-      readers.append { state_dict in
-        let blocks_0_weight = state_dict["down_downscalers.\(i).1.blocks.0.weight"].float().cpu()
-          .numpy()
-        downscaler.weight.copy(from: try! Tensor<Float>(numpy: blocks_0_weight))
-        let blocks_0_bias = state_dict["down_downscalers.\(i).1.blocks.0.bias"].float().cpu()
-          .numpy()
-        downscaler.bias.copy(from: try! Tensor<Float>(numpy: blocks_0_bias))
-      }
     }
     for j in 0..<blocks[0][i] {
       let (resBlock, resBlockReader) = ResBlock(
@@ -509,13 +266,6 @@ func StageC(batchSize: Int, height: Int, width: Int, t: Int) -> (Model, (PythonO
       let upscaler = Convolution(
         groups: 1, filters: 2048, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
       out = upscaler(out)
-      readers.append { state_dict in
-        let blocks_1_weight = state_dict["up_upscalers.\(i).1.blocks.1.weight"].float().cpu()
-          .numpy()
-        upscaler.weight.copy(from: try! Tensor<Float>(numpy: blocks_1_weight))
-        let blocks_1_bias = state_dict["up_upscalers.\(i).1.blocks.1.bias"].float().cpu().numpy()
-        upscaler.bias.copy(from: try! Tensor<Float>(numpy: blocks_1_bias))
-      }
       skip = levelOutputs.removeLast()
     }
   }
@@ -530,15 +280,6 @@ func StageC(batchSize: Int, height: Int, width: Int, t: Int) -> (Model, (PythonO
     for reader in readers {
       reader(state_dict)
     }
-    let embedding_1_weight = state_dict["embedding.1.weight"].float().cpu().numpy()
-    conv2d.weight.copy(from: try! Tensor<Float>(numpy: embedding_1_weight))
-    let embedding_1_bias = state_dict["embedding.1.bias"].float().cpu().numpy()
-    conv2d.bias.copy(from: try! Tensor<Float>(numpy: embedding_1_bias))
-
-    let clf_1_weight = state_dict["clf.1.weight"].float().cpu().numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: clf_1_weight))
-    let clf_1_bias = state_dict["clf.1.bias"].float().cpu().numpy()
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: clf_1_bias))
 
   }
   return (Model([x, rEmbed] + kvs, [out]), reader)
@@ -555,14 +296,6 @@ func SpatialMapper(prefix: String, cHidden: Int) -> (Model, (PythonObject) -> Vo
   let normOut = LayerNorm(epsilon: 1e-6, axis: [1], elementwiseAffine: false)
   out = normOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let effnet_mapper_0_weight = state_dict["\(prefix).0.weight"].float().cpu().numpy()
-    convIn.weight.copy(from: try! Tensor<Float>(numpy: effnet_mapper_0_weight))
-    let effnet_mapper_0_bias = state_dict["\(prefix).0.bias"].float().cpu().numpy()
-    convIn.bias.copy(from: try! Tensor<Float>(numpy: effnet_mapper_0_bias))
-    let effnet_mapper_2_weight = state_dict["\(prefix).2.weight"].float().cpu().numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: effnet_mapper_2_weight))
-    let effnet_mapper_2_bias = state_dict["\(prefix).2.bias"].float().cpu().numpy()
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: effnet_mapper_2_bias))
   }
   return (Model([x], [out]), reader)
 }
@@ -623,10 +356,6 @@ func StageBFixed(batchSize: Int, height: Int, width: Int, effnetHeight: Int, eff
   }
   let reader: (PythonObject) -> Void = { state_dict in
     effnetMapperReader(state_dict)
-    let clip_mapper_weight = state_dict["clip_mapper.weight"].float().cpu().numpy()
-    clipMapper.weight.copy(from: try! Tensor<Float>(numpy: clip_mapper_weight))
-    let clip_mapper_bias = state_dict["clip_mapper.bias"].float().cpu().numpy()
-    clipMapper.bias.copy(from: try! Tensor<Float>(numpy: clip_mapper_bias))
     pixelsMapperReader(state_dict)
     for reader in readers {
       reader(state_dict)
@@ -661,14 +390,6 @@ func StageB(batchSize: Int, cIn: Int, height: Int, width: Int, effnetHeight: Int
       let downscaler = Convolution(
         groups: 1, filters: cHidden[i], filterSize: [2, 2], hint: Hint(stride: [2, 2]))
       out = downscaler(out)
-      readers.append { state_dict in
-        let downscalers_1_weight = state_dict["down_downscalers.\(i).1.weight"].float().cpu()
-          .numpy()
-        downscaler.weight.copy(from: try! Tensor<Float>(numpy: downscalers_1_weight))
-        let downscalers_1_bias = state_dict["down_downscalers.\(i).1.bias"].float().cpu()
-          .numpy()
-        downscaler.bias.copy(from: try! Tensor<Float>(numpy: downscalers_1_bias))
-      }
       height = height / 2
       width = width / 2
     }
@@ -751,15 +472,6 @@ func StageB(batchSize: Int, cIn: Int, height: Int, width: Int, effnetHeight: Int
         let repmap = Convolution(
           groups: 1, filters: cHidden[3 - i], filterSize: [1, 1], hint: Hint(stride: [1, 1]))
         out = repmap(out)
-        readers.append { state_dict in
-          let up_repeat_mappers_weight = state_dict["up_repeat_mappers.\(i).\(j).weight"].float()
-            .cpu()
-            .numpy()
-          repmap.weight.copy(from: try! Tensor<Float>(numpy: up_repeat_mappers_weight))
-          let up_repeat_mappers_bias = state_dict["up_repeat_mappers.\(i).\(j).bias"].float().cpu()
-            .numpy()
-          repmap.bias.copy(from: try! Tensor<Float>(numpy: up_repeat_mappers_bias))
-        }
       }
     }
     if i < 4 - 1 {
@@ -768,13 +480,6 @@ func StageB(batchSize: Int, cIn: Int, height: Int, width: Int, effnetHeight: Int
       let upscaler = ConvolutionTranspose(
         groups: 1, filters: cHidden[2 - i], filterSize: [2, 2], hint: Hint(stride: [2, 2]))
       out = upscaler(out)
-      readers.append { state_dict in
-        let upscalers_1_weight = state_dict["up_upscalers.\(i).1.weight"].float().cpu()
-          .numpy()
-        upscaler.weight.copy(from: try! Tensor<Float>(numpy: upscalers_1_weight))
-        let upscalers_1_bias = state_dict["up_upscalers.\(i).1.bias"].float().cpu().numpy()
-        upscaler.bias.copy(from: try! Tensor<Float>(numpy: upscalers_1_bias))
-      }
       skip = levelOutputs.removeLast()
       height = height * 2
       width = width * 2
@@ -788,18 +493,9 @@ func StageB(batchSize: Int, cIn: Int, height: Int, width: Int, effnetHeight: Int
     .transposed(2, 3).reshaped([batchSize, 4, height * 2, width * 2])  // This is the same as .permuted(0, 1, 4, 2, 5, 3).
 
   let reader: (PythonObject) -> Void = { state_dict in
-    let embedding_1_weight = state_dict["embedding.1.weight"].float().cpu().numpy()
-    conv2d.weight.copy(from: try! Tensor<Float>(numpy: embedding_1_weight))
-    let embedding_1_bias = state_dict["embedding.1.bias"].float().cpu().numpy()
-    conv2d.bias.copy(from: try! Tensor<Float>(numpy: embedding_1_bias))
     for reader in readers {
       reader(state_dict)
     }
-
-    let clf_1_weight = state_dict["clf.1.weight"].float().cpu().numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: clf_1_weight))
-    let clf_1_bias = state_dict["clf.1.bias"].float().cpu().numpy()
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: clf_1_bias))
   }
   return (Model([x, rEmbed, effnetAndPixels] + kvs, [out]), reader)
 }
@@ -828,20 +524,6 @@ func StageAResBlock(prefix: String, channels: Int) -> (Model, (PythonObject) -> 
   out = out + convOut(convIn(xTemp).GELU())
     .* gammas.reshaped([1, 1, 1, 1], offset: [0, 0, 0, 5], strides: [6, 6, 6, 1])
   let reader: (PythonObject) -> Void = { state_dict in
-    let depthwise_1_weight = state_dict["\(prefix).depthwise.1.weight"].float().cpu().numpy()
-    depthwise.weight.copy(from: try! Tensor<Float>(numpy: depthwise_1_weight))
-    let depthwise_1_bias = state_dict["\(prefix).depthwise.1.bias"].float().cpu().numpy()
-    depthwise.bias.copy(from: try! Tensor<Float>(numpy: depthwise_1_bias))
-    let channelwise_0_weight = state_dict["\(prefix).channelwise.0.weight"].float().cpu().numpy()
-    convIn.weight.copy(from: try! Tensor<Float>(numpy: channelwise_0_weight))
-    let channelwise_0_bias = state_dict["\(prefix).channelwise.0.bias"].float().cpu().numpy()
-    convIn.bias.copy(from: try! Tensor<Float>(numpy: channelwise_0_bias))
-    let channelwise_2_weight = state_dict["\(prefix).channelwise.2.weight"].float().cpu().numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: channelwise_2_weight))
-    let channelwise_2_bias = state_dict["\(prefix).channelwise.2.bias"].float().cpu().numpy()
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: channelwise_2_bias))
-    let gammas_weight = state_dict["\(prefix).gammas"].float().cpu().numpy()
-    gammas.weight.copy(from: try! Tensor<Float>(numpy: gammas_weight))
   }
   return (Model([x], [out]), reader)
 }
@@ -860,13 +542,6 @@ func StageAEncoder(batchSize: Int) -> (Model, (PythonObject) -> Void) {
         groups: 1, filters: cHidden[i], filterSize: [4, 4],
         hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [1, 1])))
       out = conv2d(out)
-      let layer = j
-      readers.append { state_dict in
-        let down_blocks_weight = state_dict["down_blocks.\(layer).weight"].float().cpu().numpy()
-        conv2d.weight.copy(from: try! Tensor<Float>(numpy: down_blocks_weight))
-        let down_blocks_bias = state_dict["down_blocks.\(layer).bias"].float().cpu().numpy()
-        conv2d.bias.copy(from: try! Tensor<Float>(numpy: down_blocks_bias))
-      }
       j += 1
     }
     let (resBlock, resBlockReader) = StageAResBlock(
@@ -878,28 +553,9 @@ func StageAEncoder(batchSize: Int) -> (Model, (PythonObject) -> Void) {
   let conv2d = Convolution(groups: 1, filters: 4, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = conv2d(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let in_block_1_weight = state_dict["in_block.1.weight"].float().cpu().numpy()
-    convIn.weight.copy(from: try! Tensor<Float>(numpy: in_block_1_weight))
-    let in_block_1_bias = state_dict["in_block.1.bias"].float().cpu().numpy()
-    convIn.bias.copy(from: try! Tensor<Float>(numpy: in_block_1_bias))
     for reader in readers {
       reader(state_dict)
     }
-    let down_blocks_3_0_weight = state_dict["down_blocks.3.0.weight"].float().cpu()
-    let down_blocks_3_1_weight = state_dict["down_blocks.3.1.weight"].float().cpu()
-    let down_blocks_3_1_running_mean = state_dict["down_blocks.3.1.running_mean"].float().cpu()
-    let down_blocks_3_1_running_var = state_dict["down_blocks.3.1.running_var"].float().cpu()
-    let down_blocks_3_1_bias = state_dict["down_blocks.3.1.bias"].float().cpu()
-    let w_conv = down_blocks_3_0_weight.view(4, -1)
-    let w_bn = torch.diag(
-      down_blocks_3_1_weight.div(torch.sqrt(1e-5 + down_blocks_3_1_running_var)))
-    let fused_weight = torch.mm(w_bn, w_conv).numpy()
-    conv2d.weight.copy(from: try! Tensor<Float>(numpy: fused_weight))
-    let b_bn =
-      down_blocks_3_1_bias
-      - down_blocks_3_1_weight.mul(down_blocks_3_1_running_mean).div(
-        torch.sqrt(down_blocks_3_1_running_var + 1e-5))
-    conv2d.bias.copy(from: try! Tensor<Float>(numpy: b_bn.numpy()))
   }
   return (Model([x], [out]), reader)
 }
@@ -925,13 +581,6 @@ func StageADecoder(batchSize: Int, height: Int, width: Int) -> (Model, (PythonOb
         groups: 1, filters: cHidden[i + 1], filterSize: [4, 4],
         hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [1, 1])))
       out = conv2d(out)
-      let layer = j
-      readers.append { state_dict in
-        let up_blocks_weight = state_dict["up_blocks.\(layer).weight"].float().cpu().numpy()
-        conv2d.weight.copy(from: try! Tensor<Float>(numpy: up_blocks_weight))
-        let up_blocks_bias = state_dict["up_blocks.\(layer).bias"].float().cpu().numpy()
-        conv2d.bias.copy(from: try! Tensor<Float>(numpy: up_blocks_bias))
-      }
       j += 1
     }
   }
@@ -940,17 +589,9 @@ func StageADecoder(batchSize: Int, height: Int, width: Int) -> (Model, (PythonOb
   out = convOut(out).reshaped([batchSize, 3, 2, 2, height, width]).transposed(3, 4).transposed(4, 5)
     .transposed(2, 3).reshaped([batchSize, 3, height * 2, width * 2])  // This is the same as .permuted(0, 1, 4, 2, 5, 3).
   let reader: (PythonObject) -> Void = { state_dict in
-    let up_blocks_0_0_weight = state_dict["up_blocks.0.0.weight"].float().cpu().numpy()
-    convIn.weight.copy(from: try! Tensor<Float>(numpy: up_blocks_0_0_weight))
-    let up_blocks_0_0_bias = state_dict["up_blocks.0.0.bias"].float().cpu().numpy()
-    convIn.bias.copy(from: try! Tensor<Float>(numpy: up_blocks_0_0_bias))
     for reader in readers {
       reader(state_dict)
     }
-    let out_block_0_weight = state_dict["out_block.0.weight"].float().cpu().numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: out_block_0_weight))
-    let out_block_0_bias = state_dict["out_block.0.bias"].float().cpu().numpy()
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: out_block_0_bias))
   }
   return (Model([x], [out]), reader)
 }
@@ -980,7 +621,6 @@ func FusedMBConv(
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   var out: Model.IO = x
-  let expandConv: Model?
   let convOut: Model
   if let expandChannels = expandChannels {
     let conv = Convolution(
@@ -991,12 +631,10 @@ func FusedMBConv(
           begin: [(filterSize - 1) / 2, (filterSize - 1) / 2],
           end: [(filterSize - 1) / 2, (filterSize - 1) / 2])))
     out = conv(out).swish()
-    expandConv = conv
     convOut = Convolution(
       groups: 1, filters: outChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
     out = convOut(out)
   } else {
-    expandConv = nil
     convOut = Convolution(
       groups: 1, filters: outChannels, filterSize: [filterSize, filterSize],
       hint: Hint(
@@ -1010,56 +648,6 @@ func FusedMBConv(
     out = x + out
   }
   let reader: (PythonObject) -> Void = { state_dict in
-    if let expandConv = expandConv, let expandChannels = expandChannels {
-      let block_0_0_weight = state_dict["\(prefix).block.0.0.weight"].float().cpu()
-      let block_0_1_weight = state_dict["\(prefix).block.0.1.weight"].float().cpu()
-      let block_0_1_running_mean = state_dict["\(prefix).block.0.1.running_mean"].float().cpu()
-      let block_0_1_running_var = state_dict["\(prefix).block.0.1.running_var"].float().cpu()
-      let block_0_1_bias = state_dict["\(prefix).block.0.1.bias"].float().cpu()
-      let w_conv_0 = block_0_0_weight.view(expandChannels, -1)
-      let w_bn_0 = torch.diag(
-        block_0_1_weight.div(torch.sqrt(1e-3 + block_0_1_running_var)))
-      let fused_weight_0 = torch.mm(w_bn_0, w_conv_0).numpy()
-      expandConv.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_0))
-      let b_bn_0 =
-        block_0_1_bias
-        - block_0_1_weight.mul(block_0_1_running_mean).div(
-          torch.sqrt(block_0_1_running_var + 1e-3))
-      expandConv.bias.copy(from: try! Tensor<Float>(numpy: b_bn_0.numpy()))
-
-      let block_1_0_weight = state_dict["\(prefix).block.1.0.weight"].float().cpu()
-      let block_1_1_weight = state_dict["\(prefix).block.1.1.weight"].float().cpu()
-      let block_1_1_running_mean = state_dict["\(prefix).block.1.1.running_mean"].float().cpu()
-      let block_1_1_running_var = state_dict["\(prefix).block.1.1.running_var"].float().cpu()
-      let block_1_1_bias = state_dict["\(prefix).block.1.1.bias"].float().cpu()
-      let w_conv_1 = block_1_0_weight.view(outChannels, -1)
-      let w_bn_1 = torch.diag(
-        block_1_1_weight.div(torch.sqrt(1e-3 + block_1_1_running_var)))
-      let fused_weight_1 = torch.mm(w_bn_1, w_conv_1).numpy()
-      convOut.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_1))
-      let b_bn_1 =
-        block_1_1_bias
-        - block_1_1_weight.mul(block_1_1_running_mean).div(
-          torch.sqrt(block_1_1_running_var + 1e-3))
-      convOut.bias.copy(from: try! Tensor<Float>(numpy: b_bn_1.numpy()))
-
-    } else {
-      let block_0_0_weight = state_dict["\(prefix).block.0.0.weight"].float().cpu()
-      let block_0_1_weight = state_dict["\(prefix).block.0.1.weight"].float().cpu()
-      let block_0_1_running_mean = state_dict["\(prefix).block.0.1.running_mean"].float().cpu()
-      let block_0_1_running_var = state_dict["\(prefix).block.0.1.running_var"].float().cpu()
-      let block_0_1_bias = state_dict["\(prefix).block.0.1.bias"].float().cpu()
-      let w_conv = block_0_0_weight.view(outChannels, -1)
-      let w_bn = torch.diag(
-        block_0_1_weight.div(torch.sqrt(1e-3 + block_0_1_running_var)))
-      let fused_weight = torch.mm(w_bn, w_conv).numpy()
-      convOut.weight.copy(from: try! Tensor<Float>(numpy: fused_weight))
-      let b_bn =
-        block_0_1_bias
-        - block_0_1_weight.mul(block_0_1_running_mean).div(
-          torch.sqrt(block_0_1_running_var + 1e-3))
-      convOut.bias.copy(from: try! Tensor<Float>(numpy: b_bn.numpy()))
-    }
   }
   return (Model([x], [out]), reader)
 }
@@ -1070,14 +658,10 @@ func MBConv(
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   var out: Model.IO = x
-  let expandConv: Model?
   if expandChannels != inChannels {
     let conv = Convolution(
       groups: 1, filters: expandChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
     out = conv(out).swish()
-    expandConv = conv
-  } else {
-    expandConv = nil
   }
 
   let depthwise = Convolution(
@@ -1107,74 +691,6 @@ func MBConv(
     out = x + out
   }
   let reader: (PythonObject) -> Void = { state_dict in
-    let blockStart: Int
-    if let expandConv = expandConv {
-      let block_0_0_weight = state_dict["\(prefix).block.0.0.weight"].float().cpu()
-      let block_0_1_weight = state_dict["\(prefix).block.0.1.weight"].float().cpu()
-      let block_0_1_running_mean = state_dict["\(prefix).block.0.1.running_mean"].float().cpu()
-      let block_0_1_running_var = state_dict["\(prefix).block.0.1.running_var"].float().cpu()
-      let block_0_1_bias = state_dict["\(prefix).block.0.1.bias"].float().cpu()
-      let w_conv_0 = block_0_0_weight.view(expandChannels, -1)
-      let w_bn_0 = torch.diag(
-        block_0_1_weight.div(torch.sqrt(1e-3 + block_0_1_running_var)))
-      let fused_weight_0 = torch.mm(w_bn_0, w_conv_0).numpy()
-      expandConv.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_0))
-      let b_bn_0 =
-        block_0_1_bias
-        - block_0_1_weight.mul(block_0_1_running_mean).div(
-          torch.sqrt(block_0_1_running_var + 1e-3))
-      expandConv.bias.copy(from: try! Tensor<Float>(numpy: b_bn_0.numpy()))
-      blockStart = 1
-    } else {
-      blockStart = 0
-    }
-
-    let block_1_0_weight = state_dict["\(prefix).block.\(blockStart).0.weight"].float().cpu()
-    let block_1_1_weight = state_dict["\(prefix).block.\(blockStart).1.weight"].float().cpu()
-    let block_1_1_running_mean = state_dict["\(prefix).block.\(blockStart).1.running_mean"].float()
-      .cpu()
-    let block_1_1_running_var = state_dict["\(prefix).block.\(blockStart).1.running_var"].float()
-      .cpu()
-    let block_1_1_bias = state_dict["\(prefix).block.\(blockStart).1.bias"].float().cpu()
-    let w_conv_1 = block_1_0_weight.view(expandChannels, -1)
-    let w_bn_1 = torch.diag(
-      block_1_1_weight.div(torch.sqrt(1e-3 + block_1_1_running_var)))
-    let fused_weight_1 = torch.mm(w_bn_1, w_conv_1).numpy()
-    depthwise.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_1))
-    let b_bn_1 =
-      block_1_1_bias
-      - block_1_1_weight.mul(block_1_1_running_mean).div(
-        torch.sqrt(block_1_1_running_var + 1e-3))
-    depthwise.bias.copy(from: try! Tensor<Float>(numpy: b_bn_1.numpy()))
-
-    let block_2_fc1_weight = state_dict["\(prefix).block.\(blockStart + 1).fc1.weight"].float()
-      .cpu()
-    fc1.weight.copy(from: try! Tensor<Float>(numpy: block_2_fc1_weight.numpy()))
-    let block_2_fc1_bias = state_dict["\(prefix).block.\(blockStart + 1).fc1.bias"].float().cpu()
-    fc1.bias.copy(from: try! Tensor<Float>(numpy: block_2_fc1_bias.numpy()))
-    let block_2_fc2_weight = state_dict["\(prefix).block.\(blockStart + 1).fc2.weight"].float()
-      .cpu()
-    fc2.weight.copy(from: try! Tensor<Float>(numpy: block_2_fc2_weight.numpy()))
-    let block_2_fc2_bias = state_dict["\(prefix).block.\(blockStart + 1).fc2.bias"].float().cpu()
-    fc2.bias.copy(from: try! Tensor<Float>(numpy: block_2_fc2_bias.numpy()))
-
-    let block_3_0_weight = state_dict["\(prefix).block.\(blockStart + 2).0.weight"].float().cpu()
-    let block_3_1_weight = state_dict["\(prefix).block.\(blockStart + 2).1.weight"].float().cpu()
-    let block_3_1_running_mean = state_dict["\(prefix).block.\(blockStart + 2).1.running_mean"]
-      .float().cpu()
-    let block_3_1_running_var = state_dict["\(prefix).block.\(blockStart + 2).1.running_var"]
-      .float().cpu()
-    let block_3_1_bias = state_dict["\(prefix).block.\(blockStart + 2).1.bias"].float().cpu()
-    let w_conv_3 = block_3_0_weight.view(outChannels, -1)
-    let w_bn_3 = torch.diag(
-      block_3_1_weight.div(torch.sqrt(1e-3 + block_3_1_running_var)))
-    let fused_weight_3 = torch.mm(w_bn_3, w_conv_3).numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_3))
-    let b_bn_3 =
-      block_3_1_bias
-      - block_3_1_weight.mul(block_3_1_running_mean).div(
-        torch.sqrt(block_3_1_running_var + 1e-3))
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: b_bn_3.numpy()))
   }
   return (Model([x], [out]), reader)
 }
@@ -1267,142 +783,261 @@ func EfficientNetEncoder() -> (Model, (PythonObject) -> Void) {
     groups: 1, filters: 16, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = mapper(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let backbone_0_0_weight = state_dict["backbone.0.0.weight"].float().cpu()
-    let backbone_0_1_weight = state_dict["backbone.0.1.weight"].float().cpu()
-    let backbone_0_1_running_mean = state_dict["backbone.0.1.running_mean"].float().cpu()
-    let backbone_0_1_running_var = state_dict["backbone.0.1.running_var"].float().cpu()
-    let backbone_0_1_bias = state_dict["backbone.0.1.bias"].float().cpu()
-    let w_conv = backbone_0_0_weight.view(24, -1)
-    let w_bn = torch.diag(
-      backbone_0_1_weight.div(torch.sqrt(1e-3 + backbone_0_1_running_var)))
-    let fused_weight = torch.mm(w_bn, w_conv).numpy()
-    conv.weight.copy(from: try! Tensor<Float>(numpy: fused_weight))
-    let b_bn =
-      backbone_0_1_bias
-      - backbone_0_1_weight.mul(backbone_0_1_running_mean).div(
-        torch.sqrt(backbone_0_1_running_var + 1e-3))
-    conv.bias.copy(from: try! Tensor<Float>(numpy: b_bn.numpy()))
     for reader in readers {
       reader(state_dict)
     }
-    let backbone_7_0_weight = state_dict["backbone.7.0.weight"].float().cpu()
-    let backbone_7_1_weight = state_dict["backbone.7.1.weight"].float().cpu()
-    let backbone_7_1_running_mean = state_dict["backbone.7.1.running_mean"].float().cpu()
-    let backbone_7_1_running_var = state_dict["backbone.7.1.running_var"].float().cpu()
-    let backbone_7_1_bias = state_dict["backbone.7.1.bias"].float().cpu()
-    let w_conv_7 = backbone_7_0_weight.view(1280, -1)
-    let w_bn_7 = torch.diag(
-      backbone_7_1_weight.div(torch.sqrt(1e-3 + backbone_7_1_running_var)))
-    let fused_weight_7 = torch.mm(w_bn_7, w_conv_7).numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_7))
-    let b_bn_7 =
-      backbone_7_1_bias
-      - backbone_7_1_weight.mul(backbone_7_1_running_mean).div(
-        torch.sqrt(backbone_7_1_running_var + 1e-3))
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: b_bn_7.numpy()))
-    let mapper_0_weight = state_dict["mapper.0.weight"].float().cpu()
-    let mapper_1_running_mean = state_dict["mapper.1.running_mean"].float().cpu()
-    let mapper_1_running_var = state_dict["mapper.1.running_var"].float().cpu()
-    let w_conv_mapper = mapper_0_weight.view(16, -1)
-    let w_bn_mapper = torch.diag(
-      torch.ones([1]).div(torch.sqrt(1e-5 + mapper_1_running_var)))
-    let fused_weight_mapper = torch.mm(w_bn_mapper, w_conv_mapper).numpy()
-    mapper.weight.copy(from: try! Tensor<Float>(numpy: fused_weight_mapper))
-    let b_bn_mapper =
-      -mapper_1_running_mean.div(
-        torch.sqrt(mapper_1_running_var + 1e-5))
-    mapper.bias.copy(from: try! Tensor<Float>(numpy: b_bn_mapper.numpy()))
   }
   return (Model([x], [out]), reader)
 }
 
-let graph = DynamicGraph()
-graph.withNoGrad {
-  /*
-  let img = graph.variable(try! Tensor<Float>(numpy: img.float().cpu().numpy())).toGPU(0)
-  let (effnet, effnetReader) = EfficientNetEncoder()
-  effnet.compile(inputs: img)
-  effnetReader(effnet_state_dict)
-  let imgOut = effnet(inputs: img)[0].as(of: Float.self)
-  debugPrint(imgOut)
-  */
-  /*
-  let x = graph.variable(try! Tensor<Float>(numpy: x.float().cpu().numpy())).toGPU(0)
-  let (stageAEncoder, stageAEncoderReader) = StageAEncoder(batchSize: 2)
-  stageAEncoder.compile(inputs: x)
-  stageAEncoderReader(state_dict)
-  let y = stageAEncoder(inputs: x)[0].as(of: Float.self)
-  let (stageADecoder, stageADecoderReader) = StageADecoder(batchSize: 2, height: 512, width: 512)
-  stageADecoder.compile(inputs: y)
-  stageADecoderReader(state_dict)
-  let out = stageADecoder(inputs: y)[0].as(of: Float.self)
-  debugPrint(out)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_a_f32.ckpt") {
-    $0.write("encoder", model: stageAEncoder)
-    $0.write("decoder", model: stageADecoder)
+func OpenCLIPTextModel(
+  vocabularySize: Int, maxLength: Int, embeddingSize: Int, numLayers: Int, numHeads: Int,
+  batchSize: Int, intermediateSize: Int
+) -> Model {
+  let tokens = Input()
+  let positions = Input()
+  let casualAttentionMask = Input()
+  let embedding = CLIPTextEmbedding(
+    FloatType.self, batchSize: batchSize,
+    vocabularySize: vocabularySize, maxLength: maxLength, embeddingSize: embeddingSize)
+  var out = embedding(tokens, positions)
+  let k = embeddingSize / numHeads
+  var penultimate: Model.IO = out
+  for i in 0..<numLayers {
+    if i == numLayers - 1 {
+      penultimate = out
+    }
+    let encoderLayer =
+      OpenCLIPEncoderLayer(
+        k: k, h: numHeads, b: batchSize, t: maxLength, intermediateSize: intermediateSize)
+    out = encoderLayer(out, casualAttentionMask)
   }
-  */
-  /*
-  let rTimeEmbed = rEmbedding(timesteps: 0.9936, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
-  let rZeros = rEmbedding(timesteps: 0, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
-  var rEmbed = Tensor<Float>(.CPU, .NC(2, 128))  // 192))
-  rEmbed[0..<2, 0..<64] = rTimeEmbed
-  rEmbed[0..<2, 64..<128] = rZeros
-  // rEmbed[0..<2, 128..<192] = rZeros
-  let rEmbedVariable = graph.variable(rEmbed).toGPU(0)
-  let x = graph.variable(try! Tensor<Float>(numpy: x.float().cpu().numpy())).toGPU(0)
-  let clipTextPooled = graph.variable(
-    try! Tensor<Float>(numpy: clip_text_pooled.float().cpu().numpy())
-  ).toGPU(0)
-  let effnet = graph.variable(try! Tensor<Float>(numpy: effnet.float().cpu().numpy())).toGPU(0)
-  let pixels = graph.variable(.GPU(0), .NCHW(2, 3, 8, 8), of: Float.self)
-  pixels.full(0)
-  let (stageBFixed, stageBFixedReader) = StageBFixed(batchSize: 2, height: 256, width: 256, effnetHeight: 24, effnetWidth: 24)
-  stageBFixed.compile(inputs: effnet, pixels, clipTextPooled)
-  stageBFixedReader(state_dict)
-  let kvs = stageBFixed(inputs: effnet, pixels, clipTextPooled).map { $0.as(of: Float.self) }
-  let (stageB, stageBReader) = StageB(
-    batchSize: 2, cIn: 4, height: 256, width: 256, effnetHeight: 24, effnetWidth: 24)
-  stageB.compile(inputs: [x, rEmbedVariable] + kvs)
-  stageBReader(state_dict)
-  let out = stageB(inputs: x, [rEmbedVariable] + kvs)[0].as(
-    of: Float.self)
-  debugPrint(out)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f32.ckpt") {
-    $0.write("stage_b_fixed", model: stageBFixed)
-    $0.write("stage_b", model: stageB)
-  }
-  */
-  /*
-  let rTimeEmbed = rEmbedding(timesteps: 0.9936, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
-  let rZeros = rEmbedding(timesteps: 0, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
-  var rEmbed = Tensor<Float>(.CPU, .NC(2, 192))
-  rEmbed[0..<2, 0..<64] = rTimeEmbed
-  rEmbed[0..<2, 64..<128] = rZeros
-  rEmbed[0..<2, 128..<192] = rZeros
-  let rEmbedVariable = graph.variable(rEmbed).toGPU(0)
-  let x = graph.variable(try! Tensor<Float>(numpy: x.float().cpu().numpy())).toGPU(0)
-  let clipTextPooled = graph.variable(
-    try! Tensor<Float>(numpy: clip_text_pooled.float().cpu().numpy())
-  ).toGPU(0)
-  let clipText = graph.variable(try! Tensor<Float>(numpy: clip_text.float().cpu().numpy())).toGPU(0)
-  let clipImg = graph.variable(try! Tensor<Float>(numpy: clip_img.float().cpu().numpy())).toGPU(0)
-  let (stageCFixed, stageCFixedReader) = StageCFixed(batchSize: 2, t: 77 + 8)
-  stageCFixed.compile(inputs: clipText, clipTextPooled, clipImg)
-  stageCFixedReader(state_dict)
-  let kvs = stageCFixed(inputs: clipText, clipTextPooled, clipImg).map { $0.as(of: Float.self) }
-  let (stageC, stageCReader) = StageC(batchSize: 2, height: 24, width: 24, t: 77 + 8)
-  stageC.compile(inputs: [x, rEmbedVariable] + kvs)
-  stageCReader(state_dict)
-  let out = stageC(inputs: x, [rEmbedVariable] + kvs)[0].as(
-    of: Float.self)
-  debugPrint(out)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32.ckpt") {
-    $0.write("effnet", model: effnet)
-    $0.write("stage_c_fixed", model: stageCFixed)
-    $0.write("stage_c", model: stageC)
-  }
-  */
+  let hiddenState = out
+  let finalLayerNorm = LayerNorm(epsilon: 1e-5, axis: [1])
+  out = finalLayerNorm(out)
+  return Model([tokens, positions, casualAttentionMask], [penultimate, out, hiddenState])
 }
 
-// print(models_b.stage_a.up_blocks)
+let tokenizer = CLIPTokenizer(
+  vocabulary: "examples/open_clip/vocab_16e6.json",
+  merges: "examples/open_clip/bpe_simple_vocab_16e6.txt")
+
+let prompt =
+  "cinematic photo of an anthropomorphic polar bear sitting in a cafe reading a book and having a coffee"
+let negativePrompt = ""
+
+let tokens = tokenizer.tokenize(text: prompt, truncation: true, maxLength: 77)
+let unconditionalTokens = tokenizer.tokenize(
+  text: negativePrompt, truncation: true, maxLength: 77)
+
+let graph = DynamicGraph()
+graph.maxConcurrency = .limit(1)
+
+let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
+let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
+for i in 0..<77 {
+  tokensTensor[i] = unconditionalTokens[i]
+  tokensTensor[i + 77] = tokens[i]
+  positionTensor[i] = Int32(i)
+  positionTensor[i + 77] = Int32(i)
+}
+
+let casualAttentionMask = graph.variable(Tensor<FloatType>(.CPU, .NHWC(2, 1, 77, 77)))
+casualAttentionMask.full(0)
+var lastToken: Int? = nil
+var lastUnconditionalToken: Int? = nil
+for i in 0..<77 {
+  if i < 76 {
+    for j in (i + 1)..<77 {
+      casualAttentionMask[0, 0, i, j] = -FloatType.greatestFiniteMagnitude
+      casualAttentionMask[1, 0, i, j] = -FloatType.greatestFiniteMagnitude
+    }
+  }
+  if let lastUnconditionalToken = lastUnconditionalToken {
+    for j in (lastUnconditionalToken + 1)..<(i + 1) {
+      casualAttentionMask[0, 0, i, j] = -FloatType.greatestFiniteMagnitude
+    }
+  }
+  if lastUnconditionalToken == nil, unconditionalTokens[i] == tokenizer.endToken {
+    lastUnconditionalToken = i
+  }
+  if let lastToken = lastToken {
+    for j in (lastToken + 1)..<(i + 1) {
+      casualAttentionMask[1, 0, i, j] = -FloatType.greatestFiniteMagnitude
+    }
+  }
+  if lastToken == nil, tokens[i] == tokenizer.endToken {
+    lastToken = i
+  }
+}
+
+let (c, pooled) = graph.withNoGrad {
+  let tokensTensorGPU = tokensTensor.toGPU(0)
+  let positionTensorGPU = positionTensor.toGPU(0)
+  let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
+  let textModel = OpenCLIPTextModel(
+    vocabularySize: 49408, maxLength: 77, embeddingSize: 1280, numLayers: 32, numHeads: 20,
+    batchSize: 2, intermediateSize: 5120)
+  let textProjection = graph.variable(.GPU(0), .NC(1280, 1280), of: FloatType.self)
+  textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
+  graph.openStore("/home/liu/workspace/swift-diffusion/open_clip_vit_bigg14_f16.ckpt") {
+    $0.read("text_model", model: textModel)
+    $0.read("text_projection", variable: textProjection)
+  }
+  let c = textModel(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU).map {
+    $0.as(of: FloatType.self)
+  }
+  var pooled = graph.variable(.GPU(0), .NC(2, 1280), of: FloatType.self)
+  let c0 = c[2].reshaped(.CHW(2, 77, 1280))
+  for (i, token) in tokens.enumerated() {
+    if token == tokenizer.endToken {
+      pooled[1..<2, 0..<1280] = c[1][(77 + i)..<(77 + i + 1), 0..<1280] * textProjection
+      break
+    }
+  }
+  for (i, token) in unconditionalTokens.enumerated() {
+    if token == tokenizer.endToken {
+      pooled[0..<1, 0..<1280] = c[1][i..<(i + 1), 0..<1280] * textProjection
+      break
+    }
+  }
+  return (c0, pooled)
+}
+
+let stageCA: [Float] = [
+  0.0100, 0.0390, 0.0783, 0.1182, 0.1590, 0.2011, 0.2448, 0.2904, 0.3383, 0.3890, 0.4428, 0.5001,
+  0.5610, 0.6254, 0.6928, 0.7619, 0.8302, 0.8937, 0.9471, 0.9843, 0.9998,
+]
+let stageCB: [Float] = [
+  0.9999, 0.9992, 0.9969, 0.9930, 0.9873, 0.9796, 0.9696, 0.9569, 0.9410, 0.9212, 0.8966, 0.8660,
+  0.8278, 0.7803, 0.7211, 0.6476, 0.5574, 0.4486, 0.3209, 0.1767, 0.0200,
+]
+let stageCNoiseCond: [Float] = [
+  0.9936, 0.9750, 0.9497, 0.9240, 0.8975, 0.8701, 0.8413, 0.8110, 0.7785, 0.7436, 0.7056, 0.6640,
+  0.6179, 0.5665, 0.5089, 0.4441, 0.3715, 0.2906, 0.2018, 0.1063,
+]
+
+let stageBA: [Float] = [
+  0.0100, 0.1552, 0.3067, 0.4507, 0.5838, 0.7027, 0.8047, 0.8871, 0.9480, 0.9859, 0.9999,
+]
+let stageBB: [Float] = [
+  0.9999, 0.9879, 0.9518, 0.8927, 0.8119, 0.7114, 0.5937, 0.4616, 0.3183, 0.1671, 0.0100,
+]
+let stageBNoiseCond: [Float] = [
+  0.9936, 0.9000, 0.8000, 0.7000, 0.6000, 0.5000, 0.4000, 0.3000, 0.2000, 0.1000,
+]
+
+graph.withNoGrad {
+  var x = graph.variable(.GPU(0), .NCHW(1, 16, 24, 24), of: FloatType.self)
+  x.randn(std: 1, mean: 0)
+  let rZeros = rEmbedding(timesteps: 0, batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
+  var rEmbed = Tensor<Float>(.CPU, .NC(2, 192))
+  rEmbed[0..<2, 64..<128] = rZeros
+  rEmbed[0..<2, 128..<192] = rZeros
+  var input = graph.variable(.GPU(0), .NCHW(2, 16, 24, 24), of: FloatType.self)
+  let clipText = c
+  let clipTextPooled = pooled.reshaped(.CHW(2, 1, 1280))
+  let clipImg = graph.variable(.GPU(0), .CHW(2, 1, 1280), of: FloatType.self)
+  clipImg.full(0)
+  let (stageCFixed, _) = StageCFixed(batchSize: 2, t: 77 + 8)
+  stageCFixed.compile(inputs: clipText, clipTextPooled, clipImg)
+  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32.ckpt") {
+    $0.read("stage_c_fixed", model: stageCFixed)
+  }
+  let stageCKvs = stageCFixed(inputs: clipText, clipTextPooled, clipImg).map {
+    $0.as(of: FloatType.self)
+  }
+  let (stageC, _) = StageC(batchSize: 2, height: 24, width: 24, t: 77 + 8)
+  var rEmbedVariable = graph.variable(rEmbed).toGPU(0)
+  stageC.compile(inputs: [input, rEmbedVariable] + stageCKvs)
+  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32.ckpt") {
+    $0.read("stage_c", model: stageC)
+  }
+  for i in 0..<20 {
+    let rTimeEmbed = rEmbedding(
+      timesteps: stageCNoiseCond[i], batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
+    rEmbed[0..<2, 0..<64] = rTimeEmbed
+    let rEmbedVariable = graph.variable(rEmbed).toGPU(0)
+    input[0..<1, 0..<16, 0..<24, 0..<24] = x
+    input[1..<2, 0..<16, 0..<24, 0..<24] = x
+    let out = stageC(inputs: x, [rEmbedVariable] + stageCKvs)[0].as(
+      of: FloatType.self)
+    let etUncond = out[0..<1, 0..<16, 0..<24, 0..<24]
+    let etCond = out[1..<2, 0..<16, 0..<24, 0..<24]
+    let et = etUncond + 3.0 * (etCond - etUncond)
+    let a = stageCA[i]
+    let b = stageCB[i]
+    let a_prev = stageCA[i + 1]
+    let b_prev = stageCB[i + 1]
+    x = (a_prev / a) * x + (b_prev - a_prev * b / a) * et
+  }
+
+  rEmbed = Tensor<Float>(.CPU, .NC(2, 128))
+  rEmbed[0..<2, 64..<128] = rZeros
+  var effnet = graph.variable(.GPU(0), .NCHW(2, 16, 24, 24), of: FloatType.self)
+  effnet.full(0)
+  effnet[1..<2, 0..<16, 0..<24, 0..<24] = x
+  x = graph.variable(.GPU(0), .NCHW(1, 4, 256, 256), of: FloatType.self)
+  x.randn(std: 1, mean: 0)
+  let (stageBFixed, _) = StageBFixed(
+    batchSize: 2, height: 256, width: 256, effnetHeight: 24, effnetWidth: 24)
+  let pixels = graph.variable(.GPU(0), .NCHW(2, 3, 8, 8), of: Float.self)
+  pixels.full(0)
+  stageBFixed.compile(inputs: effnet, pixels, clipTextPooled)
+  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f32.ckpt") {
+    $0.read("stage_b_fixed", model: stageBFixed)
+  }
+  let stageBKvs = stageBFixed(inputs: effnet, pixels, clipTextPooled).map {
+    $0.as(of: FloatType.self)
+  }
+  let (stageB, _) = StageB(
+    batchSize: 2, cIn: 4, height: 256, width: 256, effnetHeight: 24, effnetWidth: 24)
+  rEmbedVariable = graph.variable(rEmbed).toGPU(0)
+  input = graph.variable(.GPU(0), .NCHW(2, 4, 256, 256), of: FloatType.self)
+  stageB.compile(inputs: [input, rEmbedVariable] + stageBKvs)
+  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f32.ckpt") {
+    $0.read("stage_b", model: stageB)
+  }
+  for i in 0..<10 {
+    let rTimeEmbed = rEmbedding(
+      timesteps: stageBNoiseCond[i], batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
+    rEmbed[0..<2, 0..<64] = rTimeEmbed
+    let rEmbedVariable = graph.variable(rEmbed).toGPU(0)
+    input[0..<1, 0..<4, 0..<256, 0..<256] = x
+    input[1..<2, 0..<4, 0..<256, 0..<256] = x
+    let out = stageB(inputs: input, [rEmbedVariable] + stageBKvs)[0].as(
+      of: FloatType.self)
+    let etUncond = out[0..<1, 0..<4, 0..<256, 0..<256]
+    let etCond = out[1..<2, 0..<4, 0..<256, 0..<256]
+    let et = etUncond + 1.1 * (etCond - etUncond)
+    let a = stageBA[i]
+    let b = stageBB[i]
+    let a_prev = stageBA[i + 1]
+    let b_prev = stageBB[i + 1]
+    x = (a_prev / a) * x + (b_prev - a_prev * b / a) * et
+  }
+
+  let (stageADecoder, _) = StageADecoder(batchSize: 1, height: 512, width: 512)
+  stageADecoder.compile(inputs: 0.43 * x)
+  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_a_f32.ckpt") {
+    $0.read("decoder", model: stageADecoder)
+  }
+  let img = stageADecoder(inputs: x)[0].as(of: FloatType.self).toCPU()
+  debugPrint(img)
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 1024 * 1024)
+  for y in 0..<1024 {
+    for x in 0..<1024 {
+      let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
+      rgba[y * 1024 + x].r = UInt8(
+        min(max(Int(Float(r) * 255), 0), 255))
+      rgba[y * 1024 + x].g = UInt8(
+        min(max(Int(Float(g) * 255), 0), 255))
+      rgba[y * 1024 + x].b = UInt8(
+        min(max(Int(Float(b) * 255), 0), 255))
+    }
+  }
+  let image = PNG.Data.Rectangular(
+    packing: rgba, size: (1024, 1024),
+    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+  try! image.compress(path: "/home/liu/workspace/swift-diffusion/wurstchen.png", level: 4)
+}

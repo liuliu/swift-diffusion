@@ -13,7 +13,7 @@ public func CLIPTextEmbedding<T: TensorNumeric>(
     T.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize)
   let positionEmbed = Embedding(T.self, vocabularySize: maxLength, embeddingSize: embeddingSize)
   let embedding = tokenEmbed(tokens) + positionEmbed(positions)
-  return Model([tokens, positions], [embedding], name: "embeddings")
+  return Model([tokens, positions], [embedding])
 }
 
 func CLIPAttention(k: Int, h: Int, b: Int, t: Int) -> Model {

@@ -611,8 +611,8 @@ swift_binary(
 )
 
 swift_binary(
-    name = "wurstchen",
-    srcs = ["wurstchen/main.swift"],
+    name = "wurstchen_converter",
+    srcs = ["wurstchen_converter/main.swift"],
     data = [
     ],
     deps = [
@@ -622,5 +622,20 @@ swift_binary(
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
         "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
+    name = "wurstchen",
+    srcs = ["wurstchen/main.swift"],
+    data = [
+        "open_clip/bpe_simple_vocab_16e6.txt",
+        "open_clip/vocab_16e6.json",
+    ],
+    deps = [
+        "//:diffusion",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
     ],
 )
