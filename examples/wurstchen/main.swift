@@ -906,28 +906,45 @@ let (c, pooled) = graph.withNoGrad {
 
 DynamicGraph.setSeed(42)
 
-let stageCA: [Float] = [
-  0.0100, 0.0390, 0.0783, 0.1182, 0.1590, 0.2011, 0.2448, 0.2904, 0.3383, 0.3890, 0.4428, 0.5001,
-  0.5610, 0.6254, 0.6928, 0.7619, 0.8302, 0.8937, 0.9471, 0.9843, 1.0000,
-]
-let stageCB: [Float] = [
-  0.9999, 0.9992, 0.9969, 0.9930, 0.9873, 0.9796, 0.9696, 0.9569, 0.9410, 0.9212, 0.8966, 0.8660,
-  0.8278, 0.7803, 0.7211, 0.6476, 0.5574, 0.4486, 0.3209, 0.1767, 0.0000,
-]
-let stageCNoiseCond: [Float] = [
-  0.9936, 0.9750, 0.9497, 0.9240, 0.8975, 0.8701, 0.8413, 0.8110, 0.7785, 0.7436, 0.7056, 0.6640,
-  0.6179, 0.5665, 0.5089, 0.4441, 0.3715, 0.2906, 0.2018, 0.1063,
-]
+struct CosineSchedule {
+  private let s: Double
+  private let range: ClosedRange<Double>
+  private let minVar: Double
+  init(s: Double = 0.008, range: ClosedRange<Double> = 0.0001...0.9999) {
+    self.s = s
+    self.range = range
+    let minStd = cos(s / (1 + s) * Double.pi * 0.5)
+    self.minVar = minStd * minStd
+  }
+  public func schedule(steps: Int, shift: Double = 1.0) -> [Double] {
+    var alphasCumprod = [Double]()
+    for i in 0..<steps {
+      let t = Double(steps - i) / Double(steps)
+      let std = min(max(cos((s + t) / (1 + s) * Double.pi * 0.5), 0), 1)
+      let v = min(max((std * std) / minVar, range.lowerBound), range.upperBound)
+      if shift != 1 {
+        // Simplify Sigmoid[Log[x / (1 - x)] + 2 * Log[1 / shift]]
+        let shiftedV = 1.0 / (1.0 + shift * shift * (1.0 - v) / v)
+        alphasCumprod.append(min(max(shiftedV, range.lowerBound), range.upperBound))
+      } else {
+        alphasCumprod.append(v)
+      }
+    }
+    return alphasCumprod
+  }
+  public func noise(alphaCumprod: Double) -> Double {
+    let t = acos((alphaCumprod * minVar).squareRoot()) / (Double.pi * 0.5) * (1 + s) - s
+    return t
+  }
+}
 
-let stageBA: [Float] = [
-  0.0100, 0.1552, 0.3067, 0.4507, 0.5838, 0.7027, 0.8047, 0.8871, 0.9480, 0.9859, 1.0000,
-]
-let stageBB: [Float] = [
-  0.9999, 0.9879, 0.9518, 0.8927, 0.8119, 0.7114, 0.5937, 0.4616, 0.3183, 0.1671, 0.0000,
-]
-let stageBNoiseCond: [Float] = [
-  0.9936, 0.9000, 0.8000, 0.7000, 0.6000, 0.5000, 0.4000, 0.3000, 0.2000, 0.1000,
-]
+let schedule = CosineSchedule()
+let stageCSteps = 20
+var stageCAlphasCumprod = schedule.schedule(steps: stageCSteps, shift: 2)
+stageCAlphasCumprod.append(1.0)
+let stageBSteps = 10
+var stageBAlphasCumprod = schedule.schedule(steps: stageBSteps)
+stageBAlphasCumprod.append(1.0)
 
 graph.withNoGrad {
   var x = graph.variable(.GPU(0), .NCHW(1, 16, 24, 24), of: FloatType.self)
@@ -955,9 +972,10 @@ graph.withNoGrad {
   graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32.ckpt") {
     $0.read("stage_c", model: stageC)
   }
-  for i in 0..<20 {
+  for i in 0..<stageCSteps {
     let rTimeEmbed = rEmbedding(
-      timesteps: stageCNoiseCond[i], batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
+      timesteps: Float(schedule.noise(alphaCumprod: stageCAlphasCumprod[i])), batchSize: 2,
+      embeddingSize: 64, maxPeriod: 10_000)
     rEmbed[0..<2, 0..<64] = rTimeEmbed
     let rEmbedVariable = graph.variable(rEmbed).toGPU(0)
     input[0..<1, 0..<16, 0..<24, 0..<24] = x
@@ -967,10 +985,10 @@ graph.withNoGrad {
     let etUncond = out[0..<1, 0..<16, 0..<24, 0..<24]
     let etCond = out[1..<2, 0..<16, 0..<24, 0..<24]
     let et = etUncond + 3.0 * (etCond - etUncond)
-    let a = stageCA[i]
-    let b = stageCB[i]
-    let a_prev = stageCA[i + 1]
-    let b_prev = stageCB[i + 1]
+    let a = Float(stageCAlphasCumprod[i].squareRoot())
+    let b = Float((1 - stageCAlphasCumprod[i]).squareRoot())
+    let a_prev = Float(stageCAlphasCumprod[i + 1].squareRoot())
+    let b_prev = Float((1 - stageCAlphasCumprod[i + 1]).squareRoot())
     x = (a_prev / a) * x + (b_prev - a_prev * b / a) * et
   }
 
@@ -1000,9 +1018,10 @@ graph.withNoGrad {
   graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f32.ckpt") {
     $0.read("stage_b", model: stageB)
   }
-  for i in 0..<10 {
+  for i in 0..<stageBSteps {
     let rTimeEmbed = rEmbedding(
-      timesteps: stageBNoiseCond[i], batchSize: 2, embeddingSize: 64, maxPeriod: 10_000)
+      timesteps: Float(schedule.noise(alphaCumprod: stageBAlphasCumprod[i])), batchSize: 2,
+      embeddingSize: 64, maxPeriod: 10_000)
     rEmbed[0..<2, 0..<64] = rTimeEmbed
     let rEmbedVariable = graph.variable(rEmbed).toGPU(0)
     input[0..<1, 0..<4, 0..<256, 0..<256] = x
@@ -1012,10 +1031,10 @@ graph.withNoGrad {
     let etUncond = out[0..<1, 0..<4, 0..<256, 0..<256]
     let etCond = out[1..<2, 0..<4, 0..<256, 0..<256]
     let et = etUncond + 1.1 * (etCond - etUncond)
-    let a = stageBA[i]
-    let b = stageBB[i]
-    let a_prev = stageBA[i + 1]
-    let b_prev = stageBB[i + 1]
+    let a = Float(stageBAlphasCumprod[i].squareRoot())
+    let b = Float((1.0 - stageBAlphasCumprod[i]).squareRoot())
+    let a_prev = Float(stageBAlphasCumprod[i + 1].squareRoot())
+    let b_prev = Float((1.0 - stageBAlphasCumprod[i + 1]).squareRoot())
     x = (a_prev / a) * x + (b_prev - a_prev * b / a) * et
   }
 
