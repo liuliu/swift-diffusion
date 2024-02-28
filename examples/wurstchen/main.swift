@@ -882,7 +882,9 @@ let (c, pooled) = graph.withNoGrad {
     batchSize: 2, intermediateSize: 5120)
   let textProjection = graph.variable(.GPU(0), .NC(1280, 1280), of: FloatType.self)
   textModel.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/open_clip_vit_bigg14_f16.ckpt") {
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/open_clip_vit_bigg14_f16.ckpt", flags: .readOnly
+  ) {
     $0.read("text_model", model: textModel)
     $0.read("text_projection", variable: textProjection)
   }
@@ -944,7 +946,7 @@ let schedule = CosineSchedule()
 let stageCSteps = 20
 var stageCAlphasCumprod = schedule.schedule(steps: stageCSteps, shift: 2)
 stageCAlphasCumprod.append(1.0)
-let stageBSteps = 10
+let stageBSteps = 20
 var stageBAlphasCumprod = schedule.schedule(steps: stageBSteps)
 stageBAlphasCumprod.append(1.0)
 
@@ -962,8 +964,15 @@ graph.withNoGrad {
   clipImg.full(0)
   let (stageCFixed, _) = StageCFixed(batchSize: 2, t: 77 + 8)
   stageCFixed.compile(inputs: clipText, clipTextPooled, clipImg)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f16_f32.ckpt") {
-    $0.read("stage_c_fixed", model: stageCFixed)
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_q6p_q8p.ckpt", flags: .readOnly
+  ) {
+    $0.read("stage_c_fixed", model: stageCFixed, codec: [.q6p, .q8p, .ezm7]) { name, _, _, _ in
+      guard name.hasPrefix("__stage_c_fixed__") else { return .continue(name) }
+      guard name.contains(".keys") || name.contains(".values") else { return .continue(name) }
+      let name = "__stage_c__" + name.dropFirst(17)
+      return .continue(name)
+    }
   }
   let stageCKvs = stageCFixed(inputs: clipText, clipTextPooled, clipImg).map {
     $0.as(of: FloatType.self)
@@ -971,8 +980,10 @@ graph.withNoGrad {
   let (stageC, _) = StageC(batchSize: 2, height: 24, width: 24, t: 77 + 8)
   var rEmbedVariable = graph.variable(Tensor<FloatType>(from: rEmbed)).toGPU(0)
   stageC.compile(inputs: [input, rEmbedVariable] + stageCKvs)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f16_f32.ckpt") {
-    $0.read("stage_c", model: stageC)
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_q6p_q8p.ckpt", flags: .readOnly
+  ) {
+    $0.read("stage_c", model: stageC, codec: [.q6p, .q8p, .ezm7])
   }
   for i in 0..<stageCSteps {
     let rTimeEmbed = rEmbedding(
@@ -1006,8 +1017,16 @@ graph.withNoGrad {
   let pixels = graph.variable(.GPU(0), .NCHW(2, 3, 8, 8), of: FloatType.self)
   pixels.full(0)
   stageBFixed.compile(inputs: effnet, pixels, clipTextPooled)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f32.ckpt") {
-    $0.read("stage_b_fixed", model: stageBFixed)
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_q6p_q8p.ckpt", flags: .readOnly
+  ) {
+    $0.read("stage_b_fixed", model: stageBFixed, codec: [.q6p, .q8p, .ezm7]) { name, _, _, _ in
+      guard name.hasPrefix("__stage_b_fixed__") else { return .continue(name) }
+      guard name.contains(".keys") || name.contains(".values") else { return .continue(name) }
+      let name = "__stage_b__" + name.dropFirst(17)
+      return .continue(name)
+    }
+
   }
   let stageBKvs = stageBFixed(inputs: effnet, pixels, clipTextPooled).map {
     $0.as(of: FloatType.self)
@@ -1017,8 +1036,10 @@ graph.withNoGrad {
   rEmbedVariable = graph.variable(Tensor<FloatType>(from: rEmbed)).toGPU(0)
   input = graph.variable(.GPU(0), .NCHW(2, 4, 256, 256), of: FloatType.self)
   stageB.compile(inputs: [input, rEmbedVariable] + stageBKvs)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f32.ckpt") {
-    $0.read("stage_b", model: stageB)
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_q6p_q8p.ckpt", flags: .readOnly
+  ) {
+    $0.read("stage_b", model: stageB, codec: [.q6p, .q8p, .ezm7])
   }
   for i in 0..<stageBSteps {
     let rTimeEmbed = rEmbedding(
@@ -1043,8 +1064,10 @@ graph.withNoGrad {
   let (stageADecoder, _) = StageADecoder(batchSize: 1, height: 512, width: 512)
   x = 0.43 * x
   stageADecoder.compile(inputs: x)
-  graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_a_f32.ckpt") {
-    $0.read("decoder", model: stageADecoder)
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_a_hq_f16.ckpt", flags: .readOnly
+  ) {
+    $0.read("decoder", model: stageADecoder, codec: [.q6p, .q8p, .ezm7])
   }
   let img = stageADecoder(inputs: x)[0].as(of: FloatType.self).toCPU()
   debugPrint(img)
@@ -1063,5 +1086,6 @@ graph.withNoGrad {
   let image = PNG.Data.Rectangular(
     packing: rgba, size: (1024, 1024),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
-  try! image.compress(path: "/home/liu/workspace/swift-diffusion/wurstchen.png", level: 4)
+  try! image.compress(
+    path: "/home/liu/workspace/swift-diffusion/wurstchen_q6p_q8p_hq.png", level: 4)
 }
