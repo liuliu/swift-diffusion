@@ -58,7 +58,8 @@ func ResBlock(
 }
 
 func TimestepBlock(
-  prefix: String, batchSize: Int, timeEmbedSize: Int, channels: Int, tConds: [String]
+  prefix: String, batchSize: Int, timeEmbedSize: Int, channels: Int, tConds: [String],
+  of dataType: DataType? = nil
 ) -> (
   Model, (PythonObject) -> Void
 ) {
@@ -78,6 +79,9 @@ func TimestepBlock(
           [batchSize, timeEmbedSize], offset: [0, timeEmbedSize * (i + 1)],
           strides: [timeEmbedSize * (tConds.count + 1), 1]))
     otherMappers.append(otherMapper)
+  }
+  if let dataType = dataType {
+    gate = gate.to(dataType)
   }
   var out: Model.IO = x
   out =
@@ -282,14 +286,16 @@ func StageC(batchSize: Int, height: Int, width: Int, t: Int) -> (Model, (PythonO
         out = resBlock(out)
       }
       skip = nil
+      let timestepBlockDataType: DataType?
+      if i == 2 - 1 && j > 0 {
+        timestepBlockDataType = .Float32
+      } else {
+        timestepBlockDataType = nil
+      }
       let (timestepBlock, timestepBlockReader) = TimestepBlock(
         prefix: "up_blocks.\(i).\(j * 3 + 1)", batchSize: batchSize, timeEmbedSize: 64,
-        channels: 2048, tConds: ["sca", "crp"])
+        channels: 2048, tConds: ["sca", "crp"], of: timestepBlockDataType)
       readers.append(timestepBlockReader)
-      var rEmbed: Model.IO = rEmbed
-      if i == 2 - 1 && j > 0 {
-        rEmbed = rEmbed.to(.Float32)
-      }
       out = timestepBlock(out, rEmbed)
       let attnBlockDataType: DataType?
       if i == 2 - 1 && j > 0 {
