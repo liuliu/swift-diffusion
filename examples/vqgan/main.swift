@@ -2,7 +2,7 @@ import Foundation
 import NNC
 
 var df = DataFrame(
-  fromCSV: "/home/liu/workspace/swift-diffusion/sdxl_vae_regression.csv", automaticUseHeader: false)!
+  fromCSV: "/home/liu/workspace/swift-diffusion/wurstchen_stage_a.csv", automaticUseHeader: false)!
 
 let graph = DynamicGraph()
 
@@ -11,7 +11,7 @@ let linear = Dense(count: 3)
 var adamOptimizer = AdamOptimizer(graph, rate: 0.01)
 adamOptimizer.parameters = [linear.parameters]
 
-let scaleFactor: Float = 0.13025
+let scaleFactor: Float = 1.0 / 0.43
 
 df["x"] = df["0", "1", "2", "3"].map {
   (c0: String, c1: String, c2: String, c3: String) -> Tensor<Float> in

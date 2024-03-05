@@ -1,3 +1,4 @@
+import C_ccv
 import Diffusion
 import Foundation
 import NNC
@@ -825,7 +826,7 @@ let tokenizer = CLIPTokenizer(
   merges: "examples/open_clip/bpe_simple_vocab_16e6.txt")
 
 let prompt =
-  "cinematic photo of an anthropomorphic polar bear sitting in a cafe reading a book and having a coffee"
+  " A painting of a woman sitting in a field of flowers. She is wearing a red dress and a crown on her head. The woman is surrounded by a variety of flowers, including daisies, roses, and tulips. The painting is done in a very detailed style, capturing the woman's features and the beauty of the flowers in the field."
 let negativePrompt = ""
 
 let tokens = tokenizer.tokenize(text: prompt, truncation: true, maxLength: 77)
@@ -834,7 +835,66 @@ let unconditionalTokens = tokenizer.tokenize(
 
 let graph = DynamicGraph()
 graph.maxConcurrency = .limit(1)
-
+/*
+graph.withNoGrad {
+  var df = DataFrame(fromCSV: "/home/liu/workspace/swift-diffusion/files.txt", automaticUseHeader: false)!
+  df["image"] = df["0"].toLoadImage()
+  df["resize"] = df["image"]!.toImageJitter(Float.self, size: ImageJitter.Size(rows: 768, cols: 768), resize: ImageJitter.Resize(min: 768, max: 768), centerCrop: true, normalize: ImageJitter.Normalize(mean: [0, 0, 0], std: [255, 255, 255]))
+  DynamicGraph.setSeed(0)
+  df.shuffle()
+  let (stageAEncoder, _) = StageAEncoder(batchSize: 1)
+  let (stageADecoder, _) = StageADecoder(batchSize: 1, height: 384, width: 384)
+  var loadedEncoder = false
+  var loadedDecoder = false
+  for (i, batch) in df["resize", Tensor<Float>.self].enumerated() {
+    let initImage = graph.variable(Tensor<FloatType>(from: batch.reshaped(.NCHW(1, 768, 768, 3))).toGPU(0)).permuted(0, 3, 1, 2).copied()
+    if !loadedEncoder {
+      stageAEncoder.compile(inputs: initImage)
+      graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_a_hq_f16.ckpt") {
+        $0.read("encoder", model: stageAEncoder)
+      }
+      loadedEncoder = true
+    }
+    let encodedImage = stageAEncoder(inputs: initImage)[0].as(of: FloatType.self)[0..<1, 0..<4, 0..<192, 0..<192].copied()
+    if !loadedDecoder {
+      stageADecoder.compile(inputs: encodedImage)
+      graph.openStore("/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_a_hq_f16.ckpt") {
+        $0.read("decoder", model: stageADecoder)
+      }
+      loadedDecoder = true
+    }
+    var result = stageADecoder(inputs: encodedImage)[0].as(of: FloatType.self)
+    result = result.toCPU()
+    let u8Img = ccv_dense_matrix_new(768, 768, Int32(CCV_8U | CCV_C3), nil, 0)!
+    for y in 0..<768 {
+      for x in 0..<768 {
+        let (r, g, b) = (result[0, 0, y, x], result[0, 1, y, x], result[0, 2, y, x])
+        u8Img.pointee.data.u8[y * 768 * 3 + x * 3] = UInt8(
+          min(max(Int(Float(r) * 255), 0), 255))
+        u8Img.pointee.data.u8[y * 768 * 3 + x * 3 + 1] = UInt8(
+          min(max(Int(Float(g) * 255), 0), 255))
+        u8Img.pointee.data.u8[y * 768 * 3 + x * 3 + 2] = UInt8(
+          min(max(Int(Float(b) * 255), 0), 255))
+      }
+    }
+    let encodedImageCPU = encodedImage.toCPU()
+    var smallerImg: UnsafeMutablePointer<ccv_dense_matrix_t>? = nil
+    ccv_resample(u8Img, &smallerImg, 0, 0.25, 0.25, Int32(CCV_INTER_AREA))
+    /*
+    // var data = "/home/liu/workspace/swift-diffusion/small_\(i).png".data(using: String.Encoding.utf8)!
+    // data.withUnsafeMutableBytes {
+    //   ccv_write(smallerImg, $0, nil, Int32(CCV_IO_PNG_FILE), nil)
+    // }
+    */
+    for y in 0..<192 {
+      for x in 0..<192 {
+        print("\(encodedImageCPU[0, 0, y, x]),\(encodedImageCPU[0, 1, y, x]),\(encodedImageCPU[0, 2, y, x]),\(encodedImageCPU[0, 3, y, x]),\(smallerImg!.pointee.data.u8[y * 192 * 3 + x * 3]),\(smallerImg!.pointee.data.u8[y * 192 * 3 + x * 3 + 1]),\(smallerImg!.pointee.data.u8[y * 192 * 3 + x * 3 + 2])")
+      }
+    }
+  }
+}
+exit(0)
+*/
 let tokensTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(2 * 77), of: Int32.self)
 for i in 0..<77 {
@@ -965,7 +1025,7 @@ graph.withNoGrad {
   let (stageCFixed, _) = StageCFixed(batchSize: 2, t: 77 + 8)
   stageCFixed.compile(inputs: clipText, clipTextPooled, clipImg)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_q6p_q8p.ckpt", flags: .readOnly
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f16.ckpt", flags: .readOnly
   ) {
     $0.read("stage_c_fixed", model: stageCFixed, codec: [.q6p, .q8p, .ezm7]) { name, _, _, _ in
       guard name.hasPrefix("__stage_c_fixed__") else { return .continue(name) }
@@ -981,7 +1041,7 @@ graph.withNoGrad {
   var rEmbedVariable = graph.variable(Tensor<FloatType>(from: rEmbed)).toGPU(0)
   stageC.compile(inputs: [input, rEmbedVariable] + stageCKvs)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_q6p_q8p.ckpt", flags: .readOnly
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f16.ckpt", flags: .readOnly
   ) {
     $0.read("stage_c", model: stageC, codec: [.q6p, .q8p, .ezm7])
   }
@@ -1018,7 +1078,7 @@ graph.withNoGrad {
   pixels.full(0)
   stageBFixed.compile(inputs: effnet, pixels, clipTextPooled)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_q6p_q8p.ckpt", flags: .readOnly
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f16.ckpt", flags: .readOnly
   ) {
     $0.read("stage_b_fixed", model: stageBFixed, codec: [.q6p, .q8p, .ezm7]) { name, _, _, _ in
       guard name.hasPrefix("__stage_b_fixed__") else { return .continue(name) }
@@ -1037,7 +1097,7 @@ graph.withNoGrad {
   input = graph.variable(.GPU(0), .NCHW(2, 4, 256, 256), of: FloatType.self)
   stageB.compile(inputs: [input, rEmbedVariable] + stageBKvs)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_q6p_q8p.ckpt", flags: .readOnly
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_b_f16.ckpt", flags: .readOnly
   ) {
     $0.read("stage_b", model: stageB, codec: [.q6p, .q8p, .ezm7])
   }
@@ -1087,5 +1147,5 @@ graph.withNoGrad {
     packing: rgba, size: (1024, 1024),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
   try! image.compress(
-    path: "/home/liu/workspace/swift-diffusion/wurstchen_q6p_q8p_hq.png", level: 4)
+    path: "/home/liu/workspace/swift-diffusion/wurstchen_f16_hq.png", level: 4)
 }
