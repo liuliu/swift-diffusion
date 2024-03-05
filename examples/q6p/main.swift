@@ -3,17 +3,20 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/fooocus_inpaint_sd_xl_v2.6_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/fooocus_inpaint_sd_xl_v2.6_q6p_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32_q6p_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
-      guard let tensor = store.read(key) else { continue }
-      if key.contains("visual_proj") {
+      guard let tensor = (store.read(key).map { Tensor<Float16>(from: $0) }) else { continue }
+      if key.contains("__stage_c_fixed__") && (key.contains("key") || key.contains("value")) {
+        continue
+      }
+      if key.contains("text_emb") || key.contains("effnet") || key.contains("previewer") {
         $0.write(key, tensor: tensor)
         continue
       }
@@ -32,6 +35,25 @@ graph.openStore(
       } else {
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
+      /*
+      if keys.contains("vision_proj") {
+        if shape.count == 2 && n > 1 {
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+        } else if shape.count == 4 && n > 1 {
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+        } else {
+          $0.write(key, tensor: tensor, codec: [.ezm7])
+        }
+      } else {
+        if shape.count == 2 && n > 1 {
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+        } else if shape.count == 4 && n > 1 {
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+        } else {
+          $0.write(key, tensor: tensor, codec: [.ezm7])
+        }
+      }
+      */
     }
   }
 }

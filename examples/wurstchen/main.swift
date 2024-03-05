@@ -7,7 +7,9 @@ import PNG
 public enum PythonObject {}
 public typealias FloatType = Float16
 
-func ResBlock(prefix: String, batchSize: Int, channels: Int, skip: Bool) -> (
+func ResBlock(
+  prefix: String, batchSize: Int, channels: Int, skip: Bool, of dataType: DataType? = nil
+) -> (
   Model, (PythonObject) -> Void
 ) {
   let x = Input()
@@ -17,6 +19,9 @@ func ResBlock(prefix: String, batchSize: Int, channels: Int, skip: Bool) -> (
   var out = depthwise(x)
   let norm = LayerNorm(epsilon: 1e-6, axis: [1], elementwiseAffine: false)
   out = norm(out)
+  if let dataType = dataType {
+    out = out.to(dataType)
+  }
   let xSkip: Input?
   if skip {
     let xSkipIn = Input()
@@ -38,7 +43,11 @@ func ResBlock(prefix: String, batchSize: Int, channels: Int, skip: Bool) -> (
   out = gamma .* (out .* Nx) + beta + out
   let convOut = Convolution(
     groups: 1, filters: channels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  out = convOut(out) + x
+  if dataType != nil {
+    out = convOut(out).to(of: x) + x
+  } else {
+    out = convOut(out) + x
+  }
   let reader: (PythonObject) -> Void = { state_dict in
   }
   if let xSkip = xSkip {
@@ -112,21 +121,29 @@ func MultiHeadAttention(prefix: String, k: Int, h: Int, b: Int, hw: Int, t: Int)
 }
 
 func AttnBlock(
-  prefix: String, batchSize: Int, channels: Int, nHead: Int, height: Int, width: Int, t: Int
+  prefix: String, batchSize: Int, channels: Int, nHead: Int, height: Int, width: Int, t: Int,
+  of dataType: DataType? = nil
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let key = Input()
   let value = Input()
   let norm = LayerNorm(epsilon: 1e-6, axis: [1], elementwiseAffine: false)
-  var out = norm(x).reshaped([batchSize, channels, height * width]).transposed(1, 2)
+  var out = norm(x).reshaped([batchSize, channels, height * width])
+  if let dataType = dataType {
+    out = out.to(dataType)
+  }
+  out = out.transposed(1, 2)
   let k = channels / nHead
   let (multiHeadAttention, multiHeadAttentionReader) = MultiHeadAttention(
     prefix: prefix, k: k, h: nHead, b: batchSize, hw: height * width, t: t)
-  out =
-    x
-    + multiHeadAttention(out, key, value).transposed(1, 2).reshaped([
-      batchSize, channels, height, width,
-    ])
+  let attnOut = multiHeadAttention(out, key, value).transposed(1, 2).reshaped([
+    batchSize, channels, height, width,
+  ])
+  if dataType != nil {
+    out = x + attnOut.to(of: x)
+  } else {
+    out = x + attnOut
+  }
   return (Model([x, key, value], [out]), multiHeadAttentionReader)
 }
 
@@ -239,8 +256,25 @@ func StageC(batchSize: Int, height: Int, width: Int, t: Int) -> (Model, (PythonO
   var skip: Model.IO? = nil
   for i in 0..<2 {
     for j in 0..<blocks[1][i] {
-      let (resBlock, resBlockReader) = ResBlock(
-        prefix: "up_blocks.\(i).\(j * 3)", batchSize: batchSize, channels: 2048, skip: skip != nil)
+      // For the last layers, we start to accumulate values through the residual connection, and that will exceed FP16.
+      // Thus, we convert to FP32 until the normalization layer of attention block so attention is done at FP16 but
+      // cheap computations such as ResBlock / timestepBlock are done in FP32.
+      if i == 1 && j > 0 {
+        out = out.to(.Float32)
+      }
+
+      let resBlock: Model
+      let resBlockReader: (PythonObject) -> Void
+      if i == 2 - 1 && j > 0 {
+        // Even input is Float32, we will do the rest of the computation of ResBlock in Float16.
+        (resBlock, resBlockReader) = ResBlock(
+          prefix: "up_blocks.\(i).\(j * 3)", batchSize: batchSize, channels: 2048,
+          skip: skip != nil, of: .Float16)
+      } else {
+        (resBlock, resBlockReader) = ResBlock(
+          prefix: "up_blocks.\(i).\(j * 3)", batchSize: batchSize, channels: 2048, skip: skip != nil
+        )
+      }
       readers.append(resBlockReader)
       if let skip = skip {
         out = resBlock(out, skip)
@@ -252,10 +286,20 @@ func StageC(batchSize: Int, height: Int, width: Int, t: Int) -> (Model, (PythonO
         prefix: "up_blocks.\(i).\(j * 3 + 1)", batchSize: batchSize, timeEmbedSize: 64,
         channels: 2048, tConds: ["sca", "crp"])
       readers.append(timestepBlockReader)
+      var rEmbed: Model.IO = rEmbed
+      if i == 2 - 1 && j > 0 {
+        rEmbed = rEmbed.to(.Float32)
+      }
       out = timestepBlock(out, rEmbed)
+      let attnBlockDataType: DataType?
+      if i == 2 - 1 && j > 0 {
+        attnBlockDataType = .Float16
+      } else {
+        attnBlockDataType = nil
+      }
       let (attnBlock, attnBlockReader) = AttnBlock(
         prefix: "up_blocks.\(i).\(j * 3 + 2)", batchSize: batchSize, channels: 2048, nHead: 32,
-        height: height, width: width, t: t)
+        height: height, width: width, t: t, of: attnBlockDataType)
       readers.append(attnBlockReader)
       let key = Input()
       let value = Input()
@@ -274,7 +318,7 @@ func StageC(batchSize: Int, height: Int, width: Int, t: Int) -> (Model, (PythonO
   }
 
   let normOut = LayerNorm(epsilon: 1e-6, axis: [1], elementwiseAffine: false)
-  out = normOut(out)
+  out = normOut(out).to(of: x)
   let convOut = Convolution(
     groups: 1, filters: 16, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = convOut(out)
@@ -1025,7 +1069,7 @@ graph.withNoGrad {
   let (stageCFixed, _) = StageCFixed(batchSize: 2, t: 77 + 8)
   stageCFixed.compile(inputs: clipText, clipTextPooled, clipImg)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f16.ckpt", flags: .readOnly
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32_q6p_q8p.ckpt", flags: .readOnly
   ) {
     $0.read("stage_c_fixed", model: stageCFixed, codec: [.q6p, .q8p, .ezm7]) { name, _, _, _ in
       guard name.hasPrefix("__stage_c_fixed__") else { return .continue(name) }
@@ -1041,7 +1085,7 @@ graph.withNoGrad {
   var rEmbedVariable = graph.variable(Tensor<FloatType>(from: rEmbed)).toGPU(0)
   stageC.compile(inputs: [input, rEmbedVariable] + stageCKvs)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f16.ckpt", flags: .readOnly
+    "/home/liu/workspace/swift-diffusion/wurstchen_3.0_stage_c_f32_q6p_q8p.ckpt", flags: .readOnly
   ) {
     $0.read("stage_c", model: stageC, codec: [.q6p, .q8p, .ezm7])
   }
@@ -1063,6 +1107,7 @@ graph.withNoGrad {
     let a_prev = Float(stageCAlphasCumprod[i + 1].squareRoot())
     let b_prev = Float((1 - stageCAlphasCumprod[i + 1]).squareRoot())
     x = (a_prev / a) * x + (b_prev - a_prev * b / a) * et
+    debugPrint(x)
   }
 
   rEmbed = Tensor<Float>(.CPU, .NC(2, 128))

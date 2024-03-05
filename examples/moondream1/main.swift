@@ -68,18 +68,21 @@ func SigLIPVisionTransformer(
   return (reader, Model([x], [out]))
 }
 
-func MoondreamVisionProjection() -> ((PythonObject) -> Void, Model) {
+func MoondreamVisionProjection(layers: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let mlp1fc = Dense(count: 2048 * 4)
   let mlp1gelu = GELU()
   let mlp1proj = Dense(count: 2048)
   var out = mlp1proj(mlp1gelu(mlp1fc(x)))
-  let ln = LayerNorm(epsilon: 1e-5, axis: [1])
-  out = ln(out)
-  let mlp2fc = Dense(count: 2048 * 4)
-  let mlp2gelu = GELU()
-  let mlp2proj = Dense(count: 2048)
-  out = out + mlp2proj(mlp2gelu(mlp2fc(out)))
+  if layers > 1 {
+    assert(layers == 2)
+    let ln = LayerNorm(epsilon: 1e-5, axis: [1])
+    out = ln(out)
+    let mlp2fc = Dense(count: 2048 * 4)
+    let mlp2gelu = GELU()
+    let mlp2proj = Dense(count: 2048)
+    out = out + mlp2proj(mlp2gelu(mlp2fc(out)))
+  }
   let reader: (PythonObject) -> Void = { _ in
   }
   return (reader, Model([x], [out]))
@@ -254,11 +257,11 @@ graph.withNoGrad {
   }
   var out = vit(inputs: input)[0].as(of: FloatType.self)
 
-  let (_, proj) = MoondreamVisionProjection()
+  let (_, proj) = MoondreamVisionProjection(layers: 1)
 
   proj.compile(inputs: out)
   var textEmbTensor: AnyTensor? = nil
-  graph.openStore("/home/liu/workspace/swift-diffusion/moondream1_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/moondream2_f32.ckpt") {
     $0.read("vision_proj", model: proj)
     textEmbTensor = $0.read("text_emb")
   }

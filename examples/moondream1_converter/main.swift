@@ -17,7 +17,7 @@ let raw_image = Image.open("/home/liu/workspace/swift-diffusion/kandinsky-512.pn
 let transformers = Python.import("transformers")
 
 torch.set_grad_enabled(false)
-let model_id = "vikhyatk/moondream1"
+let model_id = "vikhyatk/moondream2"
 let model = transformers.AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code: true)
 let tokenizer = transformers.CodeGenTokenizerFast.from_pretrained(model_id)
 
@@ -33,7 +33,12 @@ print(
 var input_ids = tokenizer("hello world ", return_tensors: "pt", add_special_tokens: false).input_ids
 input_ids = torch.cat([torch.tensor([[tokenizer.bos_token_id]]), input_ids], dim: 1)
 // print(input_ids)
-let input_embeds = model.text_model.text_emb(input_ids)
+
+let vision_encoder_state_dict = model.vision_encoder.state_dict()
+print(vision_encoder_state_dict.keys())
+let text_model_state_dict = model.text_model.state_dict()
+print(text_model_state_dict.keys())
+let input_embeds = model.text_model.transformer.embd.wte(input_ids)
 /*
 print(
   model.text_model.model.generate(
@@ -41,9 +46,6 @@ print(
     pad_token_id: tokenizer.pad_token_id, max_new_tokens: 1))
 */
 print(input_embeds)
-
-let vision_encoder_state_dict = model.vision_encoder.state_dict()
-let text_model_state_dict = model.text_model.state_dict()
 
 func SigLIPSelfAttention(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model, Model, Model) {
   let x = Input()
@@ -130,7 +132,7 @@ func SigLIPVisionTransformer(
   var readers = [(PythonObject) -> Void]()
   for i in 0..<layers {
     let (reader, block) = SigLIPResidualAttentionBlock(
-      prefix: "model.encoder.model.visual.blocks.\(i)", k: width / heads, h: heads, b: batchSize,
+      prefix: "encoder.model.visual.blocks.\(i)", k: width / heads, h: heads, b: batchSize,
       t: gridX * gridY, MLP: MLP)
     out = block(out.reshaped([batchSize, gridX * gridY, width]))
     readers.append(reader)
@@ -138,23 +140,23 @@ func SigLIPVisionTransformer(
   let lnPost = LayerNorm(epsilon: 1e-6, axis: [1])
   out = lnPost(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let positional_embedding = state_dict["model.encoder.model.visual.pos_embed"].type(torch.float)
+    let positional_embedding = state_dict["encoder.model.visual.pos_embed"].type(torch.float)
       .cpu().numpy()
     posEmbed.weight.copy(from: try! Tensor<Float>(numpy: positional_embedding))
-    let conv1_weight = state_dict["model.encoder.model.visual.patch_embed.linear.weight"].type(
+    let conv1_weight = state_dict["encoder.model.visual.patch_embed.linear.weight"].type(
       torch.float
     ).cpu().numpy()
     conv1.weight.copy(from: try! Tensor<Float>(numpy: conv1_weight))
-    let conv1_bias = state_dict["model.encoder.model.visual.patch_embed.linear.bias"].type(
+    let conv1_bias = state_dict["encoder.model.visual.patch_embed.linear.bias"].type(
       torch.float
     ).cpu().numpy()
     conv1.bias.copy(from: try! Tensor<Float>(numpy: conv1_bias))
     for reader in readers {
       reader(state_dict)
     }
-    let ln_post_weight = state_dict["model.encoder.model.visual.norm.weight"].type(torch.float)
+    let ln_post_weight = state_dict["encoder.model.visual.norm.weight"].type(torch.float)
       .cpu().numpy()
-    let ln_post_bias = state_dict["model.encoder.model.visual.norm.bias"].type(torch.float).cpu()
+    let ln_post_bias = state_dict["encoder.model.visual.norm.bias"].type(torch.float).cpu()
       .numpy()
     lnPost.weight.copy(from: try! Tensor<Float>(numpy: ln_post_weight))
     lnPost.bias.copy(from: try! Tensor<Float>(numpy: ln_post_bias))
@@ -162,45 +164,50 @@ func SigLIPVisionTransformer(
   return (reader, Model([x], [out]))
 }
 
-func MoondreamVisionProjection() -> ((PythonObject) -> Void, Model) {
+func MoondreamVisionProjection(layers: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let mlp1fc = Dense(count: 2048 * 4)
   let mlp1gelu = GELU()
   let mlp1proj = Dense(count: 2048)
   var out = mlp1proj(mlp1gelu(mlp1fc(x)))
-  let ln = LayerNorm(epsilon: 1e-5, axis: [1])
-  out = ln(out)
-  let mlp2fc = Dense(count: 2048 * 4)
-  let mlp2gelu = GELU()
-  let mlp2proj = Dense(count: 2048)
-  out = out + mlp2proj(mlp2gelu(mlp2fc(out)))
+  if layers > 1 {
+    assert(layers == 2)
+    let ln = LayerNorm(epsilon: 1e-5, axis: [1])
+    out = ln(out)
+    let mlp2fc = Dense(count: 2048 * 4)
+    let mlp2gelu = GELU()
+    let mlp2proj = Dense(count: 2048)
+    out = out + mlp2proj(mlp2gelu(mlp2fc(out)))
+  }
   let reader: (PythonObject) -> Void = { state_dict in
-    let mlp1_fc1_weight = state_dict["model.projection.mlp1.fc1.weight"].type(torch.float).cpu()
+    let mlp1_fc1_weight = state_dict["projection.mlp.fc1.weight"].type(torch.float).cpu()
       .numpy()
     mlp1fc.weight.copy(from: try! Tensor<Float>(numpy: mlp1_fc1_weight))
-    let mlp1_fc1_bias = state_dict["model.projection.mlp1.fc1.bias"].type(torch.float).cpu().numpy()
+    let mlp1_fc1_bias = state_dict["projection.mlp.fc1.bias"].type(torch.float).cpu().numpy()
     mlp1fc.bias.copy(from: try! Tensor<Float>(numpy: mlp1_fc1_bias))
-    let mlp1_fc2_weight = state_dict["model.projection.mlp1.fc2.weight"].type(torch.float).cpu()
+    let mlp1_fc2_weight = state_dict["projection.mlp.fc2.weight"].type(torch.float).cpu()
       .numpy()
     mlp1proj.weight.copy(from: try! Tensor<Float>(numpy: mlp1_fc2_weight))
-    let mlp1_fc2_bias = state_dict["model.projection.mlp1.fc2.bias"].type(torch.float).cpu().numpy()
+    let mlp1_fc2_bias = state_dict["projection.mlp.fc2.bias"].type(torch.float).cpu().numpy()
     mlp1proj.bias.copy(from: try! Tensor<Float>(numpy: mlp1_fc2_bias))
 
-    let ln_weight = state_dict["model.projection.ln.weight"].type(torch.float).cpu().numpy()
+    /*
+    let ln_weight = state_dict["projection.ln.weight"].type(torch.float).cpu().numpy()
     ln.weight.copy(from: try! Tensor<Float>(numpy: ln_weight))
-    let ln_bias = state_dict["model.projection.ln.bias"].type(torch.float).cpu().numpy()
+    let ln_bias = state_dict["projection.ln.bias"].type(torch.float).cpu().numpy()
     ln.bias.copy(from: try! Tensor<Float>(numpy: ln_bias))
 
-    let mlp2_fc1_weight = state_dict["model.projection.mlp2.fc1.weight"].type(torch.float).cpu()
+    let mlp2_fc1_weight = state_dict["projection.mlp2.fc1.weight"].type(torch.float).cpu()
       .numpy()
     mlp2fc.weight.copy(from: try! Tensor<Float>(numpy: mlp2_fc1_weight))
-    let mlp2_fc1_bias = state_dict["model.projection.mlp2.fc1.bias"].type(torch.float).cpu().numpy()
+    let mlp2_fc1_bias = state_dict["projection.mlp2.fc1.bias"].type(torch.float).cpu().numpy()
     mlp2fc.bias.copy(from: try! Tensor<Float>(numpy: mlp2_fc1_bias))
-    let mlp2_fc2_weight = state_dict["model.projection.mlp2.fc2.weight"].type(torch.float).cpu()
+    let mlp2_fc2_weight = state_dict["projection.mlp2.fc2.weight"].type(torch.float).cpu()
       .numpy()
     mlp2proj.weight.copy(from: try! Tensor<Float>(numpy: mlp2_fc2_weight))
-    let mlp2_fc2_bias = state_dict["model.projection.mlp2.fc2.bias"].type(torch.float).cpu().numpy()
+    let mlp2_fc2_bias = state_dict["projection.mlp2.fc2.bias"].type(torch.float).cpu().numpy()
     mlp2proj.bias.copy(from: try! Tensor<Float>(numpy: mlp2_fc2_bias))
+    */
   }
   return (reader, Model([x], [out]))
 }
@@ -342,7 +349,7 @@ func Transformer<T: TensorNumeric>(
   var readers = [(PythonObject) -> Void]()
   for i in 0..<layers {
     let (layer, reader) = TransformerBlock(
-      prefix: "model.transformer.h.\(i)", k: width / heads, h: heads, hk: heads, b: batchSize,
+      prefix: "transformer.h.\(i)", k: width / heads, h: heads, hk: heads, b: batchSize,
       t: tokenLength,
       MLP: MLP, rotaryDim: rotaryDim)
     out = layer(out, costheta, sintheta)
@@ -356,13 +363,13 @@ func Transformer<T: TensorNumeric>(
     for reader in readers {
       reader(state_dict)
     }
-    let norm_weight = state_dict["model.lm_head.ln.weight"].type(torch.float).cpu().numpy()
+    let norm_weight = state_dict["lm_head.ln.weight"].type(torch.float).cpu().numpy()
     norm.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm_weight)))
-    let norm_bias = state_dict["model.lm_head.ln.bias"].type(torch.float).cpu().numpy()
+    let norm_bias = state_dict["lm_head.ln.bias"].type(torch.float).cpu().numpy()
     norm.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm_bias)))
-    let output_weight = state_dict["model.lm_head.linear.weight"].type(torch.float).cpu().numpy()
+    let output_weight = state_dict["lm_head.linear.weight"].type(torch.float).cpu().numpy()
     output.weight.copy(from: try! Tensor<Float16>(from: Tensor<Float>(numpy: output_weight)))
-    let output_bias = state_dict["model.lm_head.linear.bias"].type(torch.float).cpu().numpy()
+    let output_bias = state_dict["lm_head.linear.bias"].type(torch.float).cpu().numpy()
     output.bias.copy(from: try! Tensor<Float16>(from: Tensor<Float>(numpy: output_bias)))
   }
   return (Model([textEmb, costheta, sintheta], [out]), reader)
@@ -375,9 +382,10 @@ torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
 let x = torch.randn([1, 3, 378, 378])
-print(
-  model.vision_encoder.model(
-    einops.rearrange(x, "b c (h p1) (w p2) -> b (h w) (c p1 p2)", p1: 14, p2: 14)))
+let encoded =
+  model.vision_encoder.encoder(
+    einops.rearrange(x, "b c (h p1) (w p2) -> b (h w) (c p1 p2)", p1: 14, p2: 14))
+print(model.vision_encoder.projection(encoded))
 let graph = DynamicGraph()
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let (reader, vit) = SigLIPVisionTransformer(
@@ -416,7 +424,8 @@ graph.withNoGrad {
   debugPrint(costhetaTensor)
   debugPrint(sinthetaTensor)
   let _ = phi(inputs: inputsEmbedsTensor, costhetaTensorGPU, sinthetaTensorGPU)
-  let text_emb = text_model_state_dict["text_emb.weight"].type(torch.float).cpu().numpy()
+  let text_emb = text_model_state_dict["transformer.embd.wte.weight"].type(torch.float).cpu()
+    .numpy()
   let textEmb = Tensor<Float16>(from: try! Tensor<Float>(numpy: text_emb))
   phiReader(text_model_state_dict)
   let output = phi(inputs: inputsEmbedsTensor, costhetaTensorGPU, sinthetaTensorGPU).map {
@@ -426,12 +435,12 @@ graph.withNoGrad {
   graph.openStore("/home/liu/workspace/swift-diffusion/siglip_384_f32.ckpt") {
     $0.write("vit", model: vit)
   }
-  graph.openStore("/home/liu/workspace/swift-diffusion/moondream1_f32.ckpt") {
+  */
+  graph.openStore("/home/liu/workspace/swift-diffusion/moondream2_f32.ckpt") {
     $0.write("vision_proj", model: proj)
     $0.write("text_emb", tensor: textEmb)
     $0.write("phi", model: phi)
   }
-  */
   let digit = output[0].rawValue.toCPU()
   var minVal = digit[3, 0]
   var minS = 0
