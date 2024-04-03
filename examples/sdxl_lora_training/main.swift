@@ -105,6 +105,7 @@ private func LoRABasicTransformerBlock(
   let layerNorm3 = LayerNorm(epsilon: 1e-5, axis: [2])
   out = layerNorm3(out)
   let ff = LoRAFeedForward(hiddenSize: k * h, intermediateSize: intermediateSize)
+  ff.gradientCheckpointing = true
   out = ff(out) + residual
   return Model([x, keys, values], [out])
 }
@@ -788,17 +789,26 @@ let unet = LoRAUNetXL(
   batchSize: 1, startHeight: startHeight, startWidth: startWidth, channels: [320, 640, 1280],
   attentionRes: [2: 2, 4: 10])
 unet.maxConcurrency = .limit(1)
+unet.memoryReduction = true
 unet.compile(inputs: [x, graph.variable(Tensor<FloatType>(from: ts)), vector0] + kvs0)
 graph.openStore("/home/liu/workspace/swift-diffusion/sd_xl_base_1.0_f16.ckpt") {
   $0.read("unet", model: unet) { name, dataType, format, shape in
     if name.contains("lora_up") {
-      precondition(dataType == .Float32)
-      var tensor = Tensor<Float32>(.CPU, format: format, shape: shape)
-      tensor.withUnsafeMutableBytes {
-        let size = shape.reduce(MemoryLayout<Float32>.size, *)
-        memset($0.baseAddress!, 0, size)
+      if dataType == .Float32 {
+        var tensor = Tensor<Float32>(.CPU, format: format, shape: shape)
+        tensor.withUnsafeMutableBytes {
+          let size = shape.reduce(MemoryLayout<Float32>.size, *)
+          memset($0.baseAddress!, 0, size)
+        }
+        return .final(tensor)
+      } else {
+        var tensor = Tensor<Float16>(.CPU, format: format, shape: shape)
+        tensor.withUnsafeMutableBytes {
+          let size = shape.reduce(MemoryLayout<Float16>.size, *)
+          memset($0.baseAddress!, 0, size)
+        }
+        return .final(tensor)
       }
-      return .final(tensor)
     }
     return .continue(name)
   }

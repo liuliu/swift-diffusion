@@ -17,7 +17,7 @@ let version_dict: [String: PythonObject] = [
   "W": 512,
   "C": 4, "f": 8,
   "config": "/home/liu/workspace/generative-models/configs/inference/svd_image_decoder.yaml",
-  "ckpt": "/home/liu/workspace/generative-models/checkpoints/svd_xt_image_decoder.safetensors",
+  "ckpt": "/home/liu/workspace/generative-models/checkpoints/AnimateLCM-SVD-xt-1.1.safetensors",
   "options": [
     "discretization": 1,
     "cfg": 2.5,
@@ -2291,7 +2291,7 @@ graph.withNoGrad {
   reader(model_state_dict)
   let pred = unet(inputs: x, [t_emb, y] + kvs)
   debugPrint(pred)
-  graph.openStore("/home/liu/workspace/swift-diffusion/svd_i2v_xt_1.0_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/animatelcm_svd_i2v_xt_1.1_f32.ckpt") {
     $0.write("visual_proj", model: visualProj)
     $0.write("unet_fixed", model: unetFixed)
     $0.write("unet", model: unet)

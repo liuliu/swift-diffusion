@@ -16,7 +16,7 @@ public func LoRAConvolution(
   let conv2dUp = Convolution(
     groups: groups, filters: filters, filterSize: [1, 1], noBias: true, hint: Hint(stride: [1, 1]),
     format: format, trainable: true, name: "lora_up")
-  let out = conv2d(x) + conv2dUp(conv2dDown(x))  // .to(.Float32))).to(of: x)
+  let out = conv2d(x) + conv2dUp(conv2dDown(x.to(.Float32))).to(of: x)
   return Model([x], [out])
 }
 
@@ -25,7 +25,7 @@ public func LoRADense(count: Int, noBias: Bool = false, name: String = "") -> Mo
   let dense = Dense(count: count, noBias: noBias, name: name)
   let denseDown = Dense(count: LowRank, noBias: true, trainable: true, name: "lora_down")
   let denseUp = Dense(count: count, noBias: true, trainable: true, name: "lora_up")
-  let out = dense(x) + denseUp(denseDown(x))  // .to(.Float32))).to(of: x)
+  let out = dense(x) + denseUp(denseDown(x.to(.Float32))).to(of: x)
   return Model([x], [out])
 }
 
@@ -216,6 +216,7 @@ private func LoRABasicTransformerBlock(
   let layerNorm3 = LayerNorm(epsilon: 1e-5, axis: [2])
   out = layerNorm3(out)
   let ff = LoRAFeedForward(hiddenSize: k * h, intermediateSize: intermediateSize)
+  ff.gradientCheckpointing = true
   out = ff(out) + residual
   return Model([x, c], [out])
 }
