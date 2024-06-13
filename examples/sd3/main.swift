@@ -4,7 +4,7 @@ import NNC
 import PNG
 import SentencePiece
 
-typealias FloatType = Float
+typealias FloatType = Float16
 struct PythonObject {}
 
 func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (
@@ -249,7 +249,7 @@ func OpenCLIPTextModel(
 
 func T5TextEmbedding(vocabularySize: Int, embeddingSize: Int, name: String) -> Model {
   let tokenEmbed = Embedding(
-    FloatType.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: name)
+    Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: name)
   return tokenEmbed
 }
 
@@ -311,7 +311,7 @@ func T5ForConditionalGeneration(b: Int, t: Int) -> ((PythonObject) -> Void, Mode
   let textEmbed = T5TextEmbedding(vocabularySize: 32_128, embeddingSize: 4_096, name: "shared")
   var out = textEmbed(x)
   let relativePositionEmbedding = Embedding(
-    FloatType.self, vocabularySize: 32, embeddingSize: 64, name: "relative_position_embedding")
+    Float.self, vocabularySize: 32, embeddingSize: 64, name: "relative_position_embedding")
   let positionBias = relativePositionEmbedding(relativePositionBuckets).reshaped([1, t, t, 64])
     .permuted(0, 3, 1, 2)
   var readers = [(PythonObject) -> Void]()
@@ -463,7 +463,7 @@ let c2 = graph.withNoGrad {
     $0.read("text_model", model: textModel)
   }
   let output = textModel(inputs: tokensTensorGPU, relativePositionBucketsGPU)[0].as(of: Float.self)
-  return output
+  return DynamicGraph.Tensor<FloatType>(from: output)
 }
 
 let (c, pooled) = graph.withNoGrad {
@@ -665,7 +665,9 @@ graph.withNoGrad {
   z.randn()
   var input = graph.variable(.GPU(0), .NCHW(2, 16, 128, 128), of: FloatType.self)
   let tTensor = graph.variable(
-    timeEmbedding(timesteps: 1000, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000).toGPU(0))
+    Tensor<FloatType>(
+      from: timeEmbedding(timesteps: 1000, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000)
+        .toGPU(0)))
   var cTensor = graph.variable(.GPU(0), .CHW(2, 154, 4096), of: FloatType.self)
   cTensor.full(0)
   cTensor[1..<2, 0..<154, 0..<4096] = c
@@ -683,7 +685,9 @@ graph.withNoGrad {
     input[0..<1, 0..<16, 0..<128, 0..<128] = z
     input[1..<2, 0..<16, 0..<128, 0..<128] = z
     let tTensor = graph.variable(
-      timeEmbedding(timesteps: t, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000).toGPU(0))
+      Tensor<FloatType>(
+        from: timeEmbedding(timesteps: t, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000)
+          .toGPU(0)))
     // cfg = 4.5
     let vcu = dit(inputs: input, tTensor, cTensor, yTensor)[0].as(of: FloatType.self)
     let vu = vcu[0..<1, 0..<16, 0..<128, 0..<128]
