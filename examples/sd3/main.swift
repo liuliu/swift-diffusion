@@ -1,11 +1,11 @@
 import Diffusion
 import Foundation
 import NNC
-import NNCPythonConversion
-import PythonKit
+import PNG
 import SentencePiece
 
 typealias FloatType = Float
+struct PythonObject {}
 
 func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (
   (PythonObject) -> Void, Model
@@ -36,31 +36,6 @@ func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (
     out = x + out
   }
   let reader: (PythonObject) -> Void = { state_dict in
-    let norm1_weight = state_dict["\(prefix).norm1.weight"].to(torch.float).cpu().numpy()
-    let norm1_bias = state_dict["\(prefix).norm1.bias"].to(torch.float).cpu().numpy()
-    norm1.weight.copy(from: try! Tensor<Float>(numpy: norm1_weight))
-    norm1.bias.copy(from: try! Tensor<Float>(numpy: norm1_bias))
-    let conv1_weight = state_dict["\(prefix).conv1.weight"].to(torch.float).cpu().numpy()
-    let conv1_bias = state_dict["\(prefix).conv1.bias"].to(torch.float).cpu().numpy()
-    conv1.weight.copy(from: try! Tensor<Float>(numpy: conv1_weight))
-    conv1.bias.copy(from: try! Tensor<Float>(numpy: conv1_bias))
-    let norm2_weight = state_dict["\(prefix).norm2.weight"].to(torch.float).cpu().numpy()
-    let norm2_bias = state_dict["\(prefix).norm2.bias"].to(torch.float).cpu().numpy()
-    norm2.weight.copy(from: try! Tensor<Float>(numpy: norm2_weight))
-    norm2.bias.copy(from: try! Tensor<Float>(numpy: norm2_bias))
-    let conv2_weight = state_dict["\(prefix).conv2.weight"].to(torch.float).cpu().numpy()
-    let conv2_bias = state_dict["\(prefix).conv2.bias"].to(torch.float).cpu().numpy()
-    conv2.weight.copy(from: try! Tensor<Float>(numpy: conv2_weight))
-    conv2.bias.copy(from: try! Tensor<Float>(numpy: conv2_bias))
-    if let ninShortcut = ninShortcut {
-      let nin_shortcut_weight = state_dict["\(prefix).nin_shortcut.weight"].to(torch.float).cpu()
-        .numpy()
-      let nin_shortcut_bias = state_dict["\(prefix).nin_shortcut.bias"].to(torch.float).cpu()
-        .numpy()
-      ninShortcut.weight.copy(
-        from: try! Tensor<Float>(numpy: nin_shortcut_weight))
-      ninShortcut.bias.copy(from: try! Tensor<Float>(numpy: nin_shortcut_bias))
-    }
   }
   return (reader, Model([x], [out]))
 }
@@ -92,26 +67,6 @@ func AttnBlock(prefix: String, inChannels: Int, batchSize: Int, width: Int, heig
     groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   out = x + projOut(out.reshaped([batchSize, inChannels, height, width]))
   let reader: (PythonObject) -> Void = { state_dict in
-    let norm_weight = state_dict["\(prefix).norm.weight"].to(torch.float).cpu().numpy()
-    let norm_bias = state_dict["\(prefix).norm.bias"].to(torch.float).cpu().numpy()
-    norm.weight.copy(from: try! Tensor<Float>(numpy: norm_weight))
-    norm.bias.copy(from: try! Tensor<Float>(numpy: norm_bias))
-    let k_weight = state_dict["\(prefix).k.weight"].to(torch.float).cpu().numpy()
-    let k_bias = state_dict["\(prefix).k.bias"].to(torch.float).cpu().numpy()
-    tokeys.weight.copy(from: try! Tensor<Float>(numpy: k_weight))
-    tokeys.bias.copy(from: try! Tensor<Float>(numpy: k_bias))
-    let q_weight = state_dict["\(prefix).q.weight"].to(torch.float).cpu().numpy()
-    let q_bias = state_dict["\(prefix).q.bias"].to(torch.float).cpu().numpy()
-    toqueries.weight.copy(from: try! Tensor<Float>(numpy: q_weight))
-    toqueries.bias.copy(from: try! Tensor<Float>(numpy: q_bias))
-    let v_weight = state_dict["\(prefix).v.weight"].to(torch.float).cpu().numpy()
-    let v_bias = state_dict["\(prefix).v.bias"].to(torch.float).cpu().numpy()
-    tovalues.weight.copy(from: try! Tensor<Float>(numpy: v_weight))
-    tovalues.bias.copy(from: try! Tensor<Float>(numpy: v_bias))
-    let proj_out_weight = state_dict["\(prefix).proj_out.weight"].to(torch.float).cpu().numpy()
-    let proj_out_bias = state_dict["\(prefix).proj_out.bias"].to(torch.float).cpu().numpy()
-    projOut.weight.copy(from: try! Tensor<Float>(numpy: proj_out_weight))
-    projOut.bias.copy(from: try! Tensor<Float>(numpy: proj_out_bias))
   }
   return (reader, Model([x], [out]))
 }
@@ -155,14 +110,6 @@ func Encoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
         strides: [channel * (height + 1) * (width + 1), (height + 1) * (width + 1), width + 1, 1])
       let downLayer = i
       let reader: (PythonObject) -> Void = { state_dict in
-        let conv_weight = state_dict["encoder.down.\(downLayer).downsample.conv.weight"].to(
-          torch.float
-        ).cpu()
-          .numpy()
-        let conv_bias = state_dict["encoder.down.\(downLayer).downsample.conv.bias"].to(torch.float)
-          .cpu().numpy()
-        conv2d.weight.copy(from: try! Tensor<Float>(numpy: conv_weight))
-        conv2d.bias.copy(from: try! Tensor<Float>(numpy: conv_bias))
       }
       readers.append(reader)
     }
@@ -186,24 +133,6 @@ func Encoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = convOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let conv_in_weight = state_dict["encoder.conv_in.weight"].to(torch.float).cpu().numpy()
-    let conv_in_bias = state_dict["encoder.conv_in.bias"].to(torch.float).cpu().numpy()
-    convIn.weight.copy(from: try! Tensor<Float>(numpy: conv_in_weight))
-    convIn.bias.copy(from: try! Tensor<Float>(numpy: conv_in_bias))
-    for reader in readers {
-      reader(state_dict)
-    }
-    midBlockReader1(state_dict)
-    midAttnReader1(state_dict)
-    midBlockReader2(state_dict)
-    let norm_out_weight = state_dict["encoder.norm_out.weight"].to(torch.float).cpu().numpy()
-    let norm_out_bias = state_dict["encoder.norm_out.bias"].to(torch.float).cpu().numpy()
-    normOut.weight.copy(from: try! Tensor<Float>(numpy: norm_out_weight))
-    normOut.bias.copy(from: try! Tensor<Float>(numpy: norm_out_bias))
-    let conv_out_weight = state_dict["encoder.conv_out.weight"].to(torch.float).cpu().numpy()
-    let conv_out_bias = state_dict["encoder.conv_out.bias"].to(torch.float).cpu().numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: conv_out_weight))
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: conv_out_bias))
   }
   return (reader, Model([x], [out]))
 }
@@ -246,12 +175,6 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
       out = conv2d(out)
       let upLayer = i
       let reader: (PythonObject) -> Void = { state_dict in
-        let conv_weight = state_dict["decoder.up.\(upLayer).upsample.conv.weight"].to(torch.float)
-          .cpu().numpy()
-        let conv_bias = state_dict["decoder.up.\(upLayer).upsample.conv.bias"].to(torch.float).cpu()
-          .numpy()
-        conv2d.weight.copy(from: try! Tensor<Float>(numpy: conv_weight))
-        conv2d.bias.copy(from: try! Tensor<Float>(numpy: conv_bias))
       }
       readers.append(reader)
     }
@@ -264,24 +187,6 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
   out = convOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let conv_in_weight = state_dict["decoder.conv_in.weight"].to(torch.float).cpu().numpy()
-    let conv_in_bias = state_dict["decoder.conv_in.bias"].to(torch.float).cpu().numpy()
-    convIn.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv_in_weight))
-    convIn.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: conv_in_bias))
-    midBlockReader1(state_dict)
-    midAttnReader1(state_dict)
-    midBlockReader2(state_dict)
-    for reader in readers {
-      reader(state_dict)
-    }
-    let norm_out_weight = state_dict["decoder.norm_out.weight"].to(torch.float).cpu().numpy()
-    let norm_out_bias = state_dict["decoder.norm_out.bias"].to(torch.float).cpu().numpy()
-    normOut.weight.copy(from: try! Tensor<Float>(numpy: norm_out_weight))
-    normOut.bias.copy(from: try! Tensor<Float>(numpy: norm_out_bias))
-    let conv_out_weight = state_dict["decoder.conv_out.weight"].to(torch.float).cpu().numpy()
-    let conv_out_bias = state_dict["decoder.conv_out.bias"].to(torch.float).cpu().numpy()
-    convOut.weight.copy(from: try! Tensor<Float>(numpy: conv_out_weight))
-    convOut.bias.copy(from: try! Tensor<Float>(numpy: conv_out_bias))
   }
   return (reader, Model([x], [out]))
 }
@@ -344,7 +249,7 @@ func OpenCLIPTextModel(
 
 func T5TextEmbedding(vocabularySize: Int, embeddingSize: Int, name: String) -> Model {
   let tokenEmbed = Embedding(
-    Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: name)
+    FloatType.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: name)
   return tokenEmbed
 }
 
@@ -396,28 +301,6 @@ func T5Block(
     hiddenSize: outFeatures, intermediateSize: intermediateSize)
   out = out + ff(norm2(out))
   let reader: (PythonObject) -> Void = { state_dict in
-    let layer_0_layer_norm_weight = state_dict["\(prefix).layer.0.layer_norm.weight"].cpu().float()
-      .numpy()
-    norm1.weight.copy(from: try! Tensor<Float>(numpy: layer_0_layer_norm_weight))
-    let k_weight = state_dict["\(prefix).layer.0.SelfAttention.k.weight"].cpu().float().numpy()
-    tokeys.weight.copy(from: try! Tensor<Float>(numpy: k_weight))
-    let q_weight = state_dict["\(prefix).layer.0.SelfAttention.q.weight"].cpu().float().numpy()
-    toqueries.weight.copy(from: try! Tensor<Float>(numpy: q_weight))
-    let v_weight = state_dict["\(prefix).layer.0.SelfAttention.v.weight"].cpu().float().numpy()
-    tovalues.weight.copy(from: try! Tensor<Float>(numpy: v_weight))
-    let o_weight = state_dict["\(prefix).layer.0.SelfAttention.o.weight"].cpu().float().numpy()
-    unifyheads.weight.copy(from: try! Tensor<Float>(numpy: o_weight))
-    let layer_1_layer_norm_weight = state_dict["\(prefix).layer.1.layer_norm.weight"].cpu().float()
-      .numpy()
-    norm2.weight.copy(from: try! Tensor<Float>(numpy: layer_1_layer_norm_weight))
-    let wi_0_weight = state_dict["\(prefix).layer.1.DenseReluDense.wi_0.weight"].cpu().float()
-      .numpy()
-    wi_0.weight.copy(from: try! Tensor<Float>(numpy: wi_0_weight))
-    let wi_1_weight = state_dict["\(prefix).layer.1.DenseReluDense.wi_1.weight"].cpu().float()
-      .numpy()
-    wi_1.weight.copy(from: try! Tensor<Float>(numpy: wi_1_weight))
-    let wo_weight = state_dict["\(prefix).layer.1.DenseReluDense.wo.weight"].cpu().float().numpy()
-    wo.weight.copy(from: try! Tensor<Float>(numpy: wo_weight))
   }
   return (reader, Model([x, positionBias], [out]))
 }
@@ -428,7 +311,7 @@ func T5ForConditionalGeneration(b: Int, t: Int) -> ((PythonObject) -> Void, Mode
   let textEmbed = T5TextEmbedding(vocabularySize: 32_128, embeddingSize: 4_096, name: "shared")
   var out = textEmbed(x)
   let relativePositionEmbedding = Embedding(
-    Float.self, vocabularySize: 32, embeddingSize: 64, name: "relative_position_embedding")
+    FloatType.self, vocabularySize: 32, embeddingSize: 64, name: "relative_position_embedding")
   let positionBias = relativePositionEmbedding(relativePositionBuckets).reshaped([1, t, t, 64])
     .permuted(0, 3, 1, 2)
   var readers = [(PythonObject) -> Void]()
@@ -442,19 +325,6 @@ func T5ForConditionalGeneration(b: Int, t: Int) -> ((PythonObject) -> Void, Mode
   let finalNorm = RMSNorm(epsilon: 1e-6, axis: [1], name: "final_norm")
   out = finalNorm(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let vocab = state_dict["shared.weight"].cpu().float().numpy()
-    textEmbed.weight.copy(from: try! Tensor<Float>(numpy: vocab))
-    let relative_attention_bias_weight = state_dict[
-      "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
-    ].cpu().float().numpy()
-    relativePositionEmbedding.weight.copy(
-      from: try! Tensor<Float>(numpy: relative_attention_bias_weight))
-    for reader in readers {
-      reader(state_dict)
-    }
-    let final_layer_norm_weight = state_dict["encoder.final_layer_norm.weight"].cpu().float()
-      .numpy()
-    finalNorm.weight.copy(from: try! Tensor<Float>(numpy: final_layer_norm_weight))
   }
   return (reader, Model([x, relativePositionBuckets], [out]))
 }
@@ -608,9 +478,6 @@ let (c, pooled) = graph.withNoGrad {
   return (c, pooled)
 }
 
-debugPrint(c)
-debugPrint(pooled)
-
 func TimeEmbedder(channels: Int) -> (Model, Model, Model) {
   let x = Input()
   let fc0 = Dense(count: channels, name: "t_embedder_0")
@@ -714,139 +581,6 @@ func JointTransformerBlock(
   let xNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   xOut = xOut + xChunks[5] .* xMlp(xNorm2(xOut) .* (1 + xChunks[4]) + xChunks[3])
   let reader: (PythonObject) -> Void = { state_dict in
-    let context_block_attn_qkv_weight = state_dict["\(prefix).context_block.attn.qkv.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let context_block_attn_qkv_bias = state_dict["\(prefix).context_block.attn.qkv.bias"].to(
-      torch.float
-    ).cpu().numpy()
-    contextToQueries.weight.copy(
-      from: try! Tensor<Float>(numpy: context_block_attn_qkv_weight[..<(k * h), ...]))
-    contextToQueries.bias.copy(
-      from: try! Tensor<Float>(numpy: context_block_attn_qkv_bias[..<(k * h)]))
-    contextToKeys.weight.copy(
-      from: try! Tensor<Float>(numpy: context_block_attn_qkv_weight[(k * h)..<(2 * k * h), ...]))
-    contextToKeys.bias.copy(
-      from: try! Tensor<Float>(numpy: context_block_attn_qkv_bias[(k * h)..<(2 * k * h)]))
-    contextToValues.weight.copy(
-      from: try! Tensor<Float>(numpy: context_block_attn_qkv_weight[(2 * k * h)..<(3 * k * h), ...])
-    )
-    contextToValues.bias.copy(
-      from: try! Tensor<Float>(numpy: context_block_attn_qkv_bias[(2 * k * h)..<(3 * k * h)]))
-    let x_block_attn_qkv_weight = state_dict["\(prefix).x_block.attn.qkv.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let x_block_attn_qkv_bias = state_dict["\(prefix).x_block.attn.qkv.bias"].to(
-      torch.float
-    ).cpu().numpy()
-    xToQueries.weight.copy(
-      from: try! Tensor<Float>(numpy: x_block_attn_qkv_weight[..<(k * h), ...]))
-    xToQueries.bias.copy(from: try! Tensor<Float>(numpy: x_block_attn_qkv_bias[..<(k * h)]))
-    xToKeys.weight.copy(
-      from: try! Tensor<Float>(numpy: x_block_attn_qkv_weight[(k * h)..<(2 * k * h), ...]))
-    xToKeys.bias.copy(from: try! Tensor<Float>(numpy: x_block_attn_qkv_bias[(k * h)..<(2 * k * h)]))
-    xToValues.weight.copy(
-      from: try! Tensor<Float>(numpy: x_block_attn_qkv_weight[(2 * k * h)..<(3 * k * h), ...]))
-    xToValues.bias.copy(
-      from: try! Tensor<Float>(numpy: x_block_attn_qkv_bias[(2 * k * h)..<(3 * k * h)]))
-    if let contextUnifyheads = contextUnifyheads {
-      let context_block_attn_proj_weight = state_dict["\(prefix).context_block.attn.proj.weight"]
-        .to(
-          torch.float
-        ).cpu().numpy()
-      let context_block_attn_proj_bias = state_dict["\(prefix).context_block.attn.proj.bias"].to(
-        torch.float
-      ).cpu().numpy()
-      contextUnifyheads.weight.copy(
-        from: try! Tensor<Float>(numpy: context_block_attn_proj_weight))
-      contextUnifyheads.bias.copy(
-        from: try! Tensor<Float>(numpy: context_block_attn_proj_bias))
-    }
-    let x_block_attn_proj_weight = state_dict["\(prefix).x_block.attn.proj.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let x_block_attn_proj_bias = state_dict["\(prefix).x_block.attn.proj.bias"].to(
-      torch.float
-    ).cpu().numpy()
-    xUnifyheads.weight.copy(
-      from: try! Tensor<Float>(numpy: x_block_attn_proj_weight))
-    xUnifyheads.bias.copy(
-      from: try! Tensor<Float>(numpy: x_block_attn_proj_bias))
-    if let contextFc1 = contextFc1, let contextFc2 = contextFc2 {
-      let context_block_mlp_fc1_weight = state_dict["\(prefix).context_block.mlp.fc1.weight"].to(
-        torch.float
-      ).cpu().numpy()
-      let context_block_mlp_fc1_bias = state_dict["\(prefix).context_block.mlp.fc1.bias"].to(
-        torch.float
-      ).cpu().numpy()
-      contextFc1.weight.copy(
-        from: try! Tensor<Float>(numpy: context_block_mlp_fc1_weight))
-      contextFc1.bias.copy(
-        from: try! Tensor<Float>(numpy: context_block_mlp_fc1_bias))
-      let context_block_mlp_fc2_weight = state_dict["\(prefix).context_block.mlp.fc2.weight"].to(
-        torch.float
-      ).cpu().numpy()
-      let context_block_mlp_fc2_bias = state_dict["\(prefix).context_block.mlp.fc2.bias"].to(
-        torch.float
-      ).cpu().numpy()
-      contextFc2.weight.copy(
-        from: try! Tensor<Float>(numpy: context_block_mlp_fc2_weight))
-      contextFc2.bias.copy(
-        from: try! Tensor<Float>(numpy: context_block_mlp_fc2_bias))
-    }
-    let x_block_mlp_fc1_weight = state_dict["\(prefix).x_block.mlp.fc1.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let x_block_mlp_fc1_bias = state_dict["\(prefix).x_block.mlp.fc1.bias"].to(
-      torch.float
-    ).cpu().numpy()
-    xFc1.weight.copy(
-      from: try! Tensor<Float>(numpy: x_block_mlp_fc1_weight))
-    xFc1.bias.copy(
-      from: try! Tensor<Float>(numpy: x_block_mlp_fc1_bias))
-    let x_block_mlp_fc2_weight = state_dict["\(prefix).x_block.mlp.fc2.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let x_block_mlp_fc2_bias = state_dict["\(prefix).x_block.mlp.fc2.bias"].to(
-      torch.float
-    ).cpu().numpy()
-    xFc2.weight.copy(
-      from: try! Tensor<Float>(numpy: x_block_mlp_fc2_weight))
-    xFc2.bias.copy(
-      from: try! Tensor<Float>(numpy: x_block_mlp_fc2_bias))
-    let context_block_adaln_modulation_weight = state_dict[
-      "\(prefix).context_block.adaLN_modulation.1.weight"
-    ].to(
-      torch.float
-    ).cpu().numpy()
-    let context_block_adaln_modulation_bias = state_dict[
-      "\(prefix).context_block.adaLN_modulation.1.bias"
-    ].to(
-      torch.float
-    ).cpu().numpy()
-    for i in 0..<(contextBlockPreOnly ? 2 : 6) {
-      contextAdaLNs[i].weight.copy(
-        from: try! Tensor<Float>(
-          numpy: context_block_adaln_modulation_weight[(k * h * i)..<(k * h * (i + 1)), ...]))
-      contextAdaLNs[i].bias.copy(
-        from: try! Tensor<Float>(
-          numpy: context_block_adaln_modulation_bias[(k * h * i)..<(k * h * (i + 1))]))
-    }
-    let x_block_adaln_modulation_weight = state_dict["\(prefix).x_block.adaLN_modulation.1.weight"]
-      .to(
-        torch.float
-      ).cpu().numpy()
-    let x_block_adaln_modulation_bias = state_dict["\(prefix).x_block.adaLN_modulation.1.bias"].to(
-      torch.float
-    ).cpu().numpy()
-    for i in 0..<6 {
-      xAdaLNs[i].weight.copy(
-        from: try! Tensor<Float>(
-          numpy: x_block_adaln_modulation_weight[(k * h * i)..<(k * h * (i + 1)), ...]))
-      xAdaLNs[i].bias.copy(
-        from: try! Tensor<Float>(
-          numpy: x_block_adaln_modulation_bias[(k * h * i)..<(k * h * (i + 1))]))
-    }
   }
   if !contextBlockPreOnly {
     return (reader, Model([context, x, c], [contextOut, xOut]))
@@ -864,7 +598,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
     groups: 1, filters: 1536, filterSize: [2, 2],
     hint: Hint(stride: [2, 2]), name: "x_embedder")
   var out = xEmbedder(x).reshaped([b, 1536, h * w]).transposed(1, 2)
-  let posEmbed = Parameter<Float>(.GPU(0), .NHWC(1, 192, 192, 1536))
+  let posEmbed = Parameter<FloatType>(.GPU(0), .NHWC(1, 192, 192, 1536))
   let spatialPosEmbed = posEmbed.reshaped(
     [1, h, w, 1536], offset: [0, (192 - h) / 2, (192 - w) / 2, 0],
     strides: [192 * 192 * 1536, 192 * 1536, 1536, 1]
@@ -900,78 +634,6 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
     b, 16, h * 2, w * 2,
   ])
   let reader: (PythonObject) -> Void = { state_dict in
-    let x_embedder_proj_weight = state_dict["diffusion_model.x_embedder.proj.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let x_embedder_proj_bias = state_dict["diffusion_model.x_embedder.proj.bias"].to(torch.float)
-      .cpu().numpy()
-    xEmbedder.weight.copy(from: try! Tensor<Float>(numpy: x_embedder_proj_weight))
-    xEmbedder.bias.copy(from: try! Tensor<Float>(numpy: x_embedder_proj_bias))
-    let pos_embed = state_dict["diffusion_model.pos_embed"].to(torch.float).cpu().numpy()
-    posEmbed.weight.copy(from: try! Tensor<Float>(numpy: pos_embed))
-    let t_embedder_mlp_0_weight = state_dict["diffusion_model.t_embedder.mlp.0.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let t_embedder_mlp_0_bias = state_dict["diffusion_model.t_embedder.mlp.0.bias"].to(torch.float)
-      .cpu().numpy()
-    tMlp0.weight.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_0_weight))
-    tMlp0.bias.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_0_bias))
-    let t_embedder_mlp_2_weight = state_dict["diffusion_model.t_embedder.mlp.2.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let t_embedder_mlp_2_bias = state_dict["diffusion_model.t_embedder.mlp.2.bias"].to(torch.float)
-      .cpu().numpy()
-    tMlp2.weight.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_2_weight))
-    tMlp2.bias.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_2_bias))
-    let y_embedder_mlp_0_weight = state_dict["diffusion_model.y_embedder.mlp.0.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let y_embedder_mlp_0_bias = state_dict["diffusion_model.y_embedder.mlp.0.bias"].to(torch.float)
-      .cpu().numpy()
-    yMlp0.weight.copy(from: try! Tensor<Float>(numpy: y_embedder_mlp_0_weight))
-    yMlp0.bias.copy(from: try! Tensor<Float>(numpy: y_embedder_mlp_0_bias))
-    let y_embedder_mlp_2_weight = state_dict["diffusion_model.y_embedder.mlp.2.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let y_embedder_mlp_2_bias = state_dict["diffusion_model.y_embedder.mlp.2.bias"].to(torch.float)
-      .cpu().numpy()
-    yMlp2.weight.copy(from: try! Tensor<Float>(numpy: y_embedder_mlp_2_weight))
-    yMlp2.bias.copy(from: try! Tensor<Float>(numpy: y_embedder_mlp_2_bias))
-    let context_embedder_weight = state_dict["diffusion_model.context_embedder.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let context_embedder_bias = state_dict["diffusion_model.context_embedder.bias"].to(torch.float)
-      .cpu().numpy()
-    contextEmbedder.weight.copy(from: try! Tensor<Float>(numpy: context_embedder_weight))
-    contextEmbedder.bias.copy(from: try! Tensor<Float>(numpy: context_embedder_bias))
-    for reader in readers {
-      reader(state_dict)
-    }
-    let final_layer_adaln_modulation_weight = state_dict[
-      "diffusion_model.final_layer.adaLN_modulation.1.weight"
-    ].to(
-      torch.float
-    ).cpu().numpy()
-    let final_layer_adaln_modulation_bias = state_dict[
-      "diffusion_model.final_layer.adaLN_modulation.1.bias"
-    ].to(
-      torch.float
-    ).cpu().numpy()
-    shift.weight.copy(
-      from: try! Tensor<Float>(numpy: final_layer_adaln_modulation_weight[0..<1536, ...]))
-    shift.bias.copy(from: try! Tensor<Float>(numpy: final_layer_adaln_modulation_bias[0..<1536]))
-    scale.weight.copy(
-      from: try! Tensor<Float>(numpy: final_layer_adaln_modulation_weight[1536..<(1536 * 2), ...]))
-    scale.bias.copy(
-      from: try! Tensor<Float>(numpy: final_layer_adaln_modulation_bias[1536..<(1536 * 2)]))
-    let final_layer_linear_weight = state_dict["diffusion_model.final_layer.linear.weight"].to(
-      torch.float
-    ).cpu().numpy()
-    let final_layer_linear_bias = state_dict["diffusion_model.final_layer.linear.bias"].to(
-      torch.float
-    ).cpu().numpy()
-    linear.weight.copy(from: try! Tensor<Float>(numpy: final_layer_linear_weight))
-    linear.bias.copy(from: try! Tensor<Float>(numpy: final_layer_linear_bias))
   }
   return (reader, Model([x, t, contextIn, y], [out]))
 }
@@ -996,30 +658,65 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
 
 let (reader, dit) = MMDiT(b: 2, h: 64, w: 64)
 
+DynamicGraph.setSeed(42)
+
 graph.withNoGrad {
-  let xTensor = graph.variable(try! Tensor<Float>(numpy: x.to(torch.float).cpu().numpy()).toGPU(0))
+  var z = graph.variable(.GPU(0), .NCHW(1, 16, 128, 128), of: FloatType.self)
+  z.randn()
+  var input = graph.variable(.GPU(0), .NCHW(2, 16, 128, 128), of: FloatType.self)
   let tTensor = graph.variable(
     timeEmbedding(timesteps: 1000, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000).toGPU(0))
-  let cTensor = graph.variable(
-    try! Tensor<Float>(numpy: ctx.to(torch.float).cpu().numpy()).toGPU(0))
-  let yTensor = graph.variable(try! Tensor<Float>(numpy: y.to(torch.float).cpu().numpy()).toGPU(0))
-  dit.compile(inputs: xTensor, tTensor, cTensor, yTensor)
+  var cTensor = graph.variable(.GPU(0), .CHW(2, 154, 4096), of: FloatType.self)
+  cTensor.full(0)
+  cTensor[1..<2, 0..<154, 0..<4096] = c
+  var yTensor = graph.variable(.GPU(0), .NC(2, 2048), of: FloatType.self)
+  yTensor.full(0)
+  yTensor[1..<2, 0..<2048] = pooled
+  dit.compile(inputs: input, tTensor, cTensor, yTensor)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd3_medium_f32.ckpt") {
     $0.read("dit", model: dit)
   }
-  debugPrint(dit(inputs: xTensor, tTensor, cTensor, yTensor))
-}
-graph.withNoGrad {
-  let zTensor = graph.variable(try! Tensor<Float>(numpy: z.numpy())).toGPU(0)
+  let samplingSteps = 30
+  for i in (1...samplingSteps).reversed() {
+    print("\(i)")
+    let t = Float(i) / Float(samplingSteps) * 1_000
+    input[0..<1, 0..<16, 0..<128, 0..<128] = z
+    input[1..<2, 0..<16, 0..<128, 0..<128] = z
+    let tTensor = graph.variable(
+      timeEmbedding(timesteps: t, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000).toGPU(0))
+    // cfg = 4.5
+    let vcu = dit(inputs: input, tTensor, cTensor, yTensor)[0].as(of: FloatType.self)
+    let vu = vcu[0..<1, 0..<16, 0..<128, 0..<128]
+    let vc = vcu[1..<2, 0..<16, 0..<128, 0..<128]
+    let v = vu + 4.5 * (vc - vu)
+    z = z - (1 / Float(samplingSteps)) * v
+    debugPrint(z)
+  }
   // Already processed out.
-  // zTensor = (1.0 / 1.5305) * zTensor + 0.0609
+  z = (1.0 / 1.5305) * z + 0.0609
   let (_, decoder) = Decoder(
     channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 128, startHeight: 128)
-  decoder.compile(inputs: zTensor)
+  decoder.compile(inputs: z)
   graph.openStore("/home/liu/workspace/swift-diffusion/sd3_vae_f32.ckpt") {
     $0.read("decoder", model: decoder)
   }
-  let image = decoder(inputs: zTensor)[0].as(of: Float.self)
-  let decodedImage = (image.permuted(0, 2, 3, 1) + 1) * 0.5
-  debugPrint(decodedImage)
+  let img = decoder(inputs: z)[0].as(of: FloatType.self).toCPU()
+  let startHeight = 128
+  let startWidth = 128
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
+  for y in 0..<startHeight * 8 {
+    for x in 0..<startWidth * 8 {
+      let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
+      rgba[y * startWidth * 8 + x].r = UInt8(
+        min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
+      rgba[y * startWidth * 8 + x].g = UInt8(
+        min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
+      rgba[y * startWidth * 8 + x].b = UInt8(
+        min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
+    }
+  }
+  let image = PNG.Data.Rectangular(
+    packing: rgba, size: (startWidth * 8, startHeight * 8),
+    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+  try! image.compress(path: "/home/liu/workspace/swift-diffusion/txt2img.png", level: 4)
 }

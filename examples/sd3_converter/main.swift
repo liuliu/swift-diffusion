@@ -94,8 +94,6 @@ let vaedecode_231 = vaedecode.decode(
   vae: checkpointloadersimple_252[2]
 )
 
-print(vaedecode_231[0])
-
 let vae_state_dict = checkpointloadersimple_252[2].first_stage_model.state_dict()
 
 func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (
