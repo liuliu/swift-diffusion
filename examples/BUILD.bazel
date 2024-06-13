@@ -656,9 +656,14 @@ swift_binary(
 )
 
 swift_binary(
-    name = "sd3",
-    srcs = ["sd3/main.swift"],
+    name = "sd3_converter",
+    srcs = ["sd3_converter/main.swift"],
     data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+        "open_clip/bpe_simple_vocab_16e6.txt",
+        "open_clip/vocab_16e6.json",
+        "sd3/spiece.model",
     ],
     deps = [
         "//:diffusion",
@@ -667,5 +672,27 @@ swift_binary(
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
         "@s4nnc//nnc:nnc_python",
+        "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
+
+swift_binary(
+    name = "sd3",
+    srcs = ["sd3/main.swift"],
+    data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+        "open_clip/bpe_simple_vocab_16e6.txt",
+        "open_clip/vocab_16e6.json",
+        "sd3/spiece.model",
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+        "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )

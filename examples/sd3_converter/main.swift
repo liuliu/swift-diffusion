@@ -7,6 +7,97 @@ import SentencePiece
 
 typealias FloatType = Float
 
+let torch = Python.import("torch")
+let nodes = Python.import("nodes")
+torch.set_grad_enabled(false)
+
+nodes.init_custom_nodes()
+let triplecliploader = nodes.NODE_CLASS_MAPPINGS["TripleCLIPLoader"]()
+let triplecliploader_11 = triplecliploader.load_clip(
+  clip_name1: "clip_g.safetensors",
+  clip_name2: "clip_l.safetensors",
+  clip_name3: "t5xxl_fp16.safetensors"
+)
+
+let cliptextencode = nodes.CLIPTextEncode()
+let cliptextencode_71 = cliptextencode.encode(
+  text: "", clip: triplecliploader_11[0]
+)
+
+let emptysd3latentimage = nodes.NODE_CLASS_MAPPINGS["EmptySD3LatentImage"]()
+let emptysd3latentimage_135 = emptysd3latentimage.generate(
+  width: 1024, height: 1024, batch_size: 1
+)
+
+let checkpointloadersimple = nodes.CheckpointLoaderSimple()
+let checkpointloadersimple_252 = checkpointloadersimple.load_checkpoint(
+  ckpt_name: "sdv3/2b_1024/sd3_medium.safetensors"
+)
+
+let cliptextencodesd3 = nodes.NODE_CLASS_MAPPINGS["CLIPTextEncodeSD3"]()
+let cliptextencodesd3_273 = cliptextencodesd3.encode(
+  clip_l:
+    "photo of a young woman with long, wavy brown hair lying down in grass, top down shot, summer, warm, laughing, joy, fun",
+  clip_g:
+    "photo of a young woman with long, wavy brown hair lying down in grass, top down shot, summer, warm, laughing, joy, fun",
+  t5xxl:
+    "photo of a young woman with long, wavy brown hair lying down in grass, top down shot, summer, warm, laughing, joy, fun",
+  empty_padding: "none",
+  clip: triplecliploader_11[0]
+)
+
+let modelsamplingsd3 = nodes.NODE_CLASS_MAPPINGS["ModelSamplingSD3"]()
+let conditioningzeroout = nodes.ConditioningZeroOut()
+let conditioningsettimesteprange = nodes.ConditioningSetTimestepRange()
+let conditioningcombine = nodes.ConditioningCombine()
+let ksampler = nodes.KSampler()
+let vaedecode = nodes.VAEDecode()
+
+let modelsamplingsd3_13 = modelsamplingsd3.patch(
+  shift: 3, model: checkpointloadersimple_252[0]
+)
+
+let conditioningzeroout_67 = conditioningzeroout.zero_out(
+  conditioning: cliptextencode_71[0]
+)
+
+let conditioningsettimesteprange_68 = conditioningsettimesteprange.set_range(
+  start: 0.1,
+  end: 1,
+  conditioning: conditioningzeroout_67[0]
+)
+
+let conditioningsettimesteprange_70 = conditioningsettimesteprange.set_range(
+  start: 0, end: 0.1, conditioning: cliptextencode_71[0]
+)
+
+let conditioningcombine_69 = conditioningcombine.combine(
+  conditioning_1: conditioningsettimesteprange_68[0],
+  conditioning_2: conditioningsettimesteprange_70[0]
+)
+
+let ksampler_271 = ksampler.sample(
+  seed: 23,
+  steps: 28,
+  cfg: 4.5,
+  sampler_name: "dpmpp_2m",
+  scheduler: "sgm_uniform",
+  denoise: 1,
+  model: modelsamplingsd3_13[0],
+  positive: cliptextencodesd3_273[0],
+  negative: conditioningcombine_69[0],
+  latent_image: emptysd3latentimage_135[0]
+)
+
+let vaedecode_231 = vaedecode.decode(
+  samples: ksampler_271[0],
+  vae: checkpointloadersimple_252[2]
+)
+
+print(vaedecode_231[0])
+
+let vae_state_dict = checkpointloadersimple_252[2].first_stage_model.state_dict()
+
 func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (
   (PythonObject) -> Void, Model
 ) {
@@ -286,7 +377,30 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
   return (reader, Model([x], [out]))
 }
 
+let z = ksampler_271[0]["samples"].to(torch.float).cpu()
 let graph = DynamicGraph()
+graph.withNoGrad {
+  let zTensor = graph.variable(try! Tensor<Float>(numpy: z.numpy())).toGPU(0)
+  // Already processed out.
+  // zTensor = (1.0 / 1.5305) * zTensor + 0.0609
+  debugPrint(zTensor)
+  let (decoderReader, decoder) = Decoder(
+    channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 128, startHeight: 128)
+  decoder.compile(inputs: zTensor)
+  decoderReader(vae_state_dict)
+  let image = decoder(inputs: zTensor)[0].as(of: Float.self)
+  let decodedImage = (image.permuted(0, 2, 3, 1) + 1) * 0.5
+  debugPrint(decodedImage)
+  let (encoderReader, encoder) = Encoder(
+    channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 128, startHeight: 128)
+  encoder.compile(inputs: image)
+  encoderReader(vae_state_dict)
+  let _ = encoder(inputs: image)[0].as(of: Float.self)
+  graph.openStore("/home/liu/workspace/swift-diffusion/sd3_vae_f32.ckpt") {
+    $0.write("encoder", model: encoder)
+    $0.write("decoder", model: decoder)
+  }
+}
 
 func CLIPTextModel(
   vocabularySize: Int, maxLength: Int, embeddingSize: Int, numLayers: Int, numHeads: Int,
@@ -610,6 +724,26 @@ let (c, pooled) = graph.withNoGrad {
 
 debugPrint(c)
 debugPrint(pooled)
+
+let random = Python.import("random")
+let numpy = Python.import("numpy")
+
+random.seed(42)
+numpy.random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
+let x = torch.randn([2, 16, 128, 128]).to(torch.float16).cuda()
+let y = torch.randn([2, 2048]).to(torch.float16).cuda() * 0.01
+let t = torch.full([2], 1000).cuda()
+let ctx = torch.randn([2, 154, 4096]).to(torch.float16).cuda() * 0.01
+
+let diffusion_model = modelsamplingsd3_13[0].model.diffusion_model.cuda()
+
+let out = diffusion_model(x: x, timesteps: t, context: ctx, y: y)
+print(out)
+
+let state_dict = modelsamplingsd3_13[0].model.state_dict()
 
 func TimeEmbedder(channels: Int) -> (Model, Model, Model) {
   let x = Input()
@@ -1004,22 +1138,9 @@ graph.withNoGrad {
     try! Tensor<Float>(numpy: ctx.to(torch.float).cpu().numpy()).toGPU(0))
   let yTensor = graph.variable(try! Tensor<Float>(numpy: y.to(torch.float).cpu().numpy()).toGPU(0))
   dit.compile(inputs: xTensor, tTensor, cTensor, yTensor)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sd3_medium_f32.ckpt") {
-    $0.read("dit", model: dit)
-  }
+  reader(state_dict)
   debugPrint(dit(inputs: xTensor, tTensor, cTensor, yTensor))
-}
-graph.withNoGrad {
-  let zTensor = graph.variable(try! Tensor<Float>(numpy: z.numpy())).toGPU(0)
-  // Already processed out.
-  // zTensor = (1.0 / 1.5305) * zTensor + 0.0609
-  let (_, decoder) = Decoder(
-    channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 128, startHeight: 128)
-  decoder.compile(inputs: zTensor)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sd3_vae_f32.ckpt") {
-    $0.read("decoder", model: decoder)
+  graph.openStore("/home/liu/workspace/swift-diffusion/sd3_medium_f32.ckpt") {
+    $0.write("dit", model: dit)
   }
-  let image = decoder(inputs: zTensor)[0].as(of: Float.self)
-  let decodedImage = (image.permuted(0, 2, 3, 1) + 1) * 0.5
-  debugPrint(decodedImage)
 }
