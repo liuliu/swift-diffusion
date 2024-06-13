@@ -654,3 +654,18 @@ swift_binary(
         "@s4nnc//nnc:nnc_python",
     ],
 )
+
+swift_binary(
+    name = "sd3",
+    srcs = ["sd3/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
