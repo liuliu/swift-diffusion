@@ -249,7 +249,7 @@ func OpenCLIPTextModel(
 
 func T5TextEmbedding(vocabularySize: Int, embeddingSize: Int, name: String) -> Model {
   let tokenEmbed = Embedding(
-    Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: name)
+    FloatType.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: name)
   return tokenEmbed
 }
 
@@ -281,9 +281,11 @@ func T5DenseGatedActDense(hiddenSize: Int, intermediateSize: Int) -> (Model, Mod
   let x = Input()
   let wi_0 = Dense(count: intermediateSize, noBias: true, name: "w0")
   let wi_1 = Dense(count: intermediateSize, noBias: true, name: "w1")
-  var out = wi_1(x) .* wi_0(x).GELU(approximate: .tanh)
+  var out = wi_1(x).to(.Float32) .* wi_0(x).GELU(approximate: .tanh).to(.Float32)
   let wo = Dense(count: hiddenSize, noBias: true, name: "wo")
-  out = wo(out)
+  // Need to apply a scale factor if T5 has to work with Float16.
+  let scaleFactor: Float = 8
+  out = scaleFactor * wo(((1 / scaleFactor) * out).to(of: x)).to(.Float32)
   return (wi_0, wi_1, wo, Model([x], [out]))
 }
 
@@ -295,11 +297,11 @@ func T5Block(
   let norm1 = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm1")
   let (tokeys, toqueries, tovalues, unifyheads, attention) = T5LayerSelfAttention(
     k: k, h: h, b: b, t: t, outFeatures: outFeatures)
-  var out = x + attention(norm1(x), positionBias)
-  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm1")
+  var out = x + attention(norm1(x).to(FloatType.dataType), positionBias).to(of: x)
+  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm2")
   let (wi_0, wi_1, wo, ff) = T5DenseGatedActDense(
     hiddenSize: outFeatures, intermediateSize: intermediateSize)
-  out = out + ff(norm2(out))
+  out = out + ff(norm2(out).to(FloatType.dataType))
   let reader: (PythonObject) -> Void = { state_dict in
   }
   return (reader, Model([x, positionBias], [out]))
@@ -309,11 +311,11 @@ func T5ForConditionalGeneration(b: Int, t: Int) -> ((PythonObject) -> Void, Mode
   let x = Input()
   let relativePositionBuckets = Input()
   let textEmbed = T5TextEmbedding(vocabularySize: 32_128, embeddingSize: 4_096, name: "shared")
-  var out = textEmbed(x)
+  var out = textEmbed(x).to(.Float32)
   let relativePositionEmbedding = Embedding(
-    Float.self, vocabularySize: 32, embeddingSize: 64, name: "relative_position_embedding")
+    FloatType.self, vocabularySize: 32, embeddingSize: 64, name: "relative_position_embedding")
   let positionBias = relativePositionEmbedding(relativePositionBuckets).reshaped([1, t, t, 64])
-    .permuted(0, 3, 1, 2)
+    .permuted(0, 3, 1, 2).contiguous()
   var readers = [(PythonObject) -> Void]()
   for i in 0..<24 {
     let (reader, block) = T5Block(
@@ -323,7 +325,7 @@ func T5ForConditionalGeneration(b: Int, t: Int) -> ((PythonObject) -> Void, Mode
     readers.append(reader)
   }
   let finalNorm = RMSNorm(epsilon: 1e-6, axis: [1], name: "final_norm")
-  out = finalNorm(out)
+  out = finalNorm(out).to(FloatType.dataType)
   let reader: (PythonObject) -> Void = { state_dict in
   }
   return (reader, Model([x, relativePositionBuckets], [out]))
@@ -462,8 +464,9 @@ let c2 = graph.withNoGrad {
   graph.openStore("/home/liu/workspace/swift-llm/t5_xxl_encoder_f32.ckpt") {
     $0.read("text_model", model: textModel)
   }
-  let output = textModel(inputs: tokensTensorGPU, relativePositionBucketsGPU)[0].as(of: Float.self)
-  return DynamicGraph.Tensor<FloatType>(from: output)
+  let output = textModel(inputs: tokensTensorGPU, relativePositionBucketsGPU)[0].as(
+    of: FloatType.self)
+  return output
 }
 
 let (c, pooled) = graph.withNoGrad {
