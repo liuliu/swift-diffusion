@@ -339,7 +339,8 @@ let tokenizer1 = CLIPTokenizer(
   merges: "examples/open_clip/bpe_simple_vocab_16e6.txt")
 
 let prompt =
-  "photo of a young woman with long, wavy brown hair lying down in grass, top down shot, summer, warm, laughing, joy, fun"
+  // "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
+  "photo of a young woman with long, wavy brown hair sleeping in grassfield, top down shot, summer, warm, laughing, joy, fun"
 let negativePrompt = ""
 
 let tokens0 = tokenizer0.tokenize(text: prompt, truncation: true, maxLength: 77)
@@ -355,13 +356,16 @@ tokens2.append(1)
 
 let tokensTensor0 = graph.variable(.CPU, .C(77), of: Int32.self)
 let tokensTensor1 = graph.variable(.CPU, .C(77), of: Int32.self)
-let tokensTensor2 = graph.variable(.CPU, .C(77), of: Int32.self)
+let tokensTensor2 = graph.variable(.CPU, .C(tokens2.count), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(77), of: Int32.self)
 for i in 0..<77 {
   tokensTensor0[i] = tokens0[i]
   tokensTensor1[i] = tokens1[i]
-  tokensTensor2[i] = i < tokens2.count ? tokens2[i] : 0
   positionTensor[i] = Int32(i)
+}
+for i in 0..<tokens2.count {
+  // tokensTensor2[i] = i < tokens2.count ? tokens2[i] : 0
+  tokensTensor2[i] = tokens2[i]
 }
 
 func relativePositionBuckets(sequenceLength: Int, numBuckets: Int, maxDistance: Int) -> Tensor<
@@ -455,9 +459,9 @@ let (c1, c1Pooled) = graph.withNoGrad {
 }
 
 let c2 = graph.withNoGrad {
-  let (_, textModel) = T5ForConditionalGeneration(b: 1, t: 77)
+  let (_, textModel) = T5ForConditionalGeneration(b: 1, t: tokens2.count)
   let relativePositionBuckets = relativePositionBuckets(
-    sequenceLength: 77, numBuckets: 32, maxDistance: 128)
+    sequenceLength: tokens2.count, numBuckets: 32, maxDistance: 128)
   let tokensTensorGPU = tokensTensor2.toGPU(0)
   let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
   textModel.compile(inputs: tokensTensorGPU, relativePositionBucketsGPU)
@@ -473,11 +477,11 @@ let (c, pooled) = graph.withNoGrad {
   var pooled = graph.variable(.GPU(0), .NC(1, 2048), of: FloatType.self)
   pooled[0..<1, 0..<768] = c0Pooled
   pooled[0..<1, 768..<2048] = c1Pooled
-  var c = graph.variable(.GPU(0), .CHW(1, 154, 4096), of: FloatType.self)
+  var c = graph.variable(.GPU(0), .CHW(1, 77 + tokens2.count, 4096), of: FloatType.self)
   c.full(0)
   c[0..<1, 0..<77, 0..<768] = c0
   c[0..<1, 0..<77, 768..<2048] = c1
-  c[0..<1, 77..<154, 0..<4096] = c2
+  c[0..<1, 77..<(77 + tokens2.count), 0..<4096] = c2
   return (c, pooled)
 }
 
@@ -592,9 +596,9 @@ func JointTransformerBlock(
   }
 }
 
-func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
+func MMDiT(b: Int, t: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
-  let t = Input()
+  let timestep = Input()
   let y = Input()
   let contextIn = Input()
   let xEmbedder = Convolution(
@@ -609,13 +613,13 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   out = spatialPosEmbed + out
   let (tMlp0, tMlp2, tEmbedder) = TimeEmbedder(channels: 1536)
   let (yMlp0, yMlp2, yEmbedder) = VectorEmbedder(channels: 1536)
-  let c = (tEmbedder(t) + yEmbedder(y)).reshaped([b, 1, 1536]).swish()
+  let c = (tEmbedder(timestep) + yEmbedder(y)).reshaped([b, 1, 1536]).swish()
   let contextEmbedder = Dense(count: 1536, name: "context_embedder")
   var context = contextEmbedder(contextIn)
   var readers = [(PythonObject) -> Void]()
   for i in 0..<24 {
     let (reader, block) = JointTransformerBlock(
-      prefix: "diffusion_model.joint_blocks.\(i)", k: 64, h: 24, b: b, t: 154, hw: h * w,
+      prefix: "diffusion_model.joint_blocks.\(i)", k: 64, h: 24, b: b, t: t, hw: h * w,
       contextBlockPreOnly: i == 23)
     let blockOut = block(context, out, c)
     if i == 23 {
@@ -638,7 +642,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   ])
   let reader: (PythonObject) -> Void = { state_dict in
   }
-  return (reader, Model([x, t, contextIn, y], [out]))
+  return (reader, Model([x, timestep, contextIn, y], [out]))
 }
 
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
@@ -659,7 +663,7 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
   return embedding
 }
 
-let (reader, dit) = MMDiT(b: 2, h: 64, w: 64)
+let (reader, dit) = MMDiT(b: 2, t: 77 + tokens2.count, h: 64, w: 64)
 
 DynamicGraph.setSeed(42)
 
@@ -671,9 +675,9 @@ graph.withNoGrad {
     Tensor<FloatType>(
       from: timeEmbedding(timesteps: 1000, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000)
         .toGPU(0)))
-  var cTensor = graph.variable(.GPU(0), .CHW(2, 154, 4096), of: FloatType.self)
+  var cTensor = graph.variable(.GPU(0), .CHW(2, 77 + tokens2.count, 4096), of: FloatType.self)
   cTensor.full(0)
-  cTensor[1..<2, 0..<154, 0..<4096] = c
+  cTensor[1..<2, 0..<(77 + tokens2.count), 0..<4096] = c
   var yTensor = graph.variable(.GPU(0), .NC(2, 2048), of: FloatType.self)
   yTensor.full(0)
   yTensor[1..<2, 0..<2048] = pooled
