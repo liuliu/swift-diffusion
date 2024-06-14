@@ -394,10 +394,12 @@ graph.withNoGrad {
   encoder.compile(inputs: image)
   encoderReader(vae_state_dict)
   let _ = encoder(inputs: image)[0].as(of: Float.self)
+  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/sd3_vae_f32.ckpt") {
     $0.write("encoder", model: encoder)
     $0.write("decoder", model: decoder)
   }
+  */
 }
 
 func CLIPTextModel(
@@ -761,11 +763,11 @@ func VectorEmbedder(channels: Int) -> (Model, Model, Model) {
   return (fc0, fc2, Model([x], [out]))
 }
 
-func MLP(hiddenSize: Int, intermediateSize: Int) -> (Model, Model, Model) {
+func MLP(hiddenSize: Int, intermediateSize: Int, name: String) -> (Model, Model, Model) {
   let x = Input()
-  let fc1 = Dense(count: intermediateSize)
+  let fc1 = Dense(count: intermediateSize, name: "\(name)_fc1")
   var out = GELU(approximate: .tanh)(fc1(x))
-  let fc2 = Dense(count: hiddenSize)
+  let fc2 = Dense(count: hiddenSize, name: "\(name)_fc2")
   out = fc2(out)
   return (fc1, fc2, Model([x], [out]))
 }
@@ -815,7 +817,7 @@ func JointTransformerBlock(
   let contextUnifyheads: Model?
   if !contextBlockPreOnly {
     contextOut = out.reshaped([b, t, h * k], strides: [(t + hw) * h * k, h * k, 1]).contiguous()
-    let unifyheads = Dense(count: k * h)
+    let unifyheads = Dense(count: k * h, name: "c_o")
     contextOut = unifyheads(contextOut)
     contextUnifyheads = unifyheads
   } else {
@@ -823,7 +825,7 @@ func JointTransformerBlock(
   }
   xOut = out.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
     .contiguous()
-  let xUnifyheads = Dense(count: k * h)
+  let xUnifyheads = Dense(count: k * h, name: "x_o")
   xOut = xUnifyheads(xOut)
   if !contextBlockPreOnly {
     contextOut = context + contextChunks[2] .* contextOut
@@ -834,7 +836,8 @@ func JointTransformerBlock(
   let contextFc2: Model?
   if !contextBlockPreOnly {
     let contextMlp: Model
-    (contextFc1, contextFc2, contextMlp) = MLP(hiddenSize: k * h, intermediateSize: k * h * 4)
+    (contextFc1, contextFc2, contextMlp) = MLP(
+      hiddenSize: k * h, intermediateSize: k * h * 4, name: "c")
     let contextNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
     contextOut = contextOut + contextChunks[5]
       .* contextMlp(contextNorm2(contextOut) .* (1 + contextChunks[4]) + contextChunks[3])
@@ -842,7 +845,7 @@ func JointTransformerBlock(
     contextFc1 = nil
     contextFc2 = nil
   }
-  let (xFc1, xFc2, xMlp) = MLP(hiddenSize: k * h, intermediateSize: k * h * 4)
+  let (xFc1, xFc2, xMlp) = MLP(hiddenSize: k * h, intermediateSize: k * h * 4, name: "x")
   let xNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   xOut = xOut + xChunks[5] .* xMlp(xNorm2(xOut) .* (1 + xChunks[4]) + xChunks[3])
   let reader: (PythonObject) -> Void = { state_dict in
@@ -996,7 +999,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
     groups: 1, filters: 1536, filterSize: [2, 2],
     hint: Hint(stride: [2, 2]), name: "x_embedder")
   var out = xEmbedder(x).reshaped([b, 1536, h * w]).transposed(1, 2)
-  let posEmbed = Parameter<Float>(.GPU(0), .NHWC(1, 192, 192, 1536))
+  let posEmbed = Parameter<Float>(.GPU(0), .NHWC(1, 192, 192, 1536), name: "pos_embed")
   let spatialPosEmbed = posEmbed.reshaped(
     [1, h, w, 1536], offset: [0, (192 - h) / 2, (192 - w) / 2, 0],
     strides: [192 * 192 * 1536, 192 * 1536, 1536, 1]
