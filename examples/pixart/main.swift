@@ -432,7 +432,6 @@ let alphasCumprod = model.alphasCumprod
 let sigmasForTimesteps = DiffusionModel.sigmas(from: alphasCumprod)
 // This is for Karras scheduler (used in DPM++ 2M Karras)
 let sigmas = model.fixedStepSigmas(sigmas: sigmasForTimesteps)
-print(sigmas)
 
 let (reader, dit) = PixArt(b: 2, h: 64, w: 64, t: tokens2.count)
 
@@ -462,7 +461,7 @@ let z = graph.withNoGrad {
     let ts = timeEmbedding(
       timestep: timestep, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000
     ).toGPU(0)
-    let t = graph.variable(Tensor<FloatType>(from: ts))
+    let tTensor = graph.variable(Tensor<FloatType>(from: ts))
     let cIn = 1.0 / (sigma * sigma + 1).squareRoot()
     let cOut = -sigma
     xIn[0..<1, 0..<4, 0..<startHeight, 0..<startWidth] = cIn * x
