@@ -4,7 +4,7 @@ import NNC
 import PNG
 import SentencePiece
 
-typealias FloatType = Float
+typealias FloatType = Float16
 struct PythonObject {}
 
 func T5TextEmbedding(vocabularySize: Int, embeddingSize: Int, name: String) -> Model {
@@ -444,12 +444,15 @@ let z = graph.withNoGrad {
   var x = x_T
   var xIn = graph.variable(.GPU(0), .NCHW(2, 4, 128, 128), of: FloatType.self)
   let tTensor = graph.variable(
-    timeEmbedding(timesteps: 666, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000).toGPU(0))
+    Tensor<FloatType>(
+      from: timeEmbedding(timesteps: 666, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000)
+        .toGPU(0)))
   let posEmbedTensor = graph.variable(
-    sinCos2DPositionEmbedding(height: 64, width: 64, embeddingSize: 1152).toGPU(0)
+    Tensor<FloatType>(
+      from: sinCos2DPositionEmbedding(height: 64, width: 64, embeddingSize: 1152).toGPU(0))
   ).reshaped(.CHW(1, 4096, 1152))
   dit.compile(inputs: xIn, posEmbedTensor, tTensor, cTensor)
-  graph.openStore("/home/liu/workspace/swift-diffusion/pixart_sigma_xl_2_1024_ms_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/pixart_sigma_xl_2_1024_ms_f16.ckpt") {
     $0.read("dit", model: dit)
   }
   var oldDenoised: DynamicGraph.Tensor<FloatType>? = nil

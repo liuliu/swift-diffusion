@@ -3,18 +3,20 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/sd3_medium_f32.ckpt",
+  "/home/liu/workspace/swift-diffusion/pixart_sigma_xl_2_1024_ms_f32.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/sd3_medium_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/pixart_sigma_xl_2_1024_ms_f16.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
       guard let tensor = (store.read(key).map { Tensor<Float16>(from: $0).toCPU() }) else {
         continue
       }
+      $0.write(key, tensor: tensor)
+      continue
       if key.contains("__stage_c_fixed__") && (key.contains("key") || key.contains("value")) {
         continue
       }
