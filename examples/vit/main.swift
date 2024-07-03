@@ -80,12 +80,13 @@ func CLIPResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int) 
   return (reader, Model([x], [out]))
 }
 
-func VisionTransformer(
+func VisionTransformer<T: TensorNumeric>(
+  _ dataType: T.Type,
   grid: Int, width: Int, outputDim: Int, layers: Int, heads: Int, batchSize: Int
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
-  let classEmbedding = Input()
-  let positionalEmbedding = Input()
+  let classEmbedding = Parameter<T>(.GPU(0), .HWC(1, 1, width))
+  let positionalEmbedding = Parameter<T>(.GPU(0), .HWC(1, grid * grid + 1, width))
   let conv1 = Convolution(
     groups: 1, filters: width, filterSize: [14, 14], noBias: true,
     hint: Hint(stride: [14, 14]))
@@ -102,11 +103,13 @@ func VisionTransformer(
     out = block(out.reshaped([batchSize, grid * grid + 1, width]))
     readers.append(reader)
   }
-  let lnPost = LayerNorm(epsilon: 1e-5, axis: [1])
+  let lnPost = LayerNorm(epsilon: 1e-5, axis: [1], name: "post_layernorm")
   out = lnPost(out.reshaped([batchSize, width], strides: [width, 1]))
-  let proj = Dense(count: outputDim, noBias: true)
-  out = proj(out)
   let reader: (PythonObject) -> Void = { state_dict in
+    let class_embedding = state_dict["class_embedding"].type(torch.float).cpu().numpy()
+    classEmbedding.weight.copy(from: try! Tensor<Float>(numpy: class_embedding))
+    let positional_embedding = state_dict["positional_embedding"].type(torch.float).cpu().numpy()
+    positionalEmbedding.weight.copy(from: try! Tensor<Float>(numpy: positional_embedding))
     let conv1_weight = state_dict["conv1.weight"].type(torch.float).cpu().numpy()
     conv1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv1_weight))
     let ln_pre_weight = state_dict["ln_pre.weight"].type(torch.float).cpu().numpy()
@@ -120,17 +123,8 @@ func VisionTransformer(
     let ln_post_bias = state_dict["ln_post.bias"].type(torch.float).cpu().numpy()
     lnPost.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: ln_post_weight))
     lnPost.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ln_post_bias))
-    let proj_weight = state_dict["proj"].type(torch.float).cpu().numpy()
-    // Somehow I have problems with transposed numpy array.
-    var projTensor = Tensor<Float>(.CPU, .NC(outputDim, width))
-    for i in 0..<outputDim {
-      for j in 0..<width {
-        projTensor[i, j] = Float(proj_weight[j, i])!
-      }
-    }
-    proj.parameters(for: .weight).copy(from: projTensor)
   }
-  return (reader, Model([x, classEmbedding, positionalEmbedding], [out]))
+  return (reader, Model([x], [out]))
 }
 
 let clip = Python.import("clip")
@@ -161,33 +155,26 @@ for i in 0..<768 {
     textProj[i, j] = Float(text_proj[i, j])!
   }
 }
+let proj_weight = state_dict["proj"].type(torch.float).cpu().numpy()
+let visualProj = try! Tensor<Float>(numpy: proj_weight)
 
 let graph = DynamicGraph()
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let (reader, vit) = VisionTransformer(
+  Float.self,
   grid: 16, width: 1024, outputDim: 768, layers: 24, heads: 16, batchSize: 1)
 graph.workspaceSize = 1_024 * 1_024 * 1_024
 graph.withNoGrad {
-  let class_embedding = state_dict["class_embedding"].type(torch.float).cpu().numpy()
-  let classEmbedding = graph.variable(try! Tensor<Float>(numpy: class_embedding)).reshaped(
-    .CHW(1, 1, 1024)
-  ).toGPU(0)
-  let positional_embedding = state_dict["positional_embedding"].type(torch.float).cpu().numpy()
-  let positionalEmbedding = graph.variable(try! Tensor<Float>(numpy: positional_embedding))
-    .reshaped(.CHW(1, 16 * 16 + 1, 1024)).toGPU(0)
-  let _ = vit(inputs: xTensor, classEmbedding, positionalEmbedding)
+  let _ = vit(inputs: xTensor)
   reader(state_dict)
   // DynamicGraph.logLevel = .verbose
-  let out = vit(inputs: xTensor, classEmbedding, positionalEmbedding)[0].as(of: Float.self).toCPU()
-  for j in 0..<768 {
-    print("\(j) \(out[0, j])")
-  }
+  let out = vit(inputs: xTensor)[0].as(of: Float.self).toCPU()
+  debugPrint(out)
   let textProj = graph.variable(textProj)
 
   graph.openStore("/home/liu/workspace/swift-diffusion/image_model.ckpt") {
-    $0.write("vit", model: vit)
-    $0.write("class_embedding", variable: classEmbedding)
-    $0.write("positional_embedding", variable: positionalEmbedding)
+    $0.write("vision_model", model: vit)
+    $0.write("visual_proj", tensor: visualProj)
     $0.write("text_proj", variable: textProj)
   }
 }

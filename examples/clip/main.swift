@@ -11,7 +11,7 @@ func CLIPTextEmbedding(vocabularySize: Int, maxLength: Int, embeddingSize: Int) 
     Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize)
   let positionEmbed = Embedding(Float.self, vocabularySize: maxLength, embeddingSize: embeddingSize)
   let embedding = tokenEmbed(tokens) + positionEmbed(positions)
-  return (tokenEmbed, positionEmbed, Model([tokens, positions], [embedding], name: "embeddings"))
+  return (tokenEmbed, positionEmbed, Model([tokens, positions], [embedding]))
 }
 
 func CLIPAttention(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model, Model, Model) {
@@ -120,11 +120,12 @@ let tokenizer = transformers.CLIPTokenizer.from_pretrained("openai/clip-vit-larg
 let transformer = transformers.CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
 
 let batch_encoding = tokenizer(
-  ["a photograph of an astronaut riding a horse"], truncation: true, max_length: 77,
+  ["a photo of a cat"], truncation: true, max_length: 77,
   return_length: true, return_overflowing_tokens: false, padding: "max_length", return_tensors: "pt"
 )
 let tokens = batch_encoding["input_ids"]
 let outputs = transformer(input_ids: tokens)
+print(outputs[1])
 let state_dict = transformer.state_dict()
 
 let (
@@ -206,15 +207,14 @@ finalLayerNorm.parameters(for: .weight).copy(
   from: try! Tensor<Float>(numpy: final_layer_norm_weight))
 finalLayerNorm.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: final_layer_norm_bias))
 
-let c = textModel(inputs: tokensTensor, positionTensor, casualAttentionMask)[0].as(of: Float.self)
-for i in 0..<6 {
-  let x = i < 3 ? i : 71 + i
-  for j in 0..<6 {
-    let y = j < 3 ? j : 762 + j
-    print("\(x) \(y) \(c[x, y])")
-  }
+graph.openStore("/home/liu/workspace/swift-diffusion/clip_vit_l14_f16.ckpt") {
+  $0.read("text_model", model: textModel)
 }
+let c = textModel(inputs: tokensTensor, positionTensor, casualAttentionMask)[0].as(of: Float.self)
+debugPrint(c[6..<7, 0..<768])
 
+/*
 graph.openStore("/home/liu/workspace/swift-diffusion/text_model.ckpt") {
   $0.write("text_model", model: textModel)
 }
+*/
