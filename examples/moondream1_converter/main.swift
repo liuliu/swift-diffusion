@@ -12,14 +12,16 @@ let Image = Python.import("PIL.Image")
 
 let device = torch.device("cuda")
 
-let raw_image = Image.open("/home/liu/workspace/swift-diffusion/kandinsky-512.png").convert("RGB")
+let raw_image = Image.open("/home/liu/workspace/swift-diffusion/kandinsky.png")  //.convert("RGB")
 
 let transformers = Python.import("transformers")
 
 torch.set_grad_enabled(false)
 let model_id = "vikhyatk/moondream2"
-let model = transformers.AutoModelForCausalLM.from_pretrained(model_id, trust_remote_code: true)
-let tokenizer = transformers.CodeGenTokenizerFast.from_pretrained(model_id)
+let revision = "2024-05-20"
+let model = transformers.AutoModelForCausalLM.from_pretrained(
+  model_id, trust_remote_code: true, revision: revision)
+let tokenizer = transformers.AutoTokenizer.from_pretrained(model_id, revision: revision)
 
 let enc_image = model.encode_image(raw_image)
 print(enc_image)
@@ -35,9 +37,9 @@ input_ids = torch.cat([torch.tensor([[tokenizer.bos_token_id]]), input_ids], dim
 // print(input_ids)
 
 let vision_encoder_state_dict = model.vision_encoder.state_dict()
-print(vision_encoder_state_dict.keys())
+// print(vision_encoder_state_dict.keys())
 let text_model_state_dict = model.text_model.state_dict()
-print(text_model_state_dict.keys())
+// print(text_model_state_dict.keys())
 let input_embeds = model.text_model.transformer.embd.wte(input_ids)
 /*
 print(
@@ -45,7 +47,6 @@ print(
     inputs_embeds: input_embeds, bos_token_id: tokenizer.bos_token_id,
     pad_token_id: tokenizer.pad_token_id, max_new_tokens: 1))
 */
-print(input_embeds)
 
 func SigLIPSelfAttention(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model, Model, Model) {
   let x = Input()
@@ -77,7 +78,7 @@ func SigLIPResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int
   var out = x.reshaped([b * t, h * k]) + attention(ln1(x))
   let ln2 = LayerNorm(epsilon: 1e-6, axis: [1])
   let fc = Dense(count: MLP)
-  let gelu = GELU()
+  let gelu = GELU(approximate: .tanh)
   let proj = Dense(count: k * h)
   out = out + proj(gelu(fc(ln2(out))))
   let reader: (PythonObject) -> Void = { state_dict in
@@ -167,7 +168,7 @@ func SigLIPVisionTransformer(
 func MoondreamVisionProjection(layers: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let mlp1fc = Dense(count: 2048 * 4)
-  let mlp1gelu = GELU()
+  let mlp1gelu = GELU(approximate: .tanh)
   let mlp1proj = Dense(count: 2048)
   var out = mlp1proj(mlp1gelu(mlp1fc(x)))
   if layers > 1 {
@@ -383,14 +384,13 @@ torch.cuda.manual_seed_all(42)
 
 let x = torch.randn([1, 3, 378, 378])
 let encoded =
-  model.vision_encoder.encoder(
-    einops.rearrange(x, "b c (h p1) (w p2) -> b (h w) (c p1 p2)", p1: 14, p2: 14))
-print(model.vision_encoder.projection(encoded))
+  model.vision_encoder.encoder(x)
+print(model.vision_encoder.projection(torch.concat([encoded, encoded], dim: 2)))
 let graph = DynamicGraph()
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let (reader, vit) = SigLIPVisionTransformer(
   gridX: 27, gridY: 27, width: 1152, layers: 27, heads: 16, MLP: 4304, batchSize: 1)
-let (projReader, proj) = MoondreamVisionProjection()
+let (projReader, proj) = MoondreamVisionProjection(layers: 1)
 let inputsEmbedsTensor = graph.variable(
   Tensor<Float16>(from: try! Tensor<Float>(numpy: input_embeds.numpy()))
 ).toGPU(0).reshaped(.WC(4, 2048))
@@ -403,9 +403,9 @@ graph.withNoGrad {
   let _ = vit(inputs: xTensor)
   reader(vision_encoder_state_dict)
   var outs = vit(inputs: xTensor).map { $0.as(of: Float.self) }
-  let _ = proj(inputs: outs[0])
+  let _ = proj(inputs: Functional.concat(axis: 1, outs[0], outs[0]))
   projReader(vision_encoder_state_dict)
-  outs = proj(inputs: outs[0]).map { $0.as(of: Float.self) }
+  outs = proj(inputs: Functional.concat(axis: 1, outs[0], outs[0])).map { $0.as(of: Float.self) }
   print(outs)
 
   let costhetaTensor = graph.variable(.CPU, .NHWC(1, 4, 1, 16), of: Float.self)
@@ -431,16 +431,16 @@ graph.withNoGrad {
   let output = phi(inputs: inputsEmbedsTensor, costhetaTensorGPU, sinthetaTensorGPU).map {
     $0.as(of: Float16.self)
   }
-  /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/siglip_384_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/siglip_384_240520_f32.ckpt") {
     $0.write("vit", model: vit)
   }
-  */
-  graph.openStore("/home/liu/workspace/swift-diffusion/moondream2_f32.ckpt") {
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/moondream2_240520_f32.ckpt") {
     $0.write("vision_proj", model: proj)
     $0.write("text_emb", tensor: textEmb)
     $0.write("phi", model: phi)
   }
+  */
   let digit = output[0].rawValue.toCPU()
   var minVal = digit[3, 0]
   var minS = 0

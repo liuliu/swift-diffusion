@@ -3,12 +3,12 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/pixart_sigma_xl_2_1024_ms_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/moondream2_240520_f32.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/pixart_sigma_xl_2_1024_ms_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/moondream2_240520_q6p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -32,12 +32,17 @@ graph.openStore(
         $0.write(key, tensor: tensor)
         continue
       }
+      if key.contains("norm") {
+        $0.write(key, tensor: tensor, codec: [.ezm7])
+        continue
+      }
       var n = 0
       for i in 0..<shape.count {
         if shape[i] > 1 {
           n += 1
         }
       }
+      /*
       if n > 1 {
         if key.contains("fc") {
           $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
@@ -47,6 +52,7 @@ graph.openStore(
       } else {
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
+      */
       /*
       if key.contains("relative_position_embedding") || key.contains("shared") {
         $0.write(key, tensor: tensor)
@@ -73,7 +79,6 @@ graph.openStore(
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
       */
-      /*
       if keys.contains("vision_proj") {
         if shape.count == 2 && n > 1 {
           $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
@@ -91,7 +96,6 @@ graph.openStore(
           $0.write(key, tensor: tensor, codec: [.ezm7])
         }
       }
-      */
     }
   }
 }

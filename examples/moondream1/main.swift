@@ -37,7 +37,7 @@ func SigLIPResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int
   var out = x.reshaped([b * t, h * k]) + attention(ln1(x))
   let ln2 = LayerNorm(epsilon: 1e-6, axis: [1])
   let fc = Dense(count: MLP)
-  let gelu = GELU()
+  let gelu = GELU(approximate: .tanh)
   let proj = Dense(count: k * h)
   out = out + proj(gelu(fc(ln2(out))))
   let reader: (PythonObject) -> Void = { _ in
@@ -71,7 +71,7 @@ func SigLIPVisionTransformer(
 func MoondreamVisionProjection(layers: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let mlp1fc = Dense(count: 2048 * 4)
-  let mlp1gelu = GELU()
+  let mlp1gelu = GELU(approximate: .tanh)
   let mlp1proj = Dense(count: 2048)
   var out = mlp1proj(mlp1gelu(mlp1fc(x)))
   if layers > 1 {
@@ -252,34 +252,37 @@ graph.withNoGrad {
 
   let input = graph.variable(clipImg.toGPU(0))
   vit.compile(inputs: input)
-  graph.openStore("/home/liu/workspace/swift-diffusion/siglip_384_f32.ckpt") {
-    $0.read("vit", model: vit)
+  graph.openStore("/home/liu/workspace/swift-diffusion/siglip_384_240520_q8p.ckpt") {
+    $0.read("vit", model: vit, codec: [.q8p, .q6p, .ezm7])
   }
   var out = vit(inputs: input)[0].as(of: FloatType.self)
+  out = Functional.concat(axis: 1, out, out)
+  debugPrint(out)
 
   let (_, proj) = MoondreamVisionProjection(layers: 1)
 
   proj.compile(inputs: out)
   var textEmbTensor: AnyTensor? = nil
-  graph.openStore("/home/liu/workspace/swift-diffusion/moondream2_f32.ckpt") {
-    $0.read("vision_proj", model: proj)
-    textEmbTensor = $0.read("text_emb")
+  graph.openStore("/home/liu/workspace/swift-diffusion/moondream2_240520_q6p.ckpt") {
+    $0.read("vision_proj", model: proj, codec: [.q8p, .q6p, .ezm7])
+    textEmbTensor = $0.read("text_emb", codec: [.q8p, .q6p, .ezm7])
   }
   out = proj(inputs: out)[0].as(of: FloatType.self)
+  debugPrint(out)
   let textEmb = graph.variable(
     Tensor<FloatType>(from: textEmbTensor!).toGPU(0).reshaped(
       .WC(textEmbTensor!.shape[0], textEmbTensor!.shape[1])))
   let tokenizer = GPT2Tokenizer(
     vocabulary: "/home/liu/workspace/swift-diffusion/examples/moondream1/vocab.json",
     merges: "/home/liu/workspace/swift-diffusion/examples/moondream1/merges.txt")
-  let eos = "<END>"
-  let before = tokenizer.tokenize(text: "<image>", addSpecialTokens: true)
+  let eos = "<|endoftext|>"
+  let before = tokenizer.tokenize(text: "", addSpecialTokens: true)
   let beforeTensor = Tensor<Int32>(before, .CPU, .C(before.count))
   let beforeEmb = Functional.indexSelect(
     input: textEmb, index: graph.variable(beforeTensor.toGPU(0)))
   let after = tokenizer.tokenize(
     text:
-      "</image>\n\nQuestion: Describe this image and its style in a very detailed manner, follow the format of describing: what, who, where, when, how. You don't need to fill in all if they are irrelevant. Please remove What, Who, Where, When, How prefixes and make it one paragraph.\n\nAnswer:",
+      "\n\nQuestion: Describe this image and its style in a very detailed manner, follow the format of describing: what, who, where, when, how. You don't need to fill in all if they are irrelevant. Please remove What, Who, Where, When, How prefixes and make it one paragraph.\n\nAnswer:",
     addSpecialTokens: false)
   let afterTensor = Tensor<Int32>(after, .CPU, .C(after.count))
   let afterEmb = Functional.indexSelect(input: textEmb, index: graph.variable(afterTensor.toGPU(0)))
@@ -331,8 +334,8 @@ graph.withNoGrad {
   phi.compile(
     (cachedTokenLength: 0, tokenLength: inputEmb.shape[0]),
     inputs: [inputEmb, costhetaTensorGPU, sinthetaTensorGPU, causalAttentionMask] + currentKvs)
-  graph.openStore("/home/liu/workspace/swift-diffusion/moondream1_f32.ckpt") {
-    $0.read("phi", model: phi)
+  graph.openStore("/home/liu/workspace/swift-diffusion/moondream2_240520_q6p.ckpt") {
+    $0.read("phi", model: phi, codec: [.q8p, .q6p, .ezm7])
   }
   var tuple = phi(
     (cachedTokenLength: 0, tokenLength: inputEmb.shape[0]), inputs: inputEmb,
@@ -348,7 +351,6 @@ graph.withNoGrad {
     }
   }
   var ids = [Int32(topK)]
-  print(ids)
   causalAttentionMask = graph.variable(
     .CPU, .NHWC(1, 1, 1, 1025), of: FloatType.self)
   causalAttentionMask.full(0)
