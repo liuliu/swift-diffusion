@@ -646,15 +646,24 @@ let (crossattn, pooled) = graph.withNoGrad {
   let rotTensorGPU = paddedRotTensor.toGPU(0)
   let causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
   transformer.compile(inputs: tokensTensorGPU, rotTensorGPU, causalAttentionMaskGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/chatglm3_6b_f32.ckpt") {
-    $0.read("text_model", model: transformer)
+  graph.openStore("/home/liu/workspace/swift-diffusion/chatglm3_6b_q6p_q8p.ckpt") {
+    $0.read("text_model", model: transformer, codec: [.q6p, .q8p, .ezm7])
   }
   let out = transformer(inputs: tokensTensorGPU, rotTensorGPU, causalAttentionMaskGPU).map {
     $0.as(of: FloatType.self)
   }
+  /*
+  let truth = graph.variable(like: out[0])
+  graph.openStore("/home/liu/workspace/swift-diffusion/chatglm3_6b_f16_truth.ckpt") {
+    $0.read("fp16", variable: truth)
+  }
+  let error = DynamicGraph.Tensor<Float>(from: out[0]) - DynamicGraph.Tensor<Float>(from: truth)
+  let mse = (error .* error).reduced(.mean, axis: [0, 1])
+  debugPrint(mse)
+  */
   let encoderHidProj = Dense(count: 2048)
   encoderHidProj.compile(inputs: out[0])
-  graph.openStore("/home/liu/workspace/swift-diffusion/kolors_encoder_hid_proj_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/kolors_f16.ckpt") {
     $0.read("encoder_hid_proj", model: encoderHidProj)
   }
   let encoderOut = encoderHidProj(inputs: out[0]).map { $0.as(of: FloatType.self) }

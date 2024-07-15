@@ -3,12 +3,12 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/moondream2_240520_f32.ckpt",
+  "/home/liu/workspace/swift-diffusion/chatglm3_6b_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/moondream2_240520_q6p.ckpt",
+    "/home/liu/workspace/swift-diffusion/chatglm3_6b_q6p_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -24,8 +24,14 @@ graph.openStore(
       }
       let shape = tensor.shape
       print("write \(key) \(tensor)")
-      if key.contains("embedder") || key.contains("pos_embed") || key.contains("ada_ln") {
+      if key.contains("embedder") || key.contains("pos_embed") || key.contains("ada_ln")
+        || key.contains("_embeddings")
+      {
         $0.write(key, tensor: tensor)
+        continue
+      }
+      if key.contains("_proj-") || key.contains("-o-") {
+        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         continue
       }
       if key.contains("shift_table") || key.contains("t_block") {
@@ -70,7 +76,6 @@ graph.openStore(
         continue
       }
       */
-      /*
       if shape.count == 2 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
       } else if shape.count == 4 && n > 1 {
@@ -78,7 +83,7 @@ graph.openStore(
       } else {
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
-      */
+      /*
       if keys.contains("vision_proj") {
         if shape.count == 2 && n > 1 {
           $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
@@ -96,6 +101,7 @@ graph.openStore(
           $0.write(key, tensor: tensor, codec: [.ezm7])
         }
       }
+      */
     }
   }
 }
