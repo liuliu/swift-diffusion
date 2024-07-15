@@ -736,8 +736,8 @@ swift_binary(
 )
 
 swift_binary(
-    name = "kolors",
-    srcs = ["kolors/main.swift"],
+    name = "kolors_converter",
+    srcs = ["kolors_converter/main.swift"],
     data = [
         "clip/merges.txt",
         "clip/vocab.json",
@@ -752,6 +752,25 @@ swift_binary(
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
         "@s4nnc//nnc:nnc_python",
+        "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
+
+swift_binary(
+    name = "kolors",
+    srcs = ["kolors/main.swift"],
+    data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+        "open_clip/bpe_simple_vocab_16e6.txt",
+        "open_clip/vocab_16e6.json",
+        "sd3/spiece.model",
+    ],
+    deps = [
+        "//:diffusion",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
         "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )
