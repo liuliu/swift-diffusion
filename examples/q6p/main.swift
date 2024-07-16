@@ -30,10 +30,6 @@ graph.openStore(
         $0.write(key, tensor: tensor)
         continue
       }
-      if key.contains("_proj-") || key.contains("-o-") {
-        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
-        continue
-      }
       if key.contains("shift_table") || key.contains("t_block") {
         $0.write(key, tensor: tensor)
         continue
@@ -47,6 +43,10 @@ graph.openStore(
         if shape[i] > 1 {
           n += 1
         }
+      }
+      if n > 1 && key.contains("_proj-") || key.contains("-o-") {
+        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+        continue
       }
       /*
       if n > 1 {
