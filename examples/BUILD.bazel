@@ -774,3 +774,24 @@ swift_binary(
         "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )
+
+swift_binary(
+    name = "auraflow",
+    srcs = ["auraflow/main.swift"],
+    data = [
+        "clip/merges.txt",
+        "clip/vocab.json",
+        "open_clip/bpe_simple_vocab_16e6.txt",
+        "open_clip/vocab_16e6.json",
+        "sd3/spiece.model",
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+        "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
