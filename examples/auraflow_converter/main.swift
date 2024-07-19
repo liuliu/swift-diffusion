@@ -1,15 +1,40 @@
 import Diffusion
 import Foundation
 import NNC
-import PNG
+import NNCPythonConversion
+import PythonKit
 import SentencePiece
 
-typealias FloatType = Float16
-struct PythonObject {}
+typealias FloatType = Float
+
+let torch = Python.import("torch")
+let diffusers = Python.import("diffusers")
+
+torch.set_grad_enabled(false)
+
+let pipeline = diffusers.AuraFlowPipeline.from_pretrained(
+  "fal/AuraFlow",
+  torch_dtype: torch.float16
+).to("cuda")
+
+print(pipeline.transformer)
+
+let text_encoder_state_dict = pipeline.text_encoder.state_dict()
+
+let image = pipeline(
+  prompt: "an astronaut.",
+  height: 1024,
+  width: 1024,
+  num_inference_steps: 2,
+  generator: torch.Generator().manual_seed(666),
+  guidance_scale: 3.5
+).images[0]
+
+exit(0)
 
 func UMT5TextEmbedding(vocabularySize: Int, embeddingSize: Int, name: String) -> Model {
   let tokenEmbed = Embedding(
-    FloatType.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: name)
+    Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: name)
   return tokenEmbed
 }
 
@@ -42,10 +67,9 @@ func UMT5DenseGatedActDense(hiddenSize: Int, intermediateSize: Int) -> (Model, M
   let x = Input()
   let wi_0 = Dense(count: intermediateSize, noBias: true, name: "w0")
   let wi_1 = Dense(count: intermediateSize, noBias: true, name: "w1")
-  var out = wi_1(x).to(.Float32) .* wi_0(x).GELU(approximate: .tanh).to(.Float32)
+  var out = wi_1(x) .* wi_0(x).GELU(approximate: .tanh)
   let wo = Dense(count: hiddenSize, noBias: true, name: "wo")
-  let scaleFactor: Float = 8
-  out = scaleFactor * wo(((1 / scaleFactor) * out).to(of: x)).to(.Float32)
+  out = wo(out)
   return (wi_0, wi_1, wo, Model([x], [out]))
 }
 
@@ -56,19 +80,46 @@ func UMT5Block(
   let attentionMask = Input()
   let relativePositionBuckets = Input()
   let relativePositionEmbedding = Embedding(
-    FloatType.self, vocabularySize: 32, embeddingSize: 32, name: "relative_position_embedding")
+    Float.self, vocabularySize: 32, embeddingSize: 32, name: "relative_position_embedding")
   let positionBias =
     relativePositionEmbedding(relativePositionBuckets).reshaped([1, t, t, 32])
     .permuted(0, 3, 1, 2) + attentionMask
   let norm1 = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm1")
   let (tokeys, toqueries, tovalues, unifyheads, attention) = UMT5LayerSelfAttention(
     k: k, h: h, b: b, t: t, outFeatures: outFeatures)
-  var out = x + attention(norm1(x).to(FloatType.dataType), positionBias).to(of: x)
+  var out = x + attention(norm1(x), positionBias)
   let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm1")
   let (wi_0, wi_1, wo, ff) = UMT5DenseGatedActDense(
     hiddenSize: outFeatures, intermediateSize: intermediateSize)
   out = out + ff(norm2(out))
   let reader: (PythonObject) -> Void = { state_dict in
+    let relative_attention_bias_weight = state_dict[
+      "\(prefix).layer.0.SelfAttention.relative_attention_bias.weight"
+    ].cpu().float().numpy()
+    relativePositionEmbedding.weight.copy(
+      from: try! Tensor<Float>(numpy: relative_attention_bias_weight))
+    let layer_0_layer_norm_weight = state_dict["\(prefix).layer.0.layer_norm.weight"].cpu().float()
+      .numpy()
+    norm1.weight.copy(from: try! Tensor<Float>(numpy: layer_0_layer_norm_weight))
+    let k_weight = state_dict["\(prefix).layer.0.SelfAttention.k.weight"].cpu().float().numpy()
+    tokeys.weight.copy(from: try! Tensor<Float>(numpy: k_weight))
+    let q_weight = state_dict["\(prefix).layer.0.SelfAttention.q.weight"].cpu().float().numpy()
+    toqueries.weight.copy(from: try! Tensor<Float>(numpy: q_weight))
+    let v_weight = state_dict["\(prefix).layer.0.SelfAttention.v.weight"].cpu().float().numpy()
+    tovalues.weight.copy(from: try! Tensor<Float>(numpy: v_weight))
+    let o_weight = state_dict["\(prefix).layer.0.SelfAttention.o.weight"].cpu().float().numpy()
+    unifyheads.weight.copy(from: try! Tensor<Float>(numpy: o_weight))
+    let layer_1_layer_norm_weight = state_dict["\(prefix).layer.1.layer_norm.weight"].cpu().float()
+      .numpy()
+    norm2.weight.copy(from: try! Tensor<Float>(numpy: layer_1_layer_norm_weight))
+    let wi_0_weight = state_dict["\(prefix).layer.1.DenseReluDense.wi_0.weight"].cpu().float()
+      .numpy()
+    wi_0.weight.copy(from: try! Tensor<Float>(numpy: wi_0_weight))
+    let wi_1_weight = state_dict["\(prefix).layer.1.DenseReluDense.wi_1.weight"].cpu().float()
+      .numpy()
+    wi_1.weight.copy(from: try! Tensor<Float>(numpy: wi_1_weight))
+    let wo_weight = state_dict["\(prefix).layer.1.DenseReluDense.wo.weight"].cpu().float().numpy()
+    wo.weight.copy(from: try! Tensor<Float>(numpy: wo_weight))
   }
   return (reader, Model([x, attentionMask, relativePositionBuckets], [out]))
 }
@@ -78,7 +129,7 @@ func UMT5ForConditionalGeneration(b: Int, t: Int) -> ((PythonObject) -> Void, Mo
   let attentionMask = Input()
   let relativePositionBuckets = Input()
   let textEmbed = UMT5TextEmbedding(vocabularySize: 32_128, embeddingSize: 2_048, name: "shared")
-  var out = textEmbed(x).to(.Float32)
+  var out = textEmbed(x)
   var readers = [(PythonObject) -> Void]()
   for i in 0..<24 {
     let (reader, block) = UMT5Block(
@@ -88,10 +139,35 @@ func UMT5ForConditionalGeneration(b: Int, t: Int) -> ((PythonObject) -> Void, Mo
     readers.append(reader)
   }
   let finalNorm = RMSNorm(epsilon: 1e-6, axis: [1], name: "final_norm")
-  out = finalNorm(out).to(FloatType.dataType)
+  out = finalNorm(out)
   let reader: (PythonObject) -> Void = { state_dict in
+    let vocab = state_dict["shared.weight"].cpu().float().numpy()
+    textEmbed.weight.copy(from: try! Tensor<Float>(numpy: vocab))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let final_layer_norm_weight = state_dict["encoder.final_layer_norm.weight"].cpu().float()
+      .numpy()
+    finalNorm.weight.copy(from: try! Tensor<Float>(numpy: final_layer_norm_weight))
   }
   return (reader, Model([x, attentionMask, relativePositionBuckets], [out]))
+}
+
+let graph = DynamicGraph()
+
+let prompt =
+  "an astronaut."
+// "photo of a young woman with long, wavy brown hair lying down in grass, top down shot, summer, warm, laughing, joy, fun"
+let negativePrompt = ""
+
+let sentencePiece = SentencePiece(
+  file: "/home/liu/workspace/swift-diffusion/tokenizer.model")
+var tokens2 = sentencePiece.encode(prompt).map { return $0.id }
+tokens2.append(2)
+
+let tokensTensor2 = graph.variable(.CPU, .C(256), of: Int32.self)
+for i in 0..<256 {
+  tokensTensor2[i] = i < tokens2.count ? tokens2[i] : 1
 }
 
 func relativePositionBuckets(sequenceLength: Int, numBuckets: Int, maxDistance: Int) -> Tensor<
@@ -123,6 +199,45 @@ func relativePositionBuckets(sequenceLength: Int, numBuckets: Int, maxDistance: 
   }
   return relativePositionBuckets
 }
+
+graph.withNoGrad {
+  let (reader, textModel) = UMT5ForConditionalGeneration(b: 1, t: 256)
+  let relativePositionBuckets = relativePositionBuckets(
+    sequenceLength: 256, numBuckets: 32, maxDistance: 128)
+  let tokensTensorGPU = tokensTensor2.toGPU(0)
+  var attentionMask = Tensor<FloatType>(.CPU, .NCHW(1, 1, 1, 256))
+  for i in 0..<256 {
+    attentionMask[0, 0, 0, i] = i < tokens2.count ? 0 : -FloatType.greatestFiniteMagnitude
+  }
+  let attentionMaskGPU = graph.variable(attentionMask.toGPU(0))
+  let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
+  textModel.compile(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)
+  reader(text_encoder_state_dict)
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/pile_t5_xl_encoder_f32.ckpt") {
+    $0.write("text_model", model: textModel)
+  }
+  */
+  let output = textModel(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)[0]
+    .as(of: Float.self)
+  debugPrint(output)
+}
+
+let random = Python.import("random")
+let numpy = Python.import("numpy")
+
+random.seed(42)
+numpy.random.seed(42)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
+let x = torch.randn([2, 4, 128, 128]).to(torch.float16).cuda()
+let y = torch.randn([2, 256, 2048]).to(torch.float16).cuda() * 0.01
+let t = torch.full([2], 1).cuda()
+
+print(pipeline.transformer(x, y, t))
+
+let state_dict = pipeline.transformer.state_dict()
 
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
@@ -252,6 +367,105 @@ func JointTransformerBlock(
   let xNorm2 = LayerNorm(epsilon: 1e-5, axis: [2], elementwiseAffine: false)
   xOut = x + xChunks[5] .* xFF(xNorm2(xOut) .* (1 + xChunks[4]) + xChunks[3])
   let reader: (PythonObject) -> Void = { state_dict in
+    let attn_add_q_proj_weight = state_dict["\(prefix).attn.add_q_proj.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    contextToQueries.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_add_q_proj_weight))
+    let attn_add_k_proj_weight = state_dict["\(prefix).attn.add_k_proj.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    contextToKeys.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_add_k_proj_weight))
+    let attn_add_v_proj_weight = state_dict["\(prefix).attn.add_v_proj.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    contextToValues.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_add_v_proj_weight)
+    )
+    let attn_to_q_weight = state_dict["\(prefix).attn.to_q.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xToQueries.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_to_q_weight))
+    let attn_to_k_weight = state_dict["\(prefix).attn.to_k.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xToKeys.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_to_k_weight))
+    let attn_to_v_weight = state_dict["\(prefix).attn.to_v.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xToValues.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_to_v_weight))
+    if let contextUnifyheads = contextUnifyheads {
+      let attn_to_add_out_weight = state_dict["\(prefix).attn.to_add_out.weight"]
+        .to(
+          torch.float
+        ).cpu().numpy()
+      contextUnifyheads.weight.copy(
+        from: try! Tensor<Float>(numpy: attn_to_add_out_weight))
+    }
+    let attn_to_out_0_weight = state_dict["\(prefix).attn.to_out.0.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xUnifyheads.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_to_out_0_weight))
+    if let contextLinear1 = contextLinear1, let contextLinear2 = contextLinear2,
+      let contextOutProjection = contextOutProjection
+    {
+      let ff_context_linear_1_weight = state_dict["\(prefix).ff_context.linear_1.weight"].to(
+        torch.float
+      ).cpu().numpy()
+      contextLinear1.weight.copy(
+        from: try! Tensor<Float>(numpy: ff_context_linear_1_weight))
+      let ff_context_linear_2_weight = state_dict["\(prefix).ff_context.linear_2.weight"].to(
+        torch.float
+      ).cpu().numpy()
+      contextLinear2.weight.copy(
+        from: try! Tensor<Float>(numpy: ff_context_linear_2_weight))
+      let ff_context_out_projection_weight = state_dict[
+        "\(prefix).ff_context.out_projection.weight"
+      ].to(
+        torch.float
+      ).cpu().numpy()
+      contextOutProjection.weight.copy(
+        from: try! Tensor<Float>(numpy: ff_context_out_projection_weight))
+    }
+    let ff_linear_1_weight = state_dict["\(prefix).ff.linear_1.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xLinear1.weight.copy(
+      from: try! Tensor<Float>(numpy: ff_linear_1_weight))
+    let ff_linear_2_weight = state_dict["\(prefix).ff.linear_2.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xLinear2.weight.copy(
+      from: try! Tensor<Float>(numpy: ff_linear_2_weight))
+    let ff_out_projection_weight = state_dict["\(prefix).ff.out_projection.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xOutProjection.weight.copy(
+      from: try! Tensor<Float>(numpy: ff_out_projection_weight))
+    let norm1_context_linear_weight = state_dict[
+      "\(prefix).norm1_context.linear.weight"
+    ].to(
+      torch.float
+    ).cpu().numpy()
+    for i in 0..<(contextBlockPreOnly ? 2 : 6) {
+      contextAdaLNs[i].weight.copy(
+        from: try! Tensor<Float>(
+          numpy: norm1_context_linear_weight[(k * h * i)..<(k * h * (i + 1)), ...]))
+    }
+    let norm1_linear_weight = state_dict["\(prefix).norm1.linear.weight"]
+      .to(
+        torch.float
+      ).cpu().numpy()
+    for i in 0..<6 {
+      xAdaLNs[i].weight.copy(
+        from: try! Tensor<Float>(
+          numpy: norm1_linear_weight[(k * h * i)..<(k * h * (i + 1)), ...]))
+    }
   }
   if !contextBlockPreOnly {
     return (reader, Model([context, x, c], [contextOut, xOut]))
@@ -309,6 +523,50 @@ func SingleTransformerBlock(
   let xNorm2 = LayerNorm(epsilon: 1e-5, axis: [2], elementwiseAffine: false)
   out = xIn + xChunks[5] .* xFF(xNorm2(out) .* (1 + xChunks[4]) + xChunks[3])
   let reader: (PythonObject) -> Void = { state_dict in
+    let attn_to_q_weight = state_dict["\(prefix).attn.to_q.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xToQueries.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_to_q_weight))
+    let attn_to_k_weight = state_dict["\(prefix).attn.to_k.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xToKeys.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_to_k_weight))
+    let attn_to_v_weight = state_dict["\(prefix).attn.to_v.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xToValues.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_to_v_weight))
+    let attn_to_out_0_weight = state_dict["\(prefix).attn.to_out.0.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xUnifyheads.weight.copy(
+      from: try! Tensor<Float>(numpy: attn_to_out_0_weight))
+    let ff_linear_1_weight = state_dict["\(prefix).ff.linear_1.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xLinear1.weight.copy(
+      from: try! Tensor<Float>(numpy: ff_linear_1_weight))
+    let ff_linear_2_weight = state_dict["\(prefix).ff.linear_2.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xLinear2.weight.copy(
+      from: try! Tensor<Float>(numpy: ff_linear_2_weight))
+    let ff_out_projection_weight = state_dict["\(prefix).ff.out_projection.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    xOutProjection.weight.copy(
+      from: try! Tensor<Float>(numpy: ff_out_projection_weight))
+    let norm1_linear_weight = state_dict["\(prefix).norm1.linear.weight"]
+      .to(
+        torch.float
+      ).cpu().numpy()
+    for i in 0..<6 {
+      xAdaLNs[i].weight.copy(
+        from: try! Tensor<Float>(
+          numpy: norm1_linear_weight[(k * h * i)..<(k * h * (i + 1)), ...]))
+    }
   }
   return (reader, Model([x, c], [out]))
 }
@@ -321,7 +579,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
     groups: 1, filters: 3072, filterSize: [2, 2],
     hint: Hint(stride: [2, 2]), name: "x_embedder")
   var out = xEmbedder(x).reshaped([b, 3072, h * w]).transposed(1, 2)
-  let posEmbed = Parameter<FloatType>(.GPU(0), .NHWC(1, 64, 64, 3072), name: "pos_embed")
+  let posEmbed = Parameter<Float>(.GPU(1), .NHWC(1, 64, 64, 3072), name: "pos_embed")
   let spatialPosEmbed = posEmbed.reshaped(
     [1, h, w, 3072], offset: [0, (64 - h) / 2, (64 - w) / 2, 0],
     strides: [64 * 64 * 3072, 64 * 3072, 3072, 1]
@@ -331,7 +589,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   let c = tEmbedder(t).reshaped([b, 1, 3072]).swish()
   let contextEmbedder = Dense(count: 3072, noBias: true, name: "context_embedder")
   var context = contextEmbedder(contextIn)
-  let registerTokens = Parameter<FloatType>(.GPU(0), .HWC(1, 8, 3072), name: "register_tokens")
+  let registerTokens = Parameter<Float>(.GPU(1), .HWC(1, 8, 3072), name: "register_tokens")
   context = Functional.concat(
     axis: 1, Concat(axis: 0)(Array(repeating: registerTokens, count: b)), context)
   var readers = [(PythonObject) -> Void]()
@@ -362,126 +620,69 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
     b, 4, h * 2, w * 2,
   ])
   let reader: (PythonObject) -> Void = { state_dict in
+    let x_embedder_proj_weight = state_dict["pos_embed.proj.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let x_embedder_proj_bias = state_dict["pos_embed.proj.bias"].to(torch.float)
+      .cpu().numpy()
+    xEmbedder.weight.copy(from: try! Tensor<Float>(numpy: x_embedder_proj_weight))
+    xEmbedder.bias.copy(from: try! Tensor<Float>(numpy: x_embedder_proj_bias))
+    let pos_embed = state_dict["pos_embed.pos_embed"].to(torch.float).cpu().numpy()
+    posEmbed.weight.copy(from: try! Tensor<Float>(numpy: pos_embed))
+    let t_embedder_mlp_0_weight = state_dict["time_step_proj.linear_1.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let t_embedder_mlp_0_bias = state_dict["time_step_proj.linear_1.bias"].to(torch.float)
+      .cpu().numpy()
+    tMlp0.weight.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_0_weight))
+    tMlp0.bias.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_0_bias))
+    let t_embedder_mlp_2_weight = state_dict["time_step_proj.linear_2.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let t_embedder_mlp_2_bias = state_dict["time_step_proj.linear_2.bias"].to(torch.float)
+      .cpu().numpy()
+    tMlp2.weight.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_2_weight))
+    tMlp2.bias.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_2_bias))
+    let context_embedder_weight = state_dict["context_embedder.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    contextEmbedder.weight.copy(from: try! Tensor<Float>(numpy: context_embedder_weight))
+    let register_tokens_weight = state_dict["register_tokens"].to(
+      torch.float
+    ).cpu().numpy()
+    registerTokens.weight.copy(from: try! Tensor<Float>(numpy: register_tokens_weight))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let norm_out_linear_weight = state_dict[
+      "norm_out.linear.weight"
+    ].to(
+      torch.float
+    ).cpu().numpy()
+    scale.weight.copy(
+      from: try! Tensor<Float>(numpy: norm_out_linear_weight[0..<3072, ...]))
+    shift.weight.copy(
+      from: try! Tensor<Float>(numpy: norm_out_linear_weight[3072..<(3072 * 2), ...]))
+    let proj_out_weight = state_dict["proj_out.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    projOut.weight.copy(from: try! Tensor<Float>(numpy: proj_out_weight))
   }
   return (reader, Model([x, t, contextIn], [out]))
 }
 
-let graph = DynamicGraph()
-
-let prompt =
-  "photo of a young woman with long, wavy brown hair lying down in grass, top down shot, summer, warm, laughing, joy, fun"
-let negativePrompt = ""
-
-let sentencePiece = SentencePiece(
-  file: "/home/liu/workspace/swift-diffusion/tokenizer.model")
-var tokens = sentencePiece.encode(prompt).map { return $0.id }
-tokens.append(2)
-var negativeTokens = sentencePiece.encode(negativePrompt).map { return $0.id }
-negativeTokens.append(2)
-
-let tokensTensor = graph.variable(.CPU, .C(256 * 2), of: Int32.self)
-for i in 0..<256 {
-  tokensTensor[i] = i < negativeTokens.count ? negativeTokens[i] : 1
-  tokensTensor[256 + i] = i < tokens.count ? tokens[i] : 1
-}
-
-let encoderHiddenStates = graph.withNoGrad {
-  let (_, textModel) = UMT5ForConditionalGeneration(b: 2, t: 256)
-  let relativePositionBuckets = relativePositionBuckets(
-    sequenceLength: 256, numBuckets: 32, maxDistance: 128)
-  let tokensTensorGPU = tokensTensor.toGPU(0)
-  var attentionMask = Tensor<FloatType>(.CPU, .NCHW(2, 1, 1, 256))
-  for i in 0..<256 {
-    attentionMask[0, 0, 0, i] = i < negativeTokens.count ? 0 : -FloatType.greatestFiniteMagnitude
-    attentionMask[1, 0, 0, i] = i < tokens.count ? 0 : -FloatType.greatestFiniteMagnitude
-  }
-  let attentionMaskGPU = graph.variable(attentionMask.toGPU(0))
-  let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
-  textModel.compile(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/pile_t5_xl_encoder_f32.ckpt") {
-    $0.read("text_model", model: textModel)
-  }
-  let output = textModel(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)[0]
-    .as(of: FloatType.self).reshaped(.CHW(2, 256, 2048))
-  var encoderMask = Tensor<FloatType>(.CPU, .CHW(2, 256, 1))
-  for i in 0..<256 {
-    encoderMask[0, i, 0] = i < negativeTokens.count ? 1 : 0
-    encoderMask[1, i, 0] = i < tokens.count ? 1 : 0
-  }
-  return output .* graph.variable(encoderMask.toGPU(0))
-}
-
-debugPrint(encoderHiddenStates)
-
-let (_, dit) = MMDiT(b: 2, h: 64, w: 64)
-
-DynamicGraph.setSeed(42)
+let (reader, dit) = MMDiT(b: 2, h: 64, w: 64)
 
 graph.withNoGrad {
-  var z = graph.variable(.GPU(0), .NCHW(1, 4, 128, 128), of: FloatType.self)
-  z.randn()
-  var input = graph.variable(.GPU(0), .NCHW(2, 4, 128, 128), of: FloatType.self)
+  let xTensor = graph.variable(try! Tensor<Float>(numpy: x.to(torch.float).cpu().numpy()).toGPU(1))
   let tTensor = graph.variable(
-    Tensor<FloatType>(
-      from: timeEmbedding(timesteps: 1000, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000)
-        .toGPU(0)))
-  dit.compile(inputs: input, tTensor, encoderHiddenStates)
+    timeEmbedding(timesteps: 1000, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000).toGPU(1))
+  let cTensor = graph.variable(
+    try! Tensor<Float>(numpy: y.to(torch.float).cpu().numpy()).toGPU(1))
+  dit.compile(inputs: xTensor, tTensor, cTensor)
+  reader(state_dict)
+  debugPrint(dit(inputs: xTensor, tTensor, cTensor))
   graph.openStore("/home/liu/workspace/swift-diffusion/auraflow_v0.1_f32.ckpt") {
-    $0.read("dit", model: dit, codec: [.q8p, .q6p, .q4p, .ezm7])
+    $0.write("dit", model: dit)
   }
-  let samplingSteps = 30
-  for i in (1...samplingSteps).reversed() {
-    print("\(i)")
-    let t = Float(i) / Float(samplingSteps) * 1_000
-    input[0..<1, 0..<4, 0..<128, 0..<128] = z
-    input[1..<2, 0..<4, 0..<128, 0..<128] = z
-    let tTensor = graph.variable(
-      Tensor<FloatType>(
-        from: timeEmbedding(timesteps: t, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000)
-          .toGPU(0)))
-    // cfg = 4.5
-    let vcu = dit(inputs: input, tTensor, encoderHiddenStates)[0].as(of: FloatType.self)
-    let vu = vcu[0..<1, 0..<4, 0..<128, 0..<128]
-    let vc = vcu[1..<2, 0..<4, 0..<128, 0..<128]
-    let v = vu + 4.5 * (vc - vu)
-    z = z - (1 / Float(samplingSteps)) * v
-    debugPrint(z)
-  }
-  /*
-  let truth = graph.variable(like: z)
-  graph.openStore("/home/liu/workspace/auraflow_output.ckpt") {
-    // $0.write("fp16_2", variable: z)
-    $0.read("fp16_2", variable: truth)
-  }
-  let error = DynamicGraph.Tensor<Float>(from: z) - DynamicGraph.Tensor<Float>(from: truth)
-  let mse = (error .* error).reduced(.mean, axis: [1, 2, 3])
-  debugPrint(mse)
-  */
-  // Already processed out.
-  z = (1.0 / 0.13025) * z
-  let decoder = Decoder(
-    channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 128, startHeight: 128)
-  decoder.compile(inputs: z)
-  graph.openStore("/home/liu/workspace/swift-diffusion/sdxl_vae_v1.0_f16.ckpt") {
-    $0.read("decoder", model: decoder)
-  }
-  let img = decoder(inputs: z)[0].as(of: FloatType.self).toCPU()
-  let startHeight = 128
-  let startWidth = 128
-  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
-  for y in 0..<startHeight * 8 {
-    for x in 0..<startWidth * 8 {
-      let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
-      rgba[y * startWidth * 8 + x].r = UInt8(
-        min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
-      rgba[y * startWidth * 8 + x].g = UInt8(
-        min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
-      rgba[y * startWidth * 8 + x].b = UInt8(
-        min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
-    }
-  }
-  let image = PNG.Data.Rectangular(
-    packing: rgba, size: (startWidth * 8, startHeight * 8),
-    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
-  try! image.compress(path: "/home/liu/workspace/swift-diffusion/txt2img.png", level: 4)
 }
