@@ -3,12 +3,12 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/chatglm3_6b_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/pile_t5_xl_encoder_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/chatglm3_6b_q6p_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/pile_t5_xl_encoder_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -24,8 +24,8 @@ graph.openStore(
       }
       let shape = tensor.shape
       print("write \(key) \(tensor)")
-      if key.contains("embedder") || key.contains("pos_embed") || key.contains("ada_ln")
-        || key.contains("_embeddings")
+      if key.contains("embedder") || key.contains("pos_embed")  // || key.contains("ada_ln")
+        || key.contains("_embeddings") || key.contains("register_tokens")
       {
         $0.write(key, tensor: tensor)
         continue
@@ -44,10 +44,12 @@ graph.openStore(
           n += 1
         }
       }
+      /*
       if n > 1 && key.contains("_proj-") || key.contains("-o-") {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         continue
       }
+      */
       /*
       if n > 1 {
         if key.contains("fc") {
@@ -59,7 +61,6 @@ graph.openStore(
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
       */
-      /*
       if key.contains("relative_position_embedding") || key.contains("shared") {
         $0.write(key, tensor: tensor)
         continue
@@ -75,7 +76,7 @@ graph.openStore(
         }
         continue
       }
-      */
+      /*
       if shape.count == 2 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
       } else if shape.count == 4 && n > 1 {
@@ -83,6 +84,7 @@ graph.openStore(
       } else {
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
+      */
       /*
       if keys.contains("vision_proj") {
         if shape.count == 2 && n > 1 {

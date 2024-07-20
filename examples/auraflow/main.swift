@@ -67,7 +67,7 @@ func UMT5Block(
   let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm1")
   let (wi_0, wi_1, wo, ff) = UMT5DenseGatedActDense(
     hiddenSize: outFeatures, intermediateSize: intermediateSize)
-  out = out + ff(norm2(out))
+  out = out + ff(norm2(out).to(FloatType.dataType))
   let reader: (PythonObject) -> Void = { state_dict in
   }
   return (reader, Model([x, attentionMask, relativePositionBuckets], [out]))
@@ -369,7 +369,11 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
 let graph = DynamicGraph()
 
 let prompt =
-  "photo of a young woman with long, wavy brown hair lying down in grass, top down shot, summer, warm, laughing, joy, fun"
+  // "Professional photograph of an astronaut riding a horse on the moon with view of Earth in the background."
+  // "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
+  // "photo of a young woman with long, wavy brown hair sleeping in grassfield, top down shot, summer, warm, laughing, joy, fun"
+  // "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
+  "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
 let negativePrompt = ""
 
 let sentencePiece = SentencePiece(
@@ -398,8 +402,8 @@ let encoderHiddenStates = graph.withNoGrad {
   let attentionMaskGPU = graph.variable(attentionMask.toGPU(0))
   let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
   textModel.compile(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/pile_t5_xl_encoder_f32.ckpt") {
-    $0.read("text_model", model: textModel)
+  graph.openStore("/home/liu/workspace/swift-diffusion/pile_t5_xl_encoder_q8p.ckpt") {
+    $0.read("text_model", model: textModel, codec: [.q4p, .q6p, .q8p, .ezm7])
   }
   let output = textModel(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)[0]
     .as(of: FloatType.self).reshaped(.CHW(2, 256, 2048))
@@ -426,7 +430,7 @@ graph.withNoGrad {
       from: timeEmbedding(timesteps: 1000, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000)
         .toGPU(0)))
   dit.compile(inputs: input, tTensor, encoderHiddenStates)
-  graph.openStore("/home/liu/workspace/swift-diffusion/auraflow_v0.1_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/auraflow_v0.1_f16.ckpt") {
     $0.read("dit", model: dit, codec: [.q8p, .q6p, .q4p, .ezm7])
   }
   let samplingSteps = 30
@@ -483,5 +487,5 @@ graph.withNoGrad {
   let image = PNG.Data.Rectangular(
     packing: rgba, size: (startWidth * 8, startHeight * 8),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
-  try! image.compress(path: "/home/liu/workspace/swift-diffusion/txt2img.png", level: 4)
+  try! image.compress(path: "/home/liu/workspace/swift-diffusion/4_txt2img.png", level: 4)
 }
