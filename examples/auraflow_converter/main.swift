@@ -13,7 +13,7 @@ let diffusers = Python.import("diffusers")
 torch.set_grad_enabled(false)
 
 let pipeline = diffusers.AuraFlowPipeline.from_pretrained(
-  "fal/AuraFlow",
+  "fal/AuraFlow-v0.2",
   torch_dtype: torch.float16
 ).to("cuda")
 
@@ -29,8 +29,6 @@ let image = pipeline(
   generator: torch.Generator().manual_seed(666),
   guidance_scale: 3.5
 ).images[0]
-
-exit(0)
 
 func UMT5TextEmbedding(vocabularySize: Int, embeddingSize: Int, name: String) -> Model {
   let tokenEmbed = Embedding(
@@ -682,7 +680,7 @@ graph.withNoGrad {
   dit.compile(inputs: xTensor, tTensor, cTensor)
   reader(state_dict)
   debugPrint(dit(inputs: xTensor, tTensor, cTensor))
-  graph.openStore("/home/liu/workspace/swift-diffusion/auraflow_v0.1_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/auraflow_v0.2_f32.ckpt") {
     $0.write("dit", model: dit)
   }
 }

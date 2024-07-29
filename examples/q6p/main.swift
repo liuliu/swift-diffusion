@@ -3,12 +3,12 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/pile_t5_xl_encoder_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/auraflow_v0.2_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/pile_t5_xl_encoder_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/auraflow_v0.2_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -61,6 +61,7 @@ graph.openStore(
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
       */
+      /*
       if key.contains("relative_position_embedding") || key.contains("shared") {
         $0.write(key, tensor: tensor)
         continue
@@ -76,15 +77,18 @@ graph.openStore(
         }
         continue
       }
-      /*
+      */
+      if n > 1 && (key.contains("-linear-") || key.contains("ada_ln")) {
+        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+        continue
+      }
       if shape.count == 2 && n > 1 {
-        $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+        $0.write(key, tensor: tensor, codec: [.q5p, .ezm7])
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
       } else {
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
-      */
       /*
       if keys.contains("vision_proj") {
         if shape.count == 2 && n > 1 {

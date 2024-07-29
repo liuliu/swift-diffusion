@@ -370,10 +370,10 @@ let graph = DynamicGraph()
 
 let prompt =
   // "Professional photograph of an astronaut riding a horse on the moon with view of Earth in the background."
-  // "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
-  // "photo of a young woman with long, wavy brown hair sleeping in grassfield, top down shot, summer, warm, laughing, joy, fun"
-  // "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
-  "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
+  "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
+// "photo of a young woman with long, wavy brown hair sleeping in grassfield, top down shot, summer, warm, laughing, joy, fun"
+// "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
+// "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
 let negativePrompt = ""
 
 let sentencePiece = SentencePiece(
@@ -430,7 +430,7 @@ graph.withNoGrad {
       from: timeEmbedding(timesteps: 1000, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000)
         .toGPU(0)))
   dit.compile(inputs: input, tTensor, encoderHiddenStates)
-  graph.openStore("/home/liu/workspace/swift-diffusion/auraflow_v0.1_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/auraflow_v0.2_q8p.ckpt") {
     $0.read("dit", model: dit, codec: [.q8p, .q6p, .q4p, .ezm7])
   }
   let samplingSteps = 30
@@ -487,5 +487,5 @@ graph.withNoGrad {
   let image = PNG.Data.Rectangular(
     packing: rgba, size: (startWidth * 8, startHeight * 8),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
-  try! image.compress(path: "/home/liu/workspace/swift-diffusion/4_txt2img.png", level: 4)
+  try! image.compress(path: "/home/liu/workspace/swift-diffusion/2_txt2img_v0.2_q8p.png", level: 4)
 }
