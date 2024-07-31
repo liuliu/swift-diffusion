@@ -6,13 +6,19 @@ import PythonKit
 
 let torch = Python.import("torch")
 let numpy = Python.import("numpy")
-let dpt = Python.import("depth_anything.dpt")
+let dpt = Python.import("depth_anything_v2.dpt")
 
-let depth_anything = dpt.DepthAnything.from_pretrained("LiheYoung/depth_anything_vitl14").to("cuda")
-  .eval()
+var depth_anything = dpt.DepthAnythingV2(
+  encoder: "vitl", features: 256, out_channels: [256, 512, 1024, 1024])
+// let depth_anything = dpt.DepthAnything.from_pretrained("LiheYoung/depth_anything_vitl14").to("cuda").eval()
+depth_anything.load_state_dict(
+  torch.load(
+    "/home/liu/workspace/Depth-Anything-V2/checkpoints/depth_anything_v2_vitl.pth",
+    map_location: "cpu"))
+depth_anything = depth_anything.to("cuda").eval()
 
 let transforms = Python.import("torchvision.transforms")
-let depth_anything_util_transform = Python.import("depth_anything.util.transform")
+let depth_anything_util_transform = Python.import("depth_anything_v2.util.transform")
 let cv2 = Python.import("cv2")
 
 torch.set_grad_enabled(false)
@@ -31,7 +37,7 @@ let transform = transforms.Compose([
   depth_anything_util_transform.PrepareForNet(),
 ])
 
-let raw_image = cv2.imread("/home/liu/workspace/Depth-Anything/assets/examples/demo1.png")
+let raw_image = cv2.imread("/home/liu/workspace/Depth-Anything-V2/assets/examples/demo01.jpg")
 var image = cv2.cvtColor(raw_image, cv2.COLOR_BGR2RGB) / 255.0
 
 image = transform(["image": image])["image"]
@@ -123,7 +129,7 @@ func DinoResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int) 
 
 func DinoVisionTransformer(
   gridX: Int, gridY: Int, width: Int, layers: Int, heads: Int, batchSize: Int,
-  intermediateLayers: Int
+  intermediateLayers: [Int]
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let classEmbedding = Parameter<Float>(.GPU(0), .CHW(1, 1, 1024), initBound: 1, name: "cls_token")
@@ -151,7 +157,7 @@ func DinoVisionTransformer(
       prefix: "blocks.\(i)", k: width / heads, h: heads, b: batchSize,
       t: gridX * gridY + 1)
     out = block(out.reshaped([batchSize, gridX * gridY + 1, width]))
-    if i >= layers - intermediateLayers {
+    if intermediateLayers.contains(i) {
       outs.append(out)
     }
     readers.append(reader)
@@ -398,7 +404,7 @@ let gridX = Int(image.shape[3])! / 14
 let gridY = Int(image.shape[2])! / 14
 let (reader, vit) = DinoVisionTransformer(
   gridX: gridX, gridY: gridY, width: 1024, layers: 24, heads: 16, batchSize: 1,
-  intermediateLayers: 4)
+  intermediateLayers: [4, 11, 17, 23])
 let (dptReader, depthHead) = DepthHead(gridX: gridX, gridY: gridY)
 
 let random = Python.import("random")
@@ -420,9 +426,6 @@ graph.withNoGrad {
   let _ = vit(inputs: xTensor)
   reader(state_dict)
   let outs = vit(inputs: xTensor).map { $0.as(of: Float.self) }
-  graph.openStore("/home/liu/workspace/swift-diffusion/dino_v2_f32.ckpt") {
-    $0.write("vit", model: vit)
-  }
   print(outs)
   let x0 = outs[0][1..<(gridX * gridY + 1), 0..<1024].transposed(0, 1).reshaped(
     .NCHW(1, 1024, gridY, gridX)
@@ -439,7 +442,8 @@ graph.withNoGrad {
   let _ = depthHead(inputs: x0, x1, x2, x3)
   dptReader(dpt_state_dict)
   let out = depthHead(inputs: x0, x1, x2, x3)[0].as(of: Float.self).toCPU()
-  graph.openStore("/home/liu/workspace/swift-diffusion/depth_anything_v1.0_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/depth_anything_v2.0_f32.ckpt") {
+    $0.write("vit", model: vit)
     $0.write("depth_head", model: depthHead)
   }
   debugPrint(out)

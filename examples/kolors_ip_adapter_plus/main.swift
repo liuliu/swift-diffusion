@@ -284,7 +284,7 @@ func ResamplerLayer(prefix: String, k: Int, h: Int, outputDim: Int, b: Int, t: (
 }
 
 func Resampler(
-  width: Int, queryDim: Int, outputDim: Int, heads: Int, grid: Int, queries: Int, layers: Int,
+  width: Int, keyValueDim: Int, outputDim: Int, heads: Int, grid: Int, queries: Int, layers: Int,
   batchSize: Int
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
@@ -293,13 +293,13 @@ func Resampler(
   let projX = projIn(x)
   var readers = [(PythonObject) -> Void]()
   let (firstReader, firstLayer) = ResamplerLayer(
-    prefix: "image_projection_layers.0.layers.0", k: queryDim / heads, h: heads,
+    prefix: "image_projection_layers.0.layers.0", k: keyValueDim / heads, h: heads,
     outputDim: outputDim, b: batchSize, t: (grid * grid + 1, queries))
   readers.append(firstReader)
   var out = firstLayer(projX, latents)
   for i in 1..<layers {
     let (reader, layer) = ResamplerLayer(
-      prefix: "image_projection_layers.0.layers.\(i)", k: queryDim / heads, h: heads,
+      prefix: "image_projection_layers.0.layers.\(i)", k: keyValueDim / heads, h: heads,
       outputDim: outputDim, b: batchSize, t: (grid * grid + 1, queries)
     )
     readers.append(reader)
@@ -557,7 +557,7 @@ graph.withNoGrad {
   reader(image_encoder_state_dict)
   let yTensor = vit(inputs: xTensor)[0].as(of: Float.self).reshaped(.CHW(1, 577, 1024))
   let (resamplerReader, resampler) = Resampler(
-    width: 2048, queryDim: 768, outputDim: 2048, heads: 12, grid: 24, queries: 16, layers: 4,
+    width: 2048, keyValueDim: 768, outputDim: 2048, heads: 12, grid: 24, queries: 16, layers: 4,
     batchSize: 1)
   resampler.compile(inputs: yTensor)
   resamplerReader(proj_state_dict)
