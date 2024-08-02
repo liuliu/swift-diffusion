@@ -2,12 +2,15 @@ import Diffusion
 import Foundation
 import NNC
 import NNCPythonConversion
+import PNG
 import PythonKit
 import SentencePiece
 
 typealias FloatType = Float
 
 let torch = Python.import("torch")
+let einops = Python.import("einops")
+let PIL = Python.import("PIL")
 let flux_util = Python.import("flux.util")
 
 torch.set_grad_enabled(false)
@@ -41,6 +44,18 @@ print(model(x, img_ids, txt, txt_ids, t, y, guidance))
 
 let state_dict = model.state_dict()
 
+/*
+let graph1 = DynamicGraph()
+graph1.openStore("/home/liu/workspace/swift-diffusion/z.ckpt") {
+  let z = torch.from_numpy(Tensor<Float>(from: $0.read("z")!).toCPU()).cuda()
+  var x = ae.decode(z)
+  x = x.clamp(-1, 1)
+  x = einops.rearrange(x[0], "c h w -> h w c")
+  let img = PIL.Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
+  img.save("/home/liu/workspace/swift-diffusion/ae.jpg", quality: 95, subsampling: 0)
+}
+exit(0)
+*/
 let z = torch.randn([1, 16, 128, 128]).to(torch.float).cuda()
 print(ae.decode(z))
 
@@ -927,7 +942,11 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
 }
 let vae_state_dict = ae.state_dict()
 graph.withNoGrad {
-  var zTensor = graph.variable(try! Tensor<Float>(numpy: z.to(torch.float).cpu().numpy())).toGPU(0)
+  var zTensor = graph.variable(
+    try! graph.openStore("/home/liu/workspace/swift-diffusion/z.ckpt") {
+      return Tensor<Float>(from: $0.read("z")!).toGPU(0)
+    }.get())
+  // var zTensor = graph.variable(try! Tensor<Float>(numpy: z.to(torch.float).cpu().numpy())).toGPU(0)
   // Already processed out.
   zTensor = (1.0 / 0.3611) * zTensor + 0.1159
   debugPrint(zTensor)
@@ -936,6 +955,9 @@ graph.withNoGrad {
   decoder.compile(inputs: zTensor)
   decoderReader(vae_state_dict)
   let image = decoder(inputs: zTensor)[0].as(of: Float.self)
+  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_vae_f32.ckpt") {
+    $0.write("decoder", model: decoder)
+  }
   debugPrint(image)
   let (encoderReader, encoder) = Encoder(
     channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 128, startHeight: 128)
@@ -944,6 +966,24 @@ graph.withNoGrad {
   let _ = encoder(inputs: image)[0].as(of: Float.self)
   graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_vae_f32.ckpt") {
     $0.write("encoder", model: encoder)
-    $0.write("decoder", model: decoder)
   }
+  let img = image.toCPU()
+  let startHeight = 128
+  let startWidth = 128
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
+  for y in 0..<startHeight * 8 {
+    for x in 0..<startWidth * 8 {
+      let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
+      rgba[y * startWidth * 8 + x].r = UInt8(
+        min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
+      rgba[y * startWidth * 8 + x].g = UInt8(
+        min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
+      rgba[y * startWidth * 8 + x].b = UInt8(
+        min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
+    }
+  }
+  let pngImage = PNG.Data.Rectangular(
+    packing: rgba, size: (startWidth * 8, startHeight * 8),
+    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+  try! pngImage.compress(path: "/home/liu/workspace/swift-diffusion/flux_txt2img.png", level: 4)
 }

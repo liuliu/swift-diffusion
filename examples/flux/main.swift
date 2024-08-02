@@ -4,9 +4,11 @@ import NNC
 import PNG
 import SentencePiece
 
-typealias FloatType = Float
+typealias FloatType = Float16
 
 struct PythonObject {}
+
+DynamicGraph.setSeed(42)
 
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
@@ -44,19 +46,27 @@ func VectorEmbedder(channels: Int) -> (Model, Model, Model) {
   return (fc0, fc2, Model([x], [out]))
 }
 
-func FeedForward(hiddenSize: Int, intermediateSize: Int, name: String) -> (
+func FeedForward(hiddenSize: Int, intermediateSize: Int, upcast: Bool, name: String) -> (
   Model, Model, Model
 ) {
   let x = Input()
   let linear1 = Dense(count: intermediateSize, name: "\(name)_linear1")
   var out = linear1(x).GELU(approximate: .tanh)
+  if upcast {
+    let scaleFactor: Float = 8
+    out = (1 / 8) * out
+  }
   let outProjection = Dense(count: hiddenSize, name: "\(name)_out_proj")
   out = outProjection(out)
+  if upcast {
+    let scaleFactor: Float = 8
+    out = out.to(.Float32) * scaleFactor
+  }
   return (linear1, outProjection, Model([x], [out]))
 }
 
 func JointTransformerBlock(
-  prefix: String, k: Int, h: Int, b: Int, t: Int, hw: Int, contextBlockPreOnly: Bool
+  prefix: String, k: Int, h: Int, b: Int, t: Int, hw: Int, contextBlockPreOnly: Bool, upcast: Bool
 ) -> ((PythonObject) -> Void, Model) {
   let context = Input()
   let x = Input()
@@ -67,7 +77,7 @@ func JointTransformerBlock(
   }
   let contextChunks = contextAdaLNs.map { $0(c) }
   let contextNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  var contextOut = (1 + contextChunks[1]) .* contextNorm1(context) + contextChunks[0]
+  var contextOut = (1 + contextChunks[1]) .* contextNorm1(context).to(.Float16) + contextChunks[0]
   let contextToKeys = Dense(count: k * h, name: "c_k")
   let contextToQueries = Dense(count: k * h, name: "c_q")
   let contextToValues = Dense(count: k * h, name: "c_v")
@@ -81,7 +91,7 @@ func JointTransformerBlock(
   let xAdaLNs = (0..<6).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
   let xChunks = xAdaLNs.map { $0(c) }
   let xNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  var xOut = (1 + xChunks[1]) .* xNorm1(x) + xChunks[0]
+  var xOut = (1 + xChunks[1]) .* xNorm1(x).to(.Float16) + xChunks[0]
   let xToKeys = Dense(count: k * h, name: "x_k")
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
@@ -98,10 +108,10 @@ func JointTransformerBlock(
   queries = Functional.cmul(left: queries, right: rot)
   keys = Functional.cmul(left: keys, right: rot)
   // Now run attention.
-  keys = keys.permuted(0, 2, 1, 3)
+  keys = keys.permuted(0, 2, 1, 3).contiguous()
   queries = ((1.0 / Float(k).squareRoot()) * queries)
-    .permuted(0, 2, 1, 3)
-  values = values.permuted(0, 2, 1, 3)
+    .permuted(0, 2, 1, 3).contiguous()
+  values = values.permuted(0, 2, 1, 3).contiguous()
   var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * (t + hw), t + hw])
   dot = dot.softmax()
@@ -122,27 +132,34 @@ func JointTransformerBlock(
   let xUnifyheads = Dense(count: k * h, name: "x_o")
   xOut = xUnifyheads(xOut)
   if !contextBlockPreOnly {
-    contextOut = context + contextChunks[2] .* contextOut
+    contextOut = context + (contextChunks[2] .* contextOut).to(of: context)
   }
-  xOut = x + xChunks[2] .* xOut
+  xOut = x + (xChunks[2] .* xOut).to(of: x)
   // Attentions are now. Now run MLP.
   let contextLinear1: Model?
   let contextOutProjection: Model?
   if !contextBlockPreOnly {
     let contextFF: Model
     (contextLinear1, contextOutProjection, contextFF) = FeedForward(
-      hiddenSize: k * h, intermediateSize: k * h * 4, name: "c")
+      hiddenSize: k * h, intermediateSize: k * h * 4, upcast: upcast, name: "c")
     let contextNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-    contextOut = contextOut + contextChunks[5]
-      .* contextFF(contextNorm2(contextOut) .* (1 + contextChunks[4]) + contextChunks[3])
+    contextOut =
+      contextOut
+      + ((upcast ? contextChunks[5].to(of: contextOut) : contextChunks[5])
+      .* contextFF(
+        contextNorm2(contextOut).to(.Float16) .* (1 + contextChunks[4]) + contextChunks[3])).to(
+        of: contextOut)
   } else {
     contextLinear1 = nil
     contextOutProjection = nil
   }
   let (xLinear1, xOutProjection, xFF) = FeedForward(
-    hiddenSize: k * h, intermediateSize: k * h * 4, name: "x")
+    hiddenSize: k * h, intermediateSize: k * h * 4, upcast: upcast, name: "x")
   let xNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  xOut = xOut + xChunks[5] .* xFF(xNorm2(xOut) .* (1 + xChunks[4]) + xChunks[3])
+  xOut =
+    xOut
+    + ((upcast ? xChunks[5].to(of: xOut) : xChunks[5])
+    .* xFF(xNorm2(xOut).to(.Float16) .* (1 + xChunks[4]) + xChunks[3])).to(of: xOut)
   let reader: (PythonObject) -> Void = { state_dict in
   }
   if !contextBlockPreOnly {
@@ -161,7 +178,7 @@ func SingleTransformerBlock(
   let xAdaLNs = (0..<3).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
   let xChunks = xAdaLNs.map { $0(c) }
   let xNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  var xOut = (1 + xChunks[1]) .* xNorm1(x) + xChunks[0]
+  var xOut = ((1 + xChunks[1]) .* xNorm1(x).to(.Float16) + xChunks[0])
   let xToKeys = Dense(count: k * h, name: "x_k")
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
@@ -178,10 +195,10 @@ func SingleTransformerBlock(
   queries = Functional.cmul(left: queries, right: rot)
   keys = Functional.cmul(left: keys, right: rot)
   // Now run attention.
-  keys = keys.permuted(0, 2, 1, 3)
+  keys = keys.permuted(0, 2, 1, 3).contiguous()
   queries = ((1.0 / Float(k).squareRoot()) * queries)
-    .permuted(0, 2, 1, 3)
-  values = values.permuted(0, 2, 1, 3)
+    .permuted(0, 2, 1, 3).contiguous()
+  values = values.permuted(0, 2, 1, 3).contiguous()
   var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * (t + hw), t + hw])
   dot = dot.softmax()
@@ -203,7 +220,7 @@ func SingleTransformerBlock(
   let xOutProjection = Dense(count: k * h, name: "x_out_proj")
   out = xOutProjection(
     Functional.concat(axis: 2, out, xLinear1(xOut).GELU(approximate: .tanh).contiguous()))
-  out = xIn + xChunks[2] .* out
+  out = xIn + (xChunks[2] .* out).to(.Float32)
   let reader: (PythonObject) -> Void = { state_dict in
   }
   return (reader, Model([x, c, rot], [out]))
@@ -216,20 +233,22 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   let contextIn = Input()
   let rot = Input()
   let xEmbedder = Dense(count: 3072, name: "x_embedder")
-  var out = xEmbedder(x)
+  var out = xEmbedder(x).to(.Float32)
   let (tMlp0, tMlp2, tEmbedder) = TimeEmbedder(channels: 3072)
   var vec = tEmbedder(t)
   let (yMlp0, yMlp2, yEmbedder) = VectorEmbedder(channels: 3072)
   vec = vec + yEmbedder(y)
   let contextEmbedder = Dense(count: 3072, name: "context_embedder")
-  var context = contextEmbedder(contextIn)
+  var context = contextEmbedder(contextIn).to(.Float32)
   let c = vec.reshaped([b, 1, 3072]).swish()
   var readers = [(PythonObject) -> Void]()
+  var c32: Model.IO = c
+  var rot32: Model.IO = rot
   for i in 0..<19 {
     let (reader, block) = JointTransformerBlock(
       prefix: "double_blocks.\(i)", k: 128, h: 24, b: b, t: 256, hw: h * w,
-      contextBlockPreOnly: false)
-    let blockOut = block(context, out, c, rot)
+      contextBlockPreOnly: false, upcast: i > 16)  // Just last layer should be enough, but to be safe, for the last 2 layers, we will do upcast.
+    let blockOut = block(context, out, c32, rot32)
     context = blockOut[0]
     out = blockOut[1]
     readers.append(reader)
@@ -245,7 +264,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   let scale = Dense(count: 3072, name: "ada_ln_0")
   let shift = Dense(count: 3072, name: "ada_ln_1")
   let normFinal = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  out = (1 + scale(c)) .* normFinal(out) + shift(c)
+  out = (1 + scale(c)) .* normFinal(out).to(.Float16) + shift(c)
   let projOut = Dense(count: 2 * 2 * 16, name: "linear")
   out = projOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
@@ -523,7 +542,7 @@ let z = graph.withNoGrad {
       }
     }
   }
-  let rotTensorGPU = rotTensor.toGPU(0)
+  let rotTensorGPU = DynamicGraph.Tensor<FloatType>(from: rotTensor).toGPU(0)
   dit.maxConcurrency = .limit(1)
   var z = graph.variable(.GPU(0), .CHW(1, 4096, 64), of: FloatType.self)
   z.randn()
@@ -534,10 +553,10 @@ let z = graph.withNoGrad {
   let yTensor = pooled
   let cTensor = c1
   dit.compile(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_schnell_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_schnell_f16.ckpt") {
     $0.read("dit", model: dit, codec: [.q8p, .q6p, .q4p, .ezm7])
   }
-  let samplingSteps = 8
+  let samplingSteps = 4
   for i in (1...samplingSteps).reversed() {
     print("\(i)")
     let t = Float(i) / Float(samplingSteps) * 1_000
@@ -741,14 +760,14 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
 
 let img = graph.withNoGrad {
   // Already processed out.
-  let zTensor = (1.0 / 0.3611) * z + 0.1159
-  let (decoderReader, decoder) = Decoder(
+  let zTensor = DynamicGraph.Tensor<Float>(from: (1.0 / 0.3611) * z + 0.11590)
+  let (_, decoder) = Decoder(
     channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 128, startHeight: 128)
   decoder.compile(inputs: zTensor)
-  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_vae_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_vae_f16.ckpt") {
     $0.read("decoder", model: decoder)
   }
-  let img = decoder(inputs: z)[0].as(of: FloatType.self).toCPU()
+  let img = decoder(inputs: zTensor)[0].as(of: Float.self).toCPU()
   let startHeight = 128
   let startWidth = 128
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
@@ -756,11 +775,11 @@ let img = graph.withNoGrad {
     for x in 0..<startWidth * 8 {
       let (r, g, b) = (img[0, 0, y, x], img[0, 1, y, x], img[0, 2, y, x])
       rgba[y * startWidth * 8 + x].r = UInt8(
-        min(max(Int(Float((r + 1) / 2) * 255), 0), 255))
+        min(max(Int(Float(r.isFinite ? (r + 1) / 2 : 0) * 255), 0), 255))
       rgba[y * startWidth * 8 + x].g = UInt8(
-        min(max(Int(Float((g + 1) / 2) * 255), 0), 255))
+        min(max(Int(Float(g.isFinite ? (g + 1) / 2 : 0) * 255), 0), 255))
       rgba[y * startWidth * 8 + x].b = UInt8(
-        min(max(Int(Float((b + 1) / 2) * 255), 0), 255))
+        min(max(Int(Float(b.isFinite ? (b + 1) / 2 : 0) * 255), 0), 255))
     }
   }
   let image = PNG.Data.Rectangular(

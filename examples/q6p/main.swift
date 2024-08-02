@@ -3,18 +3,20 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/auraflow_v0.2_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/flux_1_vae_f32.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/auraflow_v0.2_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/flux_1_vae_f16.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
       guard let tensor = (store.read(key).map { Tensor<Float16>(from: $0).toCPU() }) else {
         continue
       }
+      $0.write(key, tensor: tensor)
+      continue
       if key.contains("__stage_c_fixed__") && (key.contains("key") || key.contains("value")) {
         continue
       }
