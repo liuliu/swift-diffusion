@@ -12,6 +12,15 @@ DynamicGraph.setSeed(42)
 
 let textEncodingLength = 256
 
+let prompt =
+  // "Professional photograph of an astronaut riding a horse on the moon with view of Earth in the background."
+  // "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
+  // "photo of a young woman with long, wavy brown hair sleeping in grassfield, top down shot, summer, warm, laughing, joy, fun"
+  // "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
+  "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
+let filename = "flux_txt2img_4_q4p"
+let model = "flux_1_schnell_q4p"
+
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
 > {
@@ -397,13 +406,6 @@ graph.maxConcurrency = .limit(1)
 
 let tokenizer = CLIPTokenizer(
   vocabulary: "examples/clip/vocab.json", merges: "examples/clip/merges.txt")
-
-let prompt =
-  // "Professional photograph of an astronaut riding a horse on the moon with view of Earth in the background."
-  "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
-// "photo of a young woman with long, wavy brown hair sleeping in grassfield, top down shot, summer, warm, laughing, joy, fun"
-// "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
-// "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
 let tokens0 = tokenizer.tokenize(text: prompt, truncation: true, maxLength: 77)
 let sentencePiece = SentencePiece(
   file: "/home/liu/workspace/swift-diffusion/examples/sd3/spiece.model")
@@ -567,7 +569,7 @@ let z = graph.withNoGrad {
         .toGPU(0)))
   */
   dit.compile(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_schnell_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/\(model).ckpt") {
     $0.read("dit", model: dit, codec: [.q8p, .q6p, .q4p, .ezm7])
   }
   let samplingSteps = 4
@@ -797,5 +799,5 @@ graph.withNoGrad {
   let image = PNG.Data.Rectangular(
     packing: rgba, size: (startWidth * 8, startHeight * 8),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
-  try! image.compress(path: "/home/liu/workspace/swift-diffusion/flux_txt2img.png", level: 4)
+  try! image.compress(path: "/home/liu/workspace/swift-diffusion/\(filename).png", level: 4)
 }
