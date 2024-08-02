@@ -82,10 +82,10 @@ func JointTransformerBlock(
   let contextToQueries = Dense(count: k * h, name: "c_q")
   let contextToValues = Dense(count: k * h, name: "c_v")
   var contextK = contextToKeys(contextOut).reshaped([b, t, h, k])
-  let normAddedK = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normAddedK = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_k")
   contextK = normAddedK(contextK)
   var contextQ = contextToQueries(contextOut).reshaped([b, t, h, k])
-  let normAddedQ = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normAddedQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_q")
   contextQ = normAddedQ(contextQ)
   let contextV = contextToValues(contextOut).reshaped([b, t, h, k])
   let xAdaLNs = (0..<6).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
@@ -96,10 +96,10 @@ func JointTransformerBlock(
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
   var xK = xToKeys(xOut).reshaped([b, hw, h, k])
-  let normK = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_k")
   xK = normK(xK)
   var xQ = xToQueries(xOut).reshaped([b, hw, h, k])
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
   let xV = xToValues(xOut).reshaped([b, hw, h, k])
   var keys = Functional.concat(axis: 1, contextK, xK)
@@ -183,10 +183,10 @@ func SingleTransformerBlock(
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
   var xK = xToKeys(xOut).reshaped([b, t + hw, h, k])
-  let normK = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_k")
   xK = normK(xK)
   var xQ = xToQueries(xOut).reshaped([b, t + hw, h, k])
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
   let xV = xToValues(xOut).reshaped([b, t + hw, h, k])
   var keys = xK
@@ -216,10 +216,10 @@ func SingleTransformerBlock(
     )
     .contiguous()
   }
+  let xUnifyheads = Dense(count: k * h, noBias: true, name: "x_o")
   let xLinear1 = Dense(count: k * h * 4, name: "x_linear1")
   let xOutProjection = Dense(count: k * h, name: "x_out_proj")
-  out = xOutProjection(
-    Functional.concat(axis: 2, out, xLinear1(xOut).GELU(approximate: .tanh).contiguous()))
+  out = xUnifyheads(out) + xOutProjection(xLinear1(xOut).GELU(approximate: .tanh))
   out = xIn + (xChunks[2] .* out).to(.Float32)
   let reader: (PythonObject) -> Void = { state_dict in
   }
@@ -758,7 +758,7 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
   return (reader, Model([x], [out]))
 }
 
-let img = graph.withNoGrad {
+graph.withNoGrad {
   // Already processed out.
   let zTensor = DynamicGraph.Tensor<Float>(from: (1.0 / 0.3611) * z + 0.11590)
   let (_, decoder) = Decoder(

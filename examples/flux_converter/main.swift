@@ -123,10 +123,10 @@ func JointTransformerBlock(
   let contextToQueries = Dense(count: k * h, name: "c_q")
   let contextToValues = Dense(count: k * h, name: "c_v")
   var contextK = contextToKeys(contextOut).reshaped([b, t, h, k])
-  let normAddedK = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normAddedK = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_k")
   contextK = normAddedK(contextK)
   var contextQ = contextToQueries(contextOut).reshaped([b, t, h, k])
-  let normAddedQ = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normAddedQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_q")
   contextQ = normAddedQ(contextQ)
   let contextV = contextToValues(contextOut).reshaped([b, t, h, k])
   let xAdaLNs = (0..<6).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
@@ -137,10 +137,10 @@ func JointTransformerBlock(
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
   var xK = xToKeys(xOut).reshaped([b, hw, h, k])
-  let normK = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_k")
   xK = normK(xK)
   var xQ = xToQueries(xOut).reshaped([b, hw, h, k])
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
   let xV = xToValues(xOut).reshaped([b, hw, h, k])
   var keys = Functional.concat(axis: 1, contextK, xK)
@@ -374,10 +374,10 @@ func SingleTransformerBlock(
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
   var xK = xToKeys(xOut).reshaped([b, t + hw, h, k])
-  let normK = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_k")
   xK = normK(xK)
   var xQ = xToQueries(xOut).reshaped([b, t + hw, h, k])
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [3])
+  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
   let xV = xToValues(xOut).reshaped([b, t + hw, h, k])
   var keys = xK
@@ -407,10 +407,10 @@ func SingleTransformerBlock(
     )
     .contiguous()
   }
+  let xUnifyheads = Dense(count: k * h, noBias: true, name: "x_o")
   let xLinear1 = Dense(count: k * h * 4, name: "x_linear1")
   let xOutProjection = Dense(count: k * h, name: "x_out_proj")
-  out = xOutProjection(
-    Functional.concat(axis: 2, out, xLinear1(xOut).GELU(approximate: .tanh).contiguous()))
+  out = xUnifyheads(out) + xOutProjection(xLinear1(xOut).GELU(approximate: .tanh))
   out = xIn + xChunks[2] .* out
   let reader: (PythonObject) -> Void = { state_dict in
     let linear1_weight = state_dict["\(prefix).linear1.weight"].to(
@@ -441,8 +441,10 @@ func SingleTransformerBlock(
     let linear2_weight = state_dict["\(prefix).linear2.weight"].to(
       torch.float
     ).cpu().numpy()
+    xUnifyheads.weight.copy(
+      from: try! Tensor<Float>(numpy: linear2_weight[..., 0..<(k * h)]))
     xOutProjection.weight.copy(
-      from: try! Tensor<Float>(numpy: linear2_weight))
+      from: try! Tensor<Float>(numpy: linear2_weight[..., (k * h)..<(k * h * 5)]))
     let linear2_bias = state_dict["\(prefix).linear2.bias"].to(
       torch.float
     ).cpu().numpy()
@@ -650,17 +652,14 @@ graph.withNoGrad {
   }
   let rotTensorGPU = rotTensor.toGPU(1)
   dit.maxConcurrency = .limit(1)
-  /*
   dit.compile(inputs: xTensor, tTensor, yTensor, cTensor, rotTensorGPU)
   reader(state_dict)
   debugPrint(dit(inputs: xTensor, tTensor, yTensor, cTensor, rotTensorGPU))
-  */
-  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_schnell_f32.ckpt") {
     $0.write("dit", model: dit)
   }
-  */
 }
+exit(0)
 
 func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (
   (PythonObject) -> Void, Model

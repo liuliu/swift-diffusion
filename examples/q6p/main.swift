@@ -3,20 +3,18 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/flux_1_vae_f32.ckpt",
+  "/home/liu/workspace/swift-diffusion/flux_1_schnell_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/flux_1_vae_f16.ckpt",
+    "/home/liu/workspace/swift-diffusion/flux_1_schnell_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
       guard let tensor = (store.read(key).map { Tensor<Float16>(from: $0).toCPU() }) else {
         continue
       }
-      $0.write(key, tensor: tensor)
-      continue
       if key.contains("__stage_c_fixed__") && (key.contains("key") || key.contains("value")) {
         continue
       }
@@ -26,7 +24,7 @@ graph.openStore(
       }
       let shape = tensor.shape
       print("write \(key) \(tensor)")
-      if key.contains("embedder") || key.contains("pos_embed")  // || key.contains("ada_ln")
+      if key.contains("embedder") || key.contains("pos_embed") || key.contains("-linear-")  // || key.contains("ada_ln")
         || key.contains("_embeddings") || key.contains("register_tokens")
       {
         $0.write(key, tensor: tensor)
@@ -80,12 +78,12 @@ graph.openStore(
         continue
       }
       */
-      if n > 1 && (key.contains("-linear-") || key.contains("ada_ln")) {
+      if n > 1 && key.contains("ada_ln") {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         continue
       }
       if shape.count == 2 && n > 1 {
-        $0.write(key, tensor: tensor, codec: [.q5p, .ezm7])
+        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
       } else {
