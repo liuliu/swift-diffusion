@@ -17,10 +17,10 @@ torch.set_grad_enabled(false)
 
 let torch_device = "cuda"
 
-let t5 = flux_util.load_t5(torch_device, max_length: 256)
+let t5 = flux_util.load_t5(torch_device, max_length: 512)
 let clip = flux_util.load_clip(torch_device)
-let model = flux_util.load_flow_model("flux-schnell", device: torch_device)
-let ae = flux_util.load_ae("flux-schnell", device: torch_device)
+let model = flux_util.load_flow_model("flux-dev", device: torch_device)
+let ae = flux_util.load_ae("flux-dev", device: torch_device)
 
 let random = Python.import("random")
 let numpy = Python.import("numpy")
@@ -32,12 +32,12 @@ torch.cuda.manual_seed_all(42)
 
 let x = torch.randn([1, 4096, 64]).to(torch.bfloat16).cuda()
 let y = torch.randn([1, 768]).to(torch.bfloat16).cuda() * 0.01
-let txt = torch.randn([1, 256, 4096]).to(torch.bfloat16).cuda() * 0.01
+let txt = torch.randn([1, 512, 4096]).to(torch.bfloat16).cuda() * 0.01
 var img_ids = torch.zeros([64, 64, 3])
 img_ids[..., ..., 1] = img_ids[..., ..., 1] + torch.arange(64)[..., Python.None]
 img_ids[..., ..., 2] = img_ids[..., ..., 2] + torch.arange(64)[Python.None, ...]
 img_ids = img_ids.reshape([1, 4096, 3]).cuda()
-let txt_ids = torch.zeros([1, 256, 3]).cuda()
+let txt_ids = torch.zeros([1, 512, 3]).cuda()
 let t = torch.full([1], 1).to(torch.bfloat16).cuda()
 let guidance = torch.full([1], 3.5).to(torch.bfloat16).cuda()
 print(model(x, img_ids, txt, txt_ids, t, y, guidance))
@@ -77,20 +77,11 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
   return embedding
 }
 
-func TimeEmbedder(channels: Int) -> (Model, Model, Model) {
+func MLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
   let x = Input()
-  let fc0 = Dense(count: channels, name: "t_embedder_0")
+  let fc0 = Dense(count: channels, name: "\(name)_embedder_0")
   var out = fc0(x).swish()
-  let fc2 = Dense(count: channels, name: "t_embedder_1")
-  out = fc2(out)
-  return (fc0, fc2, Model([x], [out]))
-}
-
-func VectorEmbedder(channels: Int) -> (Model, Model, Model) {
-  let x = Input()
-  let fc0 = Dense(count: channels, name: "vector_embedder_0")
-  var out = fc0(x).swish()
-  let fc2 = Dense(count: channels, name: "vector_embedder_1")
+  let fc2 = Dense(count: channels, name: "\(name)_embedder_1")
   out = fc2(out)
   return (fc0, fc2, Model([x], [out]))
 }
@@ -470,17 +461,32 @@ func SingleTransformerBlock(
   return (reader, Model([x, c, rot], [out]))
 }
 
-func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
+func MMDiT(b: Int, h: Int, w: Int, guidanceEmbed: Bool) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let t = Input()
   let y = Input()
   let contextIn = Input()
   let rot = Input()
+  let guidance: Input?
   let xEmbedder = Dense(count: 3072, name: "x_embedder")
   var out = xEmbedder(x)
-  let (tMlp0, tMlp2, tEmbedder) = TimeEmbedder(channels: 3072)
+  let (tMlp0, tMlp2, tEmbedder) = MLPEmbedder(channels: 3072, name: "t")
   var vec = tEmbedder(t)
-  let (yMlp0, yMlp2, yEmbedder) = VectorEmbedder(channels: 3072)
+  let gMlp0: Model?
+  let gMlp2: Model?
+  if guidanceEmbed {
+    let (mlp0, mlp2, gEmbedder) = MLPEmbedder(channels: 3072, name: "guidance")
+    let g = Input()
+    vec = vec + gEmbedder(g)
+    guidance = g
+    gMlp0 = mlp0
+    gMlp2 = mlp2
+  } else {
+    gMlp0 = nil
+    gMlp2 = nil
+    guidance = nil
+  }
+  let (yMlp0, yMlp2, yEmbedder) = MLPEmbedder(channels: 3072, name: "vector")
   vec = vec + yEmbedder(y)
   let contextEmbedder = Dense(count: 3072, name: "context_embedder")
   var context = contextEmbedder(contextIn)
@@ -488,7 +494,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   var readers = [(PythonObject) -> Void]()
   for i in 0..<19 {
     let (reader, block) = JointTransformerBlock(
-      prefix: "double_blocks.\(i)", k: 128, h: 24, b: b, t: 256, hw: h * w,
+      prefix: "double_blocks.\(i)", k: 128, h: 24, b: b, t: 512, hw: h * w,
       contextBlockPreOnly: false)
     let blockOut = block(context, out, c, rot)
     context = blockOut[0]
@@ -498,7 +504,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   out = Functional.concat(axis: 1, context, out)
   for i in 0..<38 {
     let (reader, block) = SingleTransformerBlock(
-      prefix: "single_blocks.\(i)", k: 128, h: 24, b: b, t: 256, hw: h * w,
+      prefix: "single_blocks.\(i)", k: 128, h: 24, b: b, t: 512, hw: h * w,
       contextBlockPreOnly: i == 37)
     out = block(out, c, rot)
     readers.append(reader)
@@ -531,6 +537,22 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
       .cpu().numpy()
     tMlp2.weight.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_2_weight))
     tMlp2.bias.copy(from: try! Tensor<Float>(numpy: t_embedder_mlp_2_bias))
+    if let gMlp0 = gMlp0, let gMlp2 = gMlp2 {
+      let g_embedder_mlp_0_weight = state_dict["guidance_in.in_layer.weight"].to(
+        torch.float
+      ).cpu().numpy()
+      let g_embedder_mlp_0_bias = state_dict["guidance_in.in_layer.bias"].to(torch.float)
+        .cpu().numpy()
+      gMlp0.weight.copy(from: try! Tensor<Float>(numpy: g_embedder_mlp_0_weight))
+      gMlp0.bias.copy(from: try! Tensor<Float>(numpy: g_embedder_mlp_0_bias))
+      let g_embedder_mlp_2_weight = state_dict["guidance_in.out_layer.weight"].to(
+        torch.float
+      ).cpu().numpy()
+      let g_embedder_mlp_2_bias = state_dict["guidance_in.out_layer.bias"].to(torch.float)
+        .cpu().numpy()
+      gMlp2.weight.copy(from: try! Tensor<Float>(numpy: g_embedder_mlp_2_weight))
+      gMlp2.bias.copy(from: try! Tensor<Float>(numpy: g_embedder_mlp_2_bias))
+    }
     let y_embedder_mlp_0_weight = state_dict["vector_in.in_layer.weight"].to(
       torch.float
     ).cpu().numpy()
@@ -583,10 +605,10 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
     ).cpu().numpy()
     projOut.bias.copy(from: try! Tensor<Float>(numpy: proj_out_bias))
   }
-  return (reader, Model([x, t, y, contextIn, rot], [out]))
+  return (reader, Model([x, t, y, contextIn, rot] + (guidance.map { [$0] } ?? []), [out]))
 }
 
-let (reader, dit) = MMDiT(b: 1, h: 64, w: 64)
+let (reader, dit) = MMDiT(b: 1, h: 64, w: 64, guidanceEmbed: true)
 
 let graph = DynamicGraph()
 
@@ -600,8 +622,8 @@ graph.withNoGrad {
     try! Tensor<Float>(numpy: y.to(torch.float).cpu().numpy()).toGPU(1))
   let cTensor = graph.variable(
     try! Tensor<Float>(numpy: txt.to(torch.float).cpu().numpy()).toGPU(1))
-  let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + 256, 1, 128), of: Float.self)
-  for i in 0..<256 {
+  let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + 512, 1, 128), of: Float.self)
+  for i in 0..<512 {
     for k in 0..<8 {
       let theta = 0 * 1.0 / pow(10_000, Double(k) / 8)
       let sintheta = sin(theta)
@@ -626,7 +648,7 @@ graph.withNoGrad {
   }
   for y in 0..<64 {
     for x in 0..<64 {
-      let i = y * 64 + x + 256
+      let i = y * 64 + x + 512
       for k in 0..<8 {
         let theta = 0 * 1.0 / pow(10_000, Double(k) / 8)
         let sintheta = sin(theta)
@@ -651,11 +673,13 @@ graph.withNoGrad {
     }
   }
   let rotTensorGPU = rotTensor.toGPU(1)
+  let gTensor = graph.variable(
+    timeEmbedding(timesteps: 350, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000).toGPU(1))
   dit.maxConcurrency = .limit(1)
-  dit.compile(inputs: xTensor, tTensor, yTensor, cTensor, rotTensorGPU)
+  dit.compile(inputs: xTensor, tTensor, yTensor, cTensor, rotTensorGPU, gTensor)
   reader(state_dict)
-  debugPrint(dit(inputs: xTensor, tTensor, yTensor, cTensor, rotTensorGPU))
-  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_schnell_f32.ckpt") {
+  debugPrint(dit(inputs: xTensor, tTensor, yTensor, cTensor, rotTensorGPU, gTensor))
+  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_dev_f32.ckpt") {
     $0.write("dit", model: dit)
   }
 }

@@ -10,6 +10,8 @@ struct PythonObject {}
 
 DynamicGraph.setSeed(42)
 
+let textEncodingLength = 256
+
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
 > {
@@ -28,20 +30,11 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
   return embedding
 }
 
-func TimeEmbedder(channels: Int) -> (Model, Model, Model) {
+func MLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
   let x = Input()
-  let fc0 = Dense(count: channels, name: "t_embedder_0")
+  let fc0 = Dense(count: channels, name: "\(name)_embedder_0")
   var out = fc0(x).swish()
-  let fc2 = Dense(count: channels, name: "t_embedder_1")
-  out = fc2(out)
-  return (fc0, fc2, Model([x], [out]))
-}
-
-func VectorEmbedder(channels: Int) -> (Model, Model, Model) {
-  let x = Input()
-  let fc0 = Dense(count: channels, name: "vector_embedder_0")
-  var out = fc0(x).swish()
-  let fc2 = Dense(count: channels, name: "vector_embedder_1")
+  let fc2 = Dense(count: channels, name: "\(name)_embedder_1")
   out = fc2(out)
   return (fc0, fc2, Model([x], [out]))
 }
@@ -220,23 +213,38 @@ func SingleTransformerBlock(
   let xLinear1 = Dense(count: k * h * 4, name: "x_linear1")
   let xOutProjection = Dense(count: k * h, name: "x_out_proj")
   out = xUnifyheads(out) + xOutProjection(xLinear1(xOut).GELU(approximate: .tanh))
-  out = xIn + (xChunks[2] .* out).to(.Float32)
+  out = xIn + (xChunks[2] .* out).to(of: xIn)
   let reader: (PythonObject) -> Void = { state_dict in
   }
   return (reader, Model([x, c, rot], [out]))
 }
 
-func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
+func MMDiT(b: Int, h: Int, w: Int, guidanceEmbed: Bool) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let t = Input()
   let y = Input()
   let contextIn = Input()
   let rot = Input()
+  let guidance: Input?
   let xEmbedder = Dense(count: 3072, name: "x_embedder")
   var out = xEmbedder(x).to(.Float32)
-  let (tMlp0, tMlp2, tEmbedder) = TimeEmbedder(channels: 3072)
+  let (tMlp0, tMlp2, tEmbedder) = MLPEmbedder(channels: 3072, name: "t")
   var vec = tEmbedder(t)
-  let (yMlp0, yMlp2, yEmbedder) = VectorEmbedder(channels: 3072)
+  let gMlp0: Model?
+  let gMlp2: Model?
+  if guidanceEmbed {
+    let (mlp0, mlp2, gEmbedder) = MLPEmbedder(channels: 3072, name: "guidance")
+    let g = Input()
+    vec = vec + gEmbedder(g)
+    guidance = g
+    gMlp0 = mlp0
+    gMlp2 = mlp2
+  } else {
+    gMlp0 = nil
+    gMlp2 = nil
+    guidance = nil
+  }
+  let (yMlp0, yMlp2, yEmbedder) = MLPEmbedder(channels: 3072, name: "vector")
   vec = vec + yEmbedder(y)
   let contextEmbedder = Dense(count: 3072, name: "context_embedder")
   var context = contextEmbedder(contextIn).to(.Float32)
@@ -246,7 +254,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   var rot32: Model.IO = rot
   for i in 0..<19 {
     let (reader, block) = JointTransformerBlock(
-      prefix: "double_blocks.\(i)", k: 128, h: 24, b: b, t: 256, hw: h * w,
+      prefix: "double_blocks.\(i)", k: 128, h: 24, b: b, t: textEncodingLength, hw: h * w,
       contextBlockPreOnly: false, upcast: i > 16)  // Just last layer should be enough, but to be safe, for the last 2 layers, we will do upcast.
     let blockOut = block(context, out, c32, rot32)
     context = blockOut[0]
@@ -256,7 +264,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   out = Functional.concat(axis: 1, context, out)
   for i in 0..<38 {
     let (reader, block) = SingleTransformerBlock(
-      prefix: "single_blocks.\(i)", k: 128, h: 24, b: b, t: 256, hw: h * w,
+      prefix: "single_blocks.\(i)", k: 128, h: 24, b: b, t: textEncodingLength, hw: h * w,
       contextBlockPreOnly: i == 37)
     out = block(out, c, rot)
     readers.append(reader)
@@ -269,7 +277,7 @@ func MMDiT(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   out = projOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
   }
-  return (reader, Model([x, t, y, contextIn, rot], [out]))
+  return (reader, Model([x, t, y, contextIn, rot] + (guidance.map { [$0] } ?? []), [out]))
 }
 
 func CLIPTextModel(
@@ -402,13 +410,13 @@ let sentencePiece = SentencePiece(
 var tokens1 = sentencePiece.encode(prompt).map { return $0.id }
 tokens1.append(1)
 let tokensTensor0 = graph.variable(.CPU, .C(77), of: Int32.self)
-let tokensTensor1 = graph.variable(.CPU, .C(256), of: Int32.self)
+let tokensTensor1 = graph.variable(.CPU, .C(textEncodingLength), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(77), of: Int32.self)
 for i in 0..<77 {
   tokensTensor0[i] = tokens0[i]
   positionTensor[i] = Int32(i)
 }
-for i in 0..<256 {
+for i in 0..<textEncodingLength {
   tokensTensor1[i] = i < tokens1.count ? tokens1[i] : 0
 }
 
@@ -475,9 +483,9 @@ let pooled = graph.withNoGrad {
 }
 
 let c1 = graph.withNoGrad {
-  let (_, textModel) = T5ForConditionalGeneration(b: 1, t: 256)
+  let (_, textModel) = T5ForConditionalGeneration(b: 1, t: textEncodingLength)
   let relativePositionBuckets = relativePositionBuckets(
-    sequenceLength: 256, numBuckets: 32, maxDistance: 128)
+    sequenceLength: textEncodingLength, numBuckets: 32, maxDistance: 128)
   let tokensTensorGPU = tokensTensor1.toGPU(0)
   let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
   textModel.compile(inputs: tokensTensorGPU, relativePositionBucketsGPU)
@@ -486,14 +494,14 @@ let c1 = graph.withNoGrad {
   }
   let output = textModel(inputs: tokensTensorGPU, relativePositionBucketsGPU)[0].as(
     of: FloatType.self
-  ).reshaped(.CHW(1, 256, 4096))
+  ).reshaped(.CHW(1, textEncodingLength, 4096))
   return output
 }
 
 let z = graph.withNoGrad {
-  let (_, dit) = MMDiT(b: 1, h: 64, w: 64)
-  let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + 256, 1, 128), of: Float.self)
-  for i in 0..<256 {
+  let (_, dit) = MMDiT(b: 1, h: 64, w: 64, guidanceEmbed: false)
+  let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + textEncodingLength, 1, 128), of: Float.self)
+  for i in 0..<textEncodingLength {
     for k in 0..<8 {
       let theta = 0 * 1.0 / pow(10_000, Double(k) / 8)
       let sintheta = sin(theta)
@@ -518,7 +526,7 @@ let z = graph.withNoGrad {
   }
   for y in 0..<64 {
     for x in 0..<64 {
-      let i = y * 64 + x + 256
+      let i = y * 64 + x + textEncodingLength
       for k in 0..<8 {
         let theta = 0 * 1.0 / pow(10_000, Double(k) / 8)
         let sintheta = sin(theta)
@@ -552,6 +560,12 @@ let z = graph.withNoGrad {
         .toGPU(0)))
   let yTensor = pooled
   let cTensor = c1
+  /*
+  let gTensor = graph.variable(
+    Tensor<FloatType>(
+      from: timeEmbedding(timesteps: 350, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
+        .toGPU(0)))
+  */
   dit.compile(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU)
   graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_schnell_f16.ckpt") {
     $0.read("dit", model: dit, codec: [.q8p, .q6p, .q4p, .ezm7])
@@ -569,9 +583,7 @@ let z = graph.withNoGrad {
     debugPrint(z)
   }
   return z.reshaped(format: .NCHW, shape: [1, 64, 64, 16, 2, 2]).permuted(0, 3, 1, 4, 2, 5)
-    .contiguous().reshaped(
-      .NCHW(
-        1, 16, 128, 128))
+    .contiguous().reshaped(.NCHW(1, 16, 128, 128))
 }
 
 func ResnetBlock(prefix: String, outChannels: Int, shortcut: Bool) -> (

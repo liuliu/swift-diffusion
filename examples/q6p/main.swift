@@ -3,12 +3,12 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/flux_1_schnell_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/flux_1_dev_f32.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/flux_1_schnell_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/flux_1_dev_f16.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -83,7 +83,7 @@ graph.openStore(
         continue
       }
       if shape.count == 2 && n > 1 {
-        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+        $0.write(key, tensor: tensor, codec: [.q4p, .ezm7])
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
       } else {
