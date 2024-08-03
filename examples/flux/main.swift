@@ -10,16 +10,16 @@ struct PythonObject {}
 
 DynamicGraph.setSeed(42)
 
-let textEncodingLength = 256
+let textEncodingLength = 512
 
 let prompt =
   // "Professional photograph of an astronaut riding a horse on the moon with view of Earth in the background."
-  // "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
-  // "photo of a young woman with long, wavy brown hair sleeping in grassfield, top down shot, summer, warm, laughing, joy, fun"
-  // "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
-  "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
-let filename = "flux_txt2img_4_q4p"
-let model = "flux_1_schnell_q4p"
+  "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
+// "photo of a young woman with long, wavy brown hair sleeping in grassfield, top down shot, summer, warm, laughing, joy, fun"
+// "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
+// "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
+let filename = "flux_dev_txt2img_1_f16"
+let model = "flux_1_dev_f16"
 
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
@@ -411,6 +411,7 @@ let sentencePiece = SentencePiece(
   file: "/home/liu/workspace/swift-diffusion/examples/sd3/spiece.model")
 var tokens1 = sentencePiece.encode(prompt).map { return $0.id }
 tokens1.append(1)
+print(tokens1)
 let tokensTensor0 = graph.variable(.CPU, .C(77), of: Int32.self)
 let tokensTensor1 = graph.variable(.CPU, .C(textEncodingLength), of: Int32.self)
 let positionTensor = graph.variable(.CPU, .C(77), of: Int32.self)
@@ -501,7 +502,7 @@ let c1 = graph.withNoGrad {
 }
 
 let z = graph.withNoGrad {
-  let (_, dit) = MMDiT(b: 1, h: 64, w: 64, guidanceEmbed: false)
+  let (_, dit) = MMDiT(b: 1, h: 64, w: 64, guidanceEmbed: true)
   let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + textEncodingLength, 1, 128), of: Float.self)
   for i in 0..<textEncodingLength {
     for k in 0..<8 {
@@ -562,26 +563,42 @@ let z = graph.withNoGrad {
         .toGPU(0)))
   let yTensor = pooled
   let cTensor = c1
-  /*
   let gTensor = graph.variable(
     Tensor<FloatType>(
-      from: timeEmbedding(timesteps: 350, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
+      from: timeEmbedding(timesteps: 3500, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
         .toGPU(0)))
-  */
-  dit.compile(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU)
+  dit.compile(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU, gTensor)
   graph.openStore("/home/liu/workspace/swift-diffusion/\(model).ckpt") {
     $0.read("dit", model: dit, codec: [.q8p, .q6p, .q4p, .ezm7])
   }
-  let samplingSteps = 4
-  for i in (1...samplingSteps).reversed() {
+  let samplingSteps = 50
+  let timesteps = [
+    1.0, 0.9935795068740845, 0.9869785904884338, 0.9801895618438721, 0.9732041954994202,
+    0.9660138487815857, 0.958609402179718, 0.9509812593460083, 0.9431188106536865,
+    0.9350114464759827, 0.9266473650932312, 0.9180141687393188, 0.9090986847877502,
+    0.8998868465423584, 0.8903636932373047, 0.880513072013855, 0.870317816734314,
+    0.8597595691680908, 0.8488184809684753, 0.837473452091217, 0.8257015943527222,
+    0.8134785294532776, 0.8007776737213135, 0.7875705361366272, 0.7738260626792908,
+    0.7595109343528748, 0.7445887327194214, 0.7290201783180237, 0.7127622961997986,
+    0.6957681775093079, 0.6779866814613342, 0.6593618392944336, 0.6398321986198425,
+    0.619330108165741, 0.5977811217308044, 0.5751029253005981, 0.55120450258255, 0.5259844064712524,
+    0.4993301331996918, 0.4711155593395233, 0.44119971990585327, 0.4094238877296448,
+    0.37560901045799255, 0.33955228328704834, 0.3010232150554657, 0.2597583830356598,
+    0.2154558151960373, 0.16776712238788605, 0.11628877371549606, 0.0605502724647522, 0.0,
+  ]
+  // for i in (1...samplingSteps).reversed() {
+  for i in 0..<samplingSteps {
     print("\(i)")
-    let t = Float(i) / Float(samplingSteps) * 1_000
+    let t = Float(timesteps[i]) * 1_000
+    // let t = Float(i) / Float(samplingSteps) * 1_000
     let tTensor = graph.variable(
       Tensor<FloatType>(
         from: timeEmbedding(timesteps: t, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
           .toGPU(0)))
-    let v = dit(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU)[0].as(of: FloatType.self)
-    z = z - (1 / Float(samplingSteps)) * v
+    let v = dit(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU, gTensor)[0].as(
+      of: FloatType.self)
+    // z = z - (1 / Float(samplingSteps)) * v
+    z = z - Float(timesteps[i] - timesteps[i + 1]) * v
     debugPrint(z)
   }
   return z.reshaped(format: .NCHW, shape: [1, 64, 64, 16, 2, 2]).permuted(0, 3, 1, 4, 2, 5)
