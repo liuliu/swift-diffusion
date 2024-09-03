@@ -19,7 +19,7 @@ let prompt =
 // "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
 // "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
 let filename = "flux_dev_txt2img_1_f16"
-let model = "flux_1_dev_f16"
+let model = "flux_1_schnell_f16"
 
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
   Float
@@ -502,7 +502,7 @@ let c1 = graph.withNoGrad {
 }
 
 let z = graph.withNoGrad {
-  let (_, dit) = MMDiT(b: 1, h: 64, w: 64, guidanceEmbed: true)
+  let (_, dit) = MMDiT(b: 1, h: 64, w: 64, guidanceEmbed: false)
   let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + textEncodingLength, 1, 128), of: Float.self)
   for i in 0..<textEncodingLength {
     for k in 0..<8 {
@@ -561,44 +561,40 @@ let z = graph.withNoGrad {
     Tensor<FloatType>(
       from: timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
         .toGPU(0)))
-  let yTensor = pooled
-  let cTensor = c1
+  var yTensor = graph.variable(.GPU(0), .NC(1, 768), of: FloatType.self)
+  // yTensor.full(0)
+  yTensor[0..<1, 0..<768] = pooled
+  var cTensor = graph.variable(.GPU(0), .CHW(1, textEncodingLength, 4096), of: FloatType.self)
+  // cTensor.full(0)
+  cTensor[0..<1, 0..<textEncodingLength, 0..<4096] = c1
+  /*
   let gTensor = graph.variable(
     Tensor<FloatType>(
-      from: timeEmbedding(timesteps: 3500, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
+      from: timeEmbedding(timesteps: 1500, batchSize: 2, embeddingSize: 256, maxPeriod: 10_000)
         .toGPU(0)))
-  dit.compile(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU, gTensor)
+  var input = graph.variable(.GPU(0), .CHW(2, 4096, 64), of: FloatType.self)
+  */
+  dit.compile(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU)
   graph.openStore("/home/liu/workspace/swift-diffusion/\(model).ckpt") {
     $0.read("dit", model: dit, codec: [.q8p, .q6p, .q4p, .ezm7])
   }
-  let samplingSteps = 50
-  let timesteps = [
-    1.0, 0.9935795068740845, 0.9869785904884338, 0.9801895618438721, 0.9732041954994202,
-    0.9660138487815857, 0.958609402179718, 0.9509812593460083, 0.9431188106536865,
-    0.9350114464759827, 0.9266473650932312, 0.9180141687393188, 0.9090986847877502,
-    0.8998868465423584, 0.8903636932373047, 0.880513072013855, 0.870317816734314,
-    0.8597595691680908, 0.8488184809684753, 0.837473452091217, 0.8257015943527222,
-    0.8134785294532776, 0.8007776737213135, 0.7875705361366272, 0.7738260626792908,
-    0.7595109343528748, 0.7445887327194214, 0.7290201783180237, 0.7127622961997986,
-    0.6957681775093079, 0.6779866814613342, 0.6593618392944336, 0.6398321986198425,
-    0.619330108165741, 0.5977811217308044, 0.5751029253005981, 0.55120450258255, 0.5259844064712524,
-    0.4993301331996918, 0.4711155593395233, 0.44119971990585327, 0.4094238877296448,
-    0.37560901045799255, 0.33955228328704834, 0.3010232150554657, 0.2597583830356598,
-    0.2154558151960373, 0.16776712238788605, 0.11628877371549606, 0.0605502724647522, 0.0,
-  ]
-  // for i in (1...samplingSteps).reversed() {
-  for i in 0..<samplingSteps {
-    print("\(i)")
-    let t = Float(timesteps[i]) * 1_000
-    // let t = Float(i) / Float(samplingSteps) * 1_000
+  let samplingSteps = 4
+  for i in (1...samplingSteps).reversed() {
+    // input[0..<1, 0..<4096, 0..<64] = z
+    // input[1..<2, 0..<4096, 0..<64] = z
+    let t = Float(i) / Float(samplingSteps) * 1_000
     let tTensor = graph.variable(
       Tensor<FloatType>(
         from: timeEmbedding(timesteps: t, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
           .toGPU(0)))
-    let v = dit(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU, gTensor)[0].as(
+    let v = dit(inputs: z, tTensor, yTensor, cTensor, rotTensorGPU)[0].as(
       of: FloatType.self)
-    // z = z - (1 / Float(samplingSteps)) * v
-    z = z - Float(timesteps[i] - timesteps[i + 1]) * v
+    /*
+    let vu = vcu[0..<1, 0..<4096, 0..<64]
+    let vc = vcu[1..<2, 0..<4096, 0..<64]
+    let v = vu + 7 * (vc - vu)
+    */
+    z = z - (1 / Float(samplingSteps)) * v
     debugPrint(z)
   }
   return z.reshaped(format: .NCHW, shape: [1, 64, 64, 16, 2, 2]).permuted(0, 3, 1, 4, 2, 5)
@@ -644,19 +640,20 @@ func AttnBlock(prefix: String, inChannels: Int, batchSize: Int, width: Int, heig
   let x = Input()
   let norm = GroupNorm(axis: 1, groups: 32, epsilon: 1e-6, reduce: [2, 3])
   var out = norm(x)
+  let f32 = out.to(.Float32)
   let hw = width * height
   let tokeys = Convolution(
     groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  let k = tokeys(out).reshaped([batchSize, inChannels, hw])
+  let k = tokeys(f32).reshaped([batchSize, inChannels, hw])
   let toqueries = Convolution(
     groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
-  let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
+  let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(f32)).reshaped([
     batchSize, inChannels, hw,
   ])
   var dot = Matmul(transposeA: (1, 2))(q, k)
   dot = dot.reshaped([batchSize * hw, hw])
   dot = dot.softmax()
-  dot = dot.reshaped([batchSize, hw, hw])
+  dot = dot.reshaped([batchSize, hw, hw]).to(of: out)
   let tovalues = Convolution(
     groups: 1, filters: inChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]))
   let v = tovalues(out).reshaped([batchSize, inChannels, hw])
@@ -791,14 +788,14 @@ func Decoder(channels: [Int], numRepeat: Int, batchSize: Int, startWidth: Int, s
 
 graph.withNoGrad {
   // Already processed out.
-  let zTensor = DynamicGraph.Tensor<Float>(from: (1.0 / 0.3611) * z + 0.11590)
+  let zTensor = (1.0 / 0.3611) * z + 0.11590  // DynamicGraph.Tensor<Float>(from: (1.0 / 0.3611) * z + 0.11590)
   let (_, decoder) = Decoder(
     channels: [128, 256, 512, 512], numRepeat: 2, batchSize: 1, startWidth: 128, startHeight: 128)
   decoder.compile(inputs: zTensor)
   graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_vae_f16.ckpt") {
     $0.read("decoder", model: decoder)
   }
-  let img = decoder(inputs: zTensor)[0].as(of: Float.self).toCPU()
+  let img = decoder(inputs: zTensor)[0].as(of: FloatType.self).toCPU()
   let startHeight = 128
   let startWidth = 128
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)

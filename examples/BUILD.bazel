@@ -883,3 +883,18 @@ swift_binary(
         "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )
+
+swift_binary(
+    name = "arcface",
+    srcs = ["arcface/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
