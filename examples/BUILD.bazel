@@ -845,6 +845,21 @@ swift_binary(
 )
 
 swift_binary(
+    name = "kolors_ip_adapter_faceid_plus",
+    srcs = ["kolors_ip_adapter_faceid_plus/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "flux_converter",
     srcs = ["flux_converter/main.swift"],
     data = [

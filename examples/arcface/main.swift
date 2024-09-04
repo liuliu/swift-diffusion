@@ -128,7 +128,7 @@ print(output)
 
 func PReLU(count: Int, name: String) -> (Model, ([String: PythonObject]) -> Void) {
   let x = Input()
-  let weight = Parameter<Float>(.GPU(0), .CHW(count, 1, 1))
+  let weight = Parameter<Float>(.GPU(0), .CHW(count, 1, 1), name: "\(name).slope")
   let out = x.ReLU() - (-x).ReLU() .* weight
   let reader: ([String: PythonObject]) -> Void = { stateDict in
     let t = onnx.numpy_helper.to_array(stateDict[name])
@@ -140,8 +140,8 @@ func PReLU(count: Int, name: String) -> (Model, ([String: PythonObject]) -> Void
 
 func BatchNorm(count: Int, name: String) -> (Model, ([String: PythonObject]) -> Void) {
   let x = Input()
-  let weight = Parameter<Float>(.GPU(0), .CHW(count, 1, 1))
-  let bias = Parameter<Float>(.GPU(0), .CHW(count, 1, 1))
+  let weight = Parameter<Float>(.GPU(0), .CHW(count, 1, 1), name: "\(name).weight")
+  let bias = Parameter<Float>(.GPU(0), .CHW(count, 1, 1), name: "\(name).bias")
   let out = x .* weight + bias
   let reader: ([String: PythonObject]) -> Void = { stateDict in
     let bn1_weight = torch.from_numpy(onnx.numpy_helper.to_array(stateDict["\(name).weight"]))
@@ -170,7 +170,7 @@ func ResnetBlock(prefix: (Int, Int, String), inChannels: Int, outChannels: Int, 
   var out = bn1.0(x)
   let conv1 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3],
-    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), name: "conv1")
   out = conv1(out)
   let prelu = PReLU(count: outChannels, name: "\(prefix.1)")
   readers.append(prelu.1)
@@ -180,16 +180,16 @@ func ResnetBlock(prefix: (Int, Int, String), inChannels: Int, outChannels: Int, 
   if downsample {
     conv2 = Convolution(
       groups: 1, filters: outChannels, filterSize: [3, 3],
-      hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+      hint: Hint(stride: [2, 2], border: Hint.Border(begin: [1, 1], end: [1, 1])), name: "conv2")
     let convSkip = Convolution(
       groups: 1, filters: outChannels, filterSize: [1, 1],
-      hint: Hint(stride: [2, 2], border: Hint.Border(begin: [0, 0], end: [0, 0])))
+      hint: Hint(stride: [2, 2], border: Hint.Border(begin: [0, 0], end: [0, 0])), name: "skip")
     out = conv2(out) + convSkip(x)
     skip = convSkip
   } else {
     conv2 = Convolution(
       groups: 1, filters: outChannels, filterSize: [3, 3],
-      hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])))
+      hint: Hint(stride: [1, 1], border: Hint.Border(begin: [1, 1], end: [1, 1])), name: "conv2")
     out = conv2(out) + x
     skip = nil
   }
@@ -330,5 +330,8 @@ graph.withNoGrad {
   arc.compile(inputs: xTensor)
   arcReader(stateDict)
   let embedding = arc(inputs: xTensor)[0].as(of: Float.self)
+  graph.openStore("/home/liu/workspace/swift-diffusion/arcface_f32.ckpt") {
+    $0.write("arcface", model: arc)
+  }
   debugPrint(embedding)
 }
