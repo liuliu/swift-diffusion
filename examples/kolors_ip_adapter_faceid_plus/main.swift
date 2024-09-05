@@ -70,6 +70,7 @@ let face_info = face_info_generator.get_faceinfo_one_img(
 let face_bbox_square = sample_ipadapter_faceid_plus.face_bbox_to_square(face_info["bbox"])
 var crop_image = img.crop(face_bbox_square)
 crop_image = crop_image.resize(PythonObject(tupleOf: 336, 336))
+crop_image.save("/home/liu/workspace/swift-diffusion/crop_image.png")
 crop_image = [crop_image]
 
 var face_embeds = torch.from_numpy(numpy.array([face_info["embedding"]]))
@@ -89,6 +90,8 @@ let image = pipe(
   face_crop_image: crop_image,
   face_insightface_embeds: face_embeds
 ).images[0]
+
+exit(0)
 
 image.save("/home/liu/workspace/swift-diffusion/test_res.png")
 
