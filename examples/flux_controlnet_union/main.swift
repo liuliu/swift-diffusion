@@ -553,7 +553,6 @@ func MMDiT(b: Int, h: Int, w: Int, guidanceEmbed: Bool) -> ((PythonObject) -> Vo
   var readers = [(PythonObject) -> Void]()
   var zeroConvs = [Dense]()
   var outs = [Model.IO]()
-  outs.append(vec)
   for i in 0..<5 {
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: b, t: 513, hw: h * w,
@@ -679,7 +678,8 @@ func MMDiT(b: Int, h: Int, w: Int, guidanceEmbed: Bool) -> ((PythonObject) -> Vo
     for i in 0..<5 {
       let controlnet_blocks_weight = state_dict["controlnet_blocks.\(i).weight"].to(torch.float)
         .cpu().numpy()
-      let controlnet_blocks_bias = state_dict["controlnet_blocks.\(i).bias"].to(torch.float).cpu()
+      let controlnet_blocks_bias =
+        ((1.0 / 8) * state_dict["controlnet_blocks.\(i).bias"].to(torch.float).cpu())
         .numpy()
       zeroConvs[i].weight.copy(from: try! Tensor<Float>(numpy: controlnet_blocks_weight))
       zeroConvs[i].bias.copy(from: try! Tensor<Float>(numpy: controlnet_blocks_bias))
@@ -688,9 +688,11 @@ func MMDiT(b: Int, h: Int, w: Int, guidanceEmbed: Bool) -> ((PythonObject) -> Vo
       let controlnet_single_blocks_weight = state_dict["controlnet_single_blocks.\(i).weight"].to(
         torch.float
       ).cpu().numpy()
-      let controlnet_single_blocks_bias = state_dict["controlnet_single_blocks.\(i).bias"].to(
-        torch.float
-      ).cpu().numpy()
+      let controlnet_single_blocks_bias =
+        ((1.0 / 8)
+        * state_dict["controlnet_single_blocks.\(i).bias"].to(
+          torch.float
+        ).cpu()).numpy()
       zeroConvs[i + 5].weight.copy(from: try! Tensor<Float>(numpy: controlnet_single_blocks_weight))
       zeroConvs[i + 5].bias.copy(from: try! Tensor<Float>(numpy: controlnet_single_blocks_bias))
     }
@@ -783,7 +785,9 @@ graph.withNoGrad {
     dit(
       inputs: xTensor, conditionXTensor, conditionModeTensor, tTensor, yTensor, cTensor,
       rotTensorGPU, gTensor))
-  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_dev_controlnet_union_pro_f32.ckpt") {
-    $0.write("dit", model: dit)
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/controlnet_union_pro_flux_1_dev_1.0_f32.ckpt"
+  ) {
+    $0.write("controlnet", model: dit)
   }
 }

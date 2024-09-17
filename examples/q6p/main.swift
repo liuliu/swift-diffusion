@@ -3,12 +3,12 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/flux_1_dev_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/controlnet_union_pro_flux_1_dev_1.0_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/flux_1_dev_q5p.ckpt",
+    "/home/liu/workspace/swift-diffusion/controlnet_union_pro_flux_1_dev_1.0_q5p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -30,7 +30,7 @@ graph.openStore(
         $0.write(key, tensor: tensor)
         continue
       }
-      if key.contains("shift_table") || key.contains("t_block") {
+      if key.contains("shift_table") || key.contains("t_block") || key.contains("zero_conv") {
         $0.write(key, tensor: tensor)
         continue
       }
