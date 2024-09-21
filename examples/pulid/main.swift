@@ -320,7 +320,7 @@ func IDFormer(
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let y = (0..<layers).map { _ in Input() }
-  let latents = Parameter<Float>(.GPU(1), .CHW(1, queries, width))
+  let latents = Parameter<Float>(.GPU(1), .CHW(1, queries, width), name: "latents")
   var readers = [(PythonObject) -> Void]()
   let idEmbeddingMapping = IDFormerMapping(
     prefix: "id_embedding_mapping", channels: 1024, outputChannels: 1024 * idQueries)
@@ -342,7 +342,7 @@ func IDFormer(
       out = layer(ctxFeature, out)
     }
   }
-  let projOut = Dense(count: outputDim, noBias: true)
+  let projOut = Dense(count: outputDim, noBias: true, name: "proj_out")
   out = projOut(
     out.reshaped([1, queries, width], strides: [(queries + idQueries) * width, width, 1])
       .contiguous())
@@ -365,13 +365,13 @@ let face_resampler_state_dict = pipeline.pulid_encoder.state_dict()
 
 let pulid_ca_state_dict = pipeline.pulid_ca.state_dict()
 
-func PuLIDCrossAttentionFixed(prefix: String, k: Int, h: Int, b: Int, t: Int) -> (
+func PuLIDCrossAttentionFixed(prefix: String, name: String, k: Int, h: Int, b: Int, t: Int) -> (
   (PythonObject) -> Void, Model
 ) {
   let x = Input()
-  let norm1 = LayerNorm(epsilon: 1e-5, axis: [2], name: "\(prefix).norm1")
-  let tokeys = Dense(count: k * h, noBias: true, name: "\(prefix).k")
-  let tovalues = Dense(count: k * h, noBias: true, name: "\(prefix).v")
+  let norm1 = LayerNorm(epsilon: 1e-5, axis: [2], name: "\(name)_norm1")
+  let tokeys = Dense(count: k * h, noBias: true, name: "\(name)_k")
+  let tovalues = Dense(count: k * h, noBias: true, name: "\(name)_v")
   let out = norm1(x)
   let keys = tokeys(out).reshaped([b, t, h, k]).transposed(1, 2)
   let values = tovalues(out).reshaped([b, t, h, k]).transposed(1, 2)
@@ -387,15 +387,24 @@ func PuLIDCrossAttentionFixed(prefix: String, k: Int, h: Int, b: Int, t: Int) ->
   return (reader, Model([x], [keys, values]))
 }
 
-func PuLIDFixed(queries: Int) -> ((PythonObject) -> Void, Model) {
+func PuLIDFixed(queries: Int, double: [Int], single: [Int]) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   var readers = [(PythonObject) -> Void]()
   var outs = [Model.IO]()
-  for i in 0..<20 {
+  var ca: Int = 0
+  for i in double {
     let (reader, block) = PuLIDCrossAttentionFixed(
-      prefix: "\(i)", k: 2048 / 16, h: 16, b: 1, t: queries)
+      prefix: "\(ca)", name: "double_\(i)", k: 2048 / 16, h: 16, b: 1, t: queries)
     outs.append(block(x))
     readers.append(reader)
+    ca += 1
+  }
+  for i in single {
+    let (reader, block) = PuLIDCrossAttentionFixed(
+      prefix: "\(ca)", name: "single_\(i)", k: 2048 / 16, h: 16, b: 1, t: queries)
+    outs.append(block(x))
+    readers.append(reader)
+    ca += 1
   }
   let reader: (PythonObject) -> Void = { state_dict in
     for reader in readers {
@@ -406,13 +415,13 @@ func PuLIDFixed(queries: Int) -> ((PythonObject) -> Void, Model) {
 }
 
 func PuLIDCrossAttentionKeysAndValues(
-  prefix: String, outputDim: Int, k: Int, h: Int, b: Int, t: (Int, Int)
+  prefix: String, name: String, outputDim: Int, k: Int, h: Int, b: Int, t: (Int, Int)
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let keys = Input()
   let values = Input()
-  let norm2 = LayerNorm(epsilon: 1e-5, axis: [2], name: "\(prefix).norm2")
-  let toqueries = Dense(count: k * h, noBias: true, name: "\(prefix).q")
+  let norm2 = LayerNorm(epsilon: 1e-5, axis: [2], name: "\(name)_norm2")
+  let toqueries = Dense(count: k * h, noBias: true, name: "\(name)_q")
   let queries = toqueries(norm2(x)).reshaped([b, t.1, h, k]).permuted(0, 2, 1, 3)
   var dot = Matmul(transposeB: (2, 3))(queries, keys)
   dot = dot.reshaped([b * h * t.1, t.0])
@@ -420,7 +429,7 @@ func PuLIDCrossAttentionKeysAndValues(
   dot = dot.reshaped([b, h, t.1, t.0])
   var out = dot * values
   out = out.reshaped([b, h, t.1, k]).transposed(1, 2).reshaped([b * t.1, h * k])
-  let unifyheads = Dense(count: outputDim, noBias: true, name: "\(prefix).to_out")
+  let unifyheads = Dense(count: outputDim, noBias: true, name: "\(name)_to_out")
   out = unifyheads(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let norm2_weight = state_dict["\(prefix).norm2.weight"].type(torch.float).cpu().numpy()
@@ -435,20 +444,37 @@ func PuLIDCrossAttentionKeysAndValues(
   return (reader, Model([x, keys, values], [out]))
 }
 
-func PuLID(queries: Int, width: Int, hw: Int) -> ((PythonObject) -> Void, Model) {
+func PuLID(queries: Int, width: Int, hw: Int, double: [Int], single: [Int]) -> (
+  (PythonObject) -> Void, Model
+) {
   let x = Input()
   var readers = [(PythonObject) -> Void]()
   var kvs = [Input]()
   var outs = [Model.IO]()
-  for i in 0..<20 {
+  var ca: Int = 0
+  for i in double {
     let (reader, block) = PuLIDCrossAttentionKeysAndValues(
-      prefix: "\(i)", outputDim: width, k: 2048 / 16, h: 16, b: 1, t: (queries, hw))
+      prefix: "\(ca)", name: "double_\(i)", outputDim: width, k: 2048 / 16, h: 16, b: 1,
+      t: (queries, hw))
     let k = Input()
     let v = Input()
     let out = block(x, k, v)
     kvs.append(contentsOf: [k, v])
     outs.append(out)
     readers.append(reader)
+    ca += 1
+  }
+  for i in single {
+    let (reader, block) = PuLIDCrossAttentionKeysAndValues(
+      prefix: "\(ca)", name: "single_\(i)", outputDim: width, k: 2048 / 16, h: 16, b: 1,
+      t: (queries, hw))
+    let k = Input()
+    let v = Input()
+    let out = block(x, k, v)
+    kvs.append(contentsOf: [k, v])
+    outs.append(out)
+    readers.append(reader)
+    ca += 1
   }
   let reader: (PythonObject) -> Void = { state_dict in
     for reader in readers {
@@ -520,12 +546,16 @@ graph.withNoGrad {
   idFormerReader(face_resampler_state_dict)
   let features = idFormer(inputs: idCond, idVitHidden)[0].as(of: Float.self)
 
-  let (pulidFixedReader, pulidFixed) = PuLIDFixed(queries: 32)
+  let (pulidFixedReader, pulidFixed) = PuLIDFixed(
+    queries: 32, double: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18],
+    single: [0, 4, 8, 12, 16, 20, 24, 28, 32, 36])
   pulidFixed.compile(inputs: features)
   pulidFixedReader(pulid_ca_state_dict)
   let outs = pulidFixed(inputs: features).map { $0.as(of: Float.self) }
 
-  let (pulidReader, pulid) = PuLID(queries: 32, width: 3072, hw: 4096)
+  let (pulidReader, pulid) = PuLID(
+    queries: 32, width: 3072, hw: 4096, double: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18],
+    single: [0, 4, 8, 12, 16, 20, 24, 28, 32, 36])
   let imgTensor = graph.variable(
     try! Tensor<Float>(numpy: img.to(torch.float).cpu().numpy()).toGPU(1))
   pulid.compile(inputs: [imgTensor] + outs)
@@ -538,10 +568,12 @@ graph.withNoGrad {
   ) {
     $0.write("vit", model: vit)
   }
+  */
   graph.openStore(
     "/home/liu/workspace/swift-diffusion/pulid_0.9_eva02_clip_l14_336_f32.ckpt"
   ) {
-    $0.write("resampler", model: resampler)
+    $0.write("resampler", model: idFormer)
+    $0.write("pulid", model: pulidFixed)
+    $0.write("pulid", model: pulid)
   }
-  */
 }
