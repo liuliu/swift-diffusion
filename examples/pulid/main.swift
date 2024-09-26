@@ -14,6 +14,8 @@ let model = flux_util.load_flow_model("flux-dev", device: "cpu")
 let pipeline = pulid_pipeline_flux.PuLIDPipeline(
   model, device: "cpu", weight_dtype: torch.bfloat16, onnx_provider: "gpu")
 
+pipeline.load_pretrain()
+
 torch.set_grad_enabled(false)
 
 torch.manual_seed(42)
@@ -296,6 +298,7 @@ func IDFormerMapping(prefix: String, channels: Int, outputChannels: Int) -> (
     layer0.bias.copy(from: try! Tensor<Float>(numpy: layer0_bias))
     let layer1_weight = state_dict["\(prefix).1.weight"].type(torch.float).cpu().numpy()
     layer1.weight.copy(from: try! Tensor<Float>(numpy: layer1_weight))
+    print("layer1_weight \(layer1_weight)")
     let layer1_bias = state_dict["\(prefix).1.bias"].type(torch.float).cpu().numpy()
     layer1.bias.copy(from: try! Tensor<Float>(numpy: layer1_bias))
     let layer3_weight = state_dict["\(prefix).3.weight"].type(torch.float).cpu().numpy()
@@ -562,13 +565,11 @@ graph.withNoGrad {
   pulidReader(pulid_ca_state_dict)
   debugPrint(pulid(inputs: imgTensor, outs))
 
-  /*
   graph.openStore(
     "/home/liu/workspace/swift-diffusion/eva02_clip_l14_336_f32.ckpt"
   ) {
-    $0.write("vit", model: vit)
+    $0.write("vision_model", model: vit)
   }
-  */
   graph.openStore(
     "/home/liu/workspace/swift-diffusion/pulid_0.9_eva02_clip_l14_336_f32.ckpt"
   ) {

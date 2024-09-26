@@ -110,6 +110,10 @@ func JointTransformerBlock(
   queries = Functional.cmul(left: queries, right: rot)
   keys = Functional.cmul(left: keys, right: rot)
   // Now run attention.
+  let scaledDotProductAttention = ScaledDotProductAttention(
+    scale: 1.0 / Float(k).squareRoot(), flags: [.Float16])
+  let out = scaledDotProductAttention(queries, keys, values).reshaped([b, (t + hw), k * h])
+  /*
   keys = keys.permuted(0, 2, 1, 3).contiguous()
   queries = ((1.0 / Float(k).squareRoot()) * queries)
     .permuted(0, 2, 1, 3).contiguous()
@@ -120,6 +124,7 @@ func JointTransformerBlock(
   dot = dot.reshaped([b, h, (t + hw), t + hw])
   var out = dot * values
   out = out.reshaped([b, h, (t + hw), k]).transposed(1, 2).reshaped([b, (t + hw), h * k])
+  */
   let contextUnifyheads: Model?
   if !contextBlockPreOnly {
     contextOut = out.reshaped([b, t, h * k], strides: [(t + hw) * h * k, h * k, 1]).contiguous()
@@ -197,6 +202,10 @@ func SingleTransformerBlock(
   queries = Functional.cmul(left: queries, right: rot)
   keys = Functional.cmul(left: keys, right: rot)
   // Now run attention.
+  let scaledDotProductAttention = ScaledDotProductAttention(
+    scale: 1.0 / Float(k).squareRoot(), flags: [.Float16])
+  var out = scaledDotProductAttention(queries, keys, values).reshaped([b, (t + hw), k * h])
+  /*
   keys = keys.permuted(0, 2, 1, 3).contiguous()
   queries = ((1.0 / Float(k).squareRoot()) * queries)
     .permuted(0, 2, 1, 3).contiguous()
@@ -207,6 +216,7 @@ func SingleTransformerBlock(
   dot = dot.reshaped([b, h, (t + hw), t + hw])
   var out = dot * values
   out = out.reshaped([b, h, (t + hw), k]).transposed(1, 2).reshaped([b, (t + hw), h * k])
+  */
   var xIn: Model.IO = x
   if contextBlockPreOnly {
     out = out.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
