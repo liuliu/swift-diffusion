@@ -9,6 +9,8 @@ let flux_util = Python.import("flux.util")
 
 let torch = Python.import("torch")
 
+let numpy = Python.import("numpy")
+
 let model = flux_util.load_flow_model("flux-dev", device: "cpu")
 
 let pipeline = pulid_pipeline_flux.PuLIDPipeline(
@@ -46,6 +48,7 @@ let id_embedding = pipeline.pulid_encoder(id_cond, id_vit_hidden)
 
 print("id_embedding \(id_embedding) \(id_embedding.shape)")
 pipeline.pulid_ca = pipeline.pulid_ca.to(torch.float).cuda()
+print(pipeline.pulid_ca)
 
 for i in 0..<20 {
   let out = pipeline.pulid_ca[i](id_embedding, img)
@@ -441,6 +444,10 @@ func PuLIDCrossAttentionKeysAndValues(
     norm2.bias.copy(from: try! Tensor<Float>(numpy: norm2_bias))
     let to_q_weight = state_dict["\(prefix).to_q.weight"].type(torch.float).cpu().numpy()
     toqueries.weight.copy(from: try! Tensor<Float>(numpy: to_q_weight))
+    let top_10_max = -numpy.sort(-numpy.partition(-to_q_weight.ravel(), 10)[..<10])
+    let top_10_min = numpy.sort(numpy.partition(to_q_weight.ravel(), 10)[..<10])
+    print("top 10 max \(top_10_max)")
+    print("top 10 min \(top_10_min)")
     let to_out_weight = state_dict["\(prefix).to_out.weight"].type(torch.float).cpu().numpy()
     unifyheads.weight.copy(from: try! Tensor<Float>(numpy: to_out_weight))
   }
@@ -564,12 +571,13 @@ graph.withNoGrad {
   pulid.compile(inputs: [imgTensor] + outs)
   pulidReader(pulid_ca_state_dict)
   debugPrint(pulid(inputs: imgTensor, outs))
-
+  /*
   graph.openStore(
     "/home/liu/workspace/swift-diffusion/eva02_clip_l14_336_f32.ckpt"
   ) {
     $0.write("vision_model", model: vit)
   }
+*/
   graph.openStore(
     "/home/liu/workspace/swift-diffusion/pulid_0.9_eva02_clip_l14_336_f32.ckpt"
   ) {
