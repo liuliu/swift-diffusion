@@ -577,9 +577,9 @@ graph.withNoGrad {
   ) {
     $0.write("vision_model", model: vit)
   }
-*/
+  */
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/pulid_0.9_eva02_clip_l14_336_f32.ckpt"
+    "/home/liu/workspace/swift-diffusion/pulid_0.9.1_eva02_clip_l14_336_f32.ckpt"
   ) {
     $0.write("resampler", model: idFormer)
     $0.write("pulid", model: pulidFixed)

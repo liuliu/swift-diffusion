@@ -225,15 +225,13 @@ func SingleTransformerBlock(
   var xIn: Model.IO = x
   if contextBlockPreOnly {
     out = out.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
-      .contiguous()
     xIn = x.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
       .contiguous()
     xOut = xOut.reshaped(
       [b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1]
     )
-    .contiguous()
   }
-  let xUnifyheads = Dense(count: k * h, noBias: true, name: "x_o")
+  let xUnifyheads = LoRADense(count: k * h, noBias: true, name: "x_o")
   let (_, _, xFF) = LoRAFeedForward(
     hiddenSize: k * h, intermediateSize: k * h * 4, upcast: false, name: "x")
   xFF.gradientCheckpointing = true
@@ -747,8 +745,8 @@ let x = graph.withNoGrad {
 debugPrint(x)
 
 let (_, dit) = MMDiT(b: 1, h: startHeight / 2, w: startWidth / 2, guidanceEmbed: true)
-let rotTensor = graph.variable(
-  .CPU, .NHWC(1, (startHeight / 2 * startWidth / 2) + textEncodingLength, 24, 128), of: Float.self)
+var rotTensor = Tensor<Float>(
+  .CPU, .NHWC(1, (startHeight / 2 * startWidth / 2) + textEncodingLength, 24, 128))
 for i in 0..<textEncodingLength {
   for j in 0..<24 {
     for k in 0..<8 {
@@ -802,23 +800,26 @@ for y in 0..<(startHeight / 2) {
     }
   }
 }
-let rotTensorGPU = DynamicGraph.Tensor<FloatType>(from: rotTensor).toGPU(0)
+let rotTensorGPU = graph.constant(Tensor<FloatType>(from: rotTensor).toGPU(0))
 dit.maxConcurrency = .limit(1)
 var z = graph.variable(
   .GPU(0), .HWC(1, (startHeight / 2) * (startWidth / 2), 64), of: FloatType.self)
 z.randn()
-let tTensor = graph.variable(
+let tTensor = graph.constant(
   Tensor<FloatType>(
     from: timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
       .toGPU(0)))
 var yTensor = graph.variable(.GPU(0), .WC(1, 768), of: FloatType.self)
 yTensor[0..<1, 0..<768] = pooled
+yTensor = graph.constant(yTensor.rawValue)
 var cTensor = graph.variable(.GPU(0), .HWC(1, textEncodingLength, 4096), of: FloatType.self)
 cTensor[0..<1, 0..<textEncodingLength, 0..<4096] = c1
-let gTensor = graph.variable(
+cTensor = graph.constant(cTensor.rawValue)
+let gTensor = graph.constant(
   Tensor<FloatType>(
     from: timeEmbedding(timesteps: 3500, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
       .toGPU(0)))
+dit.memoryReduction = true
 /*
 var input = graph.variable(.GPU(0), .CHW(2, 4096, 64), of: FloatType.self)
 */
@@ -841,7 +842,7 @@ graph.openStore("/home/liu/workspace/swift-diffusion/\(model).ckpt") {
 var optimizer = AdamWOptimizer(graph, rate: 0.0001)
 optimizer.parameters = [dit.parameters]
 var scaler = GradScaler()
-for i in 0..<500 {
+for i in 0..<2000 {
   let t = graph.withNoGrad {
     let t = graph.variable(.CPU, .C(1), of: Float.self)
     t.rand(0...1)
@@ -854,7 +855,7 @@ for i in 0..<500 {
     let zt = (1 - tG) .* x + tG .* z1
     return (zt, z1)
   }
-  let tTensor = graph.variable(
+  let tTensor = graph.constant(
     Tensor<FloatType>(
       from: timeEmbedding(
         timesteps: t[0] * 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000
@@ -864,8 +865,10 @@ for i in 0..<500 {
     of: FloatType.self)
   let diff = z1 - x - vtheta
   let loss = (diff .* diff).reduced(.mean, axis: [1, 2])
+  DynamicGraph.logLevel = .verbose
   scaler.scale(loss).backward(to: [zt])
   scaler.step(&optimizer)
+  exit(0)
   let time = t[0]
   let lossC = loss.rawValue.toCPU()[0, 0, 0]
   print("epoch \(i), t \(time), loss \(lossC)")
@@ -873,13 +876,13 @@ for i in 0..<500 {
 
 let samplingSteps = 20
 z.randn()
-let testGTensor = graph.variable(
+let testGTensor = graph.constant(
   Tensor<FloatType>(
     from: timeEmbedding(timesteps: 3500, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
       .toGPU(0)))
 for i in (1...samplingSteps).reversed() {
   let t = Float(i) / Float(samplingSteps) * 1_000
-  let tTensor = graph.variable(
+  let tTensor = graph.constant(
     Tensor<FloatType>(
       from: timeEmbedding(timesteps: t, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
         .toGPU(0)))
