@@ -596,6 +596,19 @@ swift_binary(
 )
 
 swift_binary(
+    name = "siglip",
+    srcs = ["siglip/main.swift"],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "moondream1",
     srcs = ["moondream1/main.swift"],
     data = [

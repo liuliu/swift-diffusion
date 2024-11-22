@@ -3,12 +3,12 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/sd3_large_turbo_3.5_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/flux_1_dev_de_distill_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/sd3_large_turbo_3.5_q5p.ckpt",
+    "/home/liu/workspace/swift-diffusion/flux_1_dev_de_distill_q5p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
