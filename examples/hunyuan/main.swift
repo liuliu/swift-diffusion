@@ -56,9 +56,8 @@ func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
   let tokeys = Dense(count: k * hk, noBias: true, name: "k_proj")
   let toqueries = Dense(count: k * h, noBias: true, name: "q_proj")
   let tovalues = Dense(count: k * hk, noBias: true, name: "v_proj")
-  // The rotary in Llama is first half and second half, so we need to do the extra transpose to use with cmul.
-  var keys = tokeys(x).reshaped([b, t, hk, 2, k / 2]).transposed(3, 4).reshaped([b, t, hk, k])
-  var queries = toqueries(x).reshaped([b, t, h, 2, k / 2]).transposed(3, 4).reshaped([b, t, h, k])
+  var keys = tokeys(x).reshaped([b, t, hk, k])
+  var queries = toqueries(x).reshaped([b, t, h, k])
   let values = tovalues(x).reshaped([b, t, hk, k])
   queries = Functional.cmul(left: queries, right: rot)
   keys = Functional.cmul(left: keys, right: rot)
@@ -68,10 +67,14 @@ func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
   let unifyheads = Dense(count: k * h, noBias: true, name: "out_proj")
   out = unifyheads(out)
   let reader: (PythonObject) -> Void = { state_dict in
-    let q_weight = state_dict["\(prefix).self_attn.q_proj.weight"].type(torch.float).cpu()
-      .numpy()
+    // The rotary in Llama is first half and second half, we can be clever and do the extra transpose here to use with cmul.
+    let q_weight = state_dict["\(prefix).self_attn.q_proj.weight"].type(torch.float).view(
+      32, 2, 64, 4096
+    ).transpose(1, 2).cpu().numpy()
     toqueries.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: q_weight)))
-    let k_weight = state_dict["\(prefix).self_attn.k_proj.weight"].type(torch.float).cpu().numpy()
+    let k_weight = state_dict["\(prefix).self_attn.k_proj.weight"].type(torch.float).view(
+      8, 2, 64, 4096
+    ).transpose(1, 2).cpu().numpy()
     tokeys.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: k_weight)))
     let v_weight = state_dict["\(prefix).self_attn.v_proj.weight"].type(torch.float).cpu()
       .numpy()
@@ -208,7 +211,7 @@ graph.withNoGrad {
   transformer.compile(inputs: tokensTensorGPU, rotTensorGPU)
   reader(text_encoder_state_dict)
   let lastHiddenStates = transformer(inputs: tokensTensorGPU, rotTensorGPU)[0].as(of: Float16.self)[
-    95..<351, 0..<4096
-  ].copied()
+    95..<106, 0..<4096
+  ].copied()  // We don't need attention mask, just reduce the hidden states.
   debugPrint(lastHiddenStates)
 }
