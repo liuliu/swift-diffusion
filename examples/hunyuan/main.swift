@@ -6,6 +6,8 @@ import PythonKit
 
 let torch = Python.import("torch")
 
+torch.set_grad_enabled(false)
+
 let numpy = Python.import("numpy")
 
 let hyvideo_config = Python.import("hyvideo.config")
@@ -41,12 +43,19 @@ let hunyuan_video_sampler = hyvideo_inference.HunyuanVideoSampler.from_pretraine
   "/home/liu/workspace/HunyuanVideo/ckpts", args)
 
 print(hunyuan_video_sampler.pipeline.text_encoder.model)
+print(hunyuan_video_sampler.pipeline.transformer)
+print(hunyuan_video_sampler.pipeline.transformer.txt_in)
 
 let text_inputs = hunyuan_video_sampler.pipeline.text_encoder.text2tokens(
   [prompt], data_type: "video")
 let prompt_outputs = hunyuan_video_sampler.pipeline.text_encoder.encode(
   text_inputs, data_type: "video", device: torch.device("cuda:0"))
 print(prompt_outputs)
+let txt_in = hunyuan_video_sampler.pipeline.transformer.txt_in.to(torch.float)(
+  prompt_outputs.hidden_state.to(dtype: torch.float),
+  torch.tensor([1000], dtype: torch.long, device: torch.device("cuda:0")),
+  prompt_outputs.attention_mask)
+print(txt_in[..., 0..<11])
 
 func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
   Model, (PythonObject) -> Void
@@ -183,6 +192,207 @@ func Transformer<T: TensorNumeric>(
   return (Model([tokens, rot], (hiddenStates.map { [$0] } ?? []) + [out]), reader)
 }
 
+func TimeEmbedder(channels: Int) -> (Model, Model, Model) {
+  let x = Input()
+  let fc0 = Dense(count: channels, name: "t_embedder_0")
+  var out = fc0(x).swish()
+  let fc2 = Dense(count: channels, name: "t_embedder_1")
+  out = fc2(out)
+  return (fc0, fc2, Model([x], [out]))
+}
+
+func ContextEmbedder(channels: Int) -> (Model, Model, Model) {
+  let x = Input()
+  let fc0 = Dense(count: channels, name: "c_embedder_0")
+  var out = fc0(x).swish()
+  let fc2 = Dense(count: channels, name: "c_embedder_1")
+  out = fc2(out)
+  return (fc0, fc2, Model([x], [out]))
+}
+
+func RefinerSelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
+  Model, (PythonObject) -> Void
+) {
+  let x = Input()
+  let tokeys = Dense(count: k * hk, name: "refiner_k_proj")
+  let toqueries = Dense(count: k * h, name: "refiner_q_proj")
+  let tovalues = Dense(count: k * hk, name: "refiner_v_proj")
+  let keys = tokeys(x).reshaped([b, t, hk, k])
+  let queries = toqueries(x).reshaped([b, t, h, k])
+  let values = tovalues(x).reshaped([b, t, hk, k])
+  var out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot())(
+    queries, keys, values
+  ).reshaped([b * t, h * k])
+  let unifyheads = Dense(count: k * h, name: "refiner_out_proj")
+  out = unifyheads(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    // The rotary in Llama is first half and second half, we can be clever and do the extra transpose here to use with cmul.
+    let qkv_weight = state_dict["\(prefix).self_attn_qkv.weight"].type(torch.float).cpu().numpy()
+    let qkv_bias = state_dict["\(prefix).self_attn_qkv.bias"].type(torch.float).cpu().numpy()
+    toqueries.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: qkv_weight[..<(k * h), ...])))
+    tokeys.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: qkv_weight[(k * h)..<(2 * k * h), ...]))
+    )
+    tovalues.weight.copy(
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: qkv_weight[(2 * k * h)..<(3 * k * h), ...])))
+    toqueries.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: qkv_bias[..<(k * h)])))
+    tokeys.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: qkv_bias[(k * h)..<(2 * k * h)])))
+    tovalues.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: qkv_bias[(2 * k * h)..<(3 * k * h)])))
+    let proj_weight = state_dict["\(prefix).self_attn_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    let proj_bias = state_dict["\(prefix).self_attn_proj.bias"].type(torch.float).cpu()
+      .numpy()
+    unifyheads.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: proj_weight)))
+    unifyheads.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: proj_bias)))
+  }
+  return (Model([x], [out]), reader)
+}
+
+func IndividualRefinerBlock(prefix: String, t: Int) -> (Model, (PythonObject) -> Void) {
+  let x = Input()
+  let c = Input()
+  let norm1 = LayerNorm(epsilon: 1e-6, axis: [1], name: "refiner_norm1")
+  let gateMsa = Dense(count: 3_072, name: "refiner_ada_ln_msa")
+  let (attention, attentionReader) = RefinerSelfAttention(
+    prefix: prefix, k: 128, h: 24, hk: 24, b: 1, t: t)
+  var out = x + attention(norm1(x)) .* gateMsa(c)
+  let norm2 = LayerNorm(epsilon: 1e-6, axis: [1], name: "refiner_norm2")
+  let mlp0 = Dense(count: 3_072 * 4, name: "refiner_mlp_0")
+  let mlp1 = Dense(count: 3_072, name: "refiner_mlp_1")
+  let gateMlp = Dense(count: 3_072, name: "refiner_ada_ln_mlp")
+  out = out + mlp1(mlp0(norm2(out)).swish()) .* gateMlp(c)
+  let reader: (PythonObject) -> Void = { state_dict in
+    attentionReader(state_dict)
+    let norm1_weight = state_dict["\(prefix).norm1.weight"].type(torch.float).cpu()
+      .numpy()
+    let norm1_bias = state_dict["\(prefix).norm1.bias"].type(torch.float).cpu()
+      .numpy()
+    norm1.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm1_weight)))
+    norm1.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm1_bias)))
+    let norm2_weight = state_dict["\(prefix).norm2.weight"].type(torch.float).cpu()
+      .numpy()
+    let norm2_bias = state_dict["\(prefix).norm2.bias"].type(torch.float).cpu()
+      .numpy()
+    norm2.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm2_weight)))
+    norm2.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm2_bias)))
+    let fc1_weight = state_dict["\(prefix).mlp.fc1.weight"].type(torch.float).cpu()
+      .numpy()
+    let fc1_bias = state_dict["\(prefix).mlp.fc1.bias"].type(torch.float).cpu()
+      .numpy()
+    mlp0.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: fc1_weight)))
+    mlp0.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: fc1_bias)))
+    let fc2_weight = state_dict["\(prefix).mlp.fc2.weight"].type(torch.float).cpu()
+      .numpy()
+    let fc2_bias = state_dict["\(prefix).mlp.fc2.bias"].type(torch.float).cpu()
+      .numpy()
+    mlp1.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: fc2_weight)))
+    mlp1.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: fc2_bias)))
+    let adaLN_weight = state_dict["\(prefix).adaLN_modulation.1.weight"].type(torch.float).cpu()
+      .numpy()
+    gateMsa.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: adaLN_weight[..<3072, ...])))
+    gateMlp.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: adaLN_weight[3072..<6144, ...])))
+    let adaLN_bias = state_dict["\(prefix).adaLN_modulation.1.bias"].type(torch.float).cpu()
+      .numpy()
+    gateMsa.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: adaLN_bias[..<3072])))
+    gateMlp.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: adaLN_bias[3072..<6144])))
+  }
+  return (Model([x, c], [out]), reader)
+}
+
+func Hunyuan(textLength: Int) -> (Model, (PythonObject) -> Void) {
+  let txt = Input()
+  let t = Input()
+  let (tMlp0, tMlp2, timeEmbedder) = TimeEmbedder(channels: 3_072)
+  var c = txt.reduced(.mean, axis: [0])
+  let (cLinear1, cLinear2, contextEmbedder) = ContextEmbedder(channels: 3_072)
+  c = timeEmbedder(t) + contextEmbedder(c)
+  c = c.swish()
+  let inputEmbedder = Dense(count: 3_072, name: "input_embedder")
+  var out = inputEmbedder(txt)
+  var readers = [(PythonObject) -> Void]()
+  for i in 0..<2 {
+    let (block, reader) = IndividualRefinerBlock(
+      prefix: "txt_in.individual_token_refiner.blocks.\(i)", t: textLength)
+    out = block(out, c)
+    readers.append(reader)
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    let input_embedder_weight = state_dict["txt_in.input_embedder.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let input_embedder_bias = state_dict["txt_in.input_embedder.bias"].to(torch.float)
+      .cpu().numpy()
+    inputEmbedder.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: input_embedder_weight)))
+    inputEmbedder.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: input_embedder_bias)))
+    let t_embedder_mlp_0_weight = state_dict["txt_in.t_embedder.mlp.0.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let t_embedder_mlp_0_bias = state_dict["txt_in.t_embedder.mlp.0.bias"].to(torch.float)
+      .cpu().numpy()
+    tMlp0.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: t_embedder_mlp_0_weight)))
+    tMlp0.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: t_embedder_mlp_0_bias)))
+    let t_embedder_mlp_2_weight = state_dict["txt_in.t_embedder.mlp.2.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let t_embedder_mlp_2_bias = state_dict["txt_in.t_embedder.mlp.2.bias"].to(torch.float)
+      .cpu().numpy()
+    tMlp2.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: t_embedder_mlp_2_weight)))
+    tMlp2.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: t_embedder_mlp_2_bias)))
+    let c_embedder_linear_1_weight = state_dict["txt_in.c_embedder.linear_1.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let c_embedder_linear_1_bias = state_dict["txt_in.c_embedder.linear_1.bias"].to(torch.float)
+      .cpu().numpy()
+    cLinear1.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: c_embedder_linear_1_weight)))
+    cLinear1.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: c_embedder_linear_1_bias)))
+    let c_embedder_linear_2_weight = state_dict["txt_in.c_embedder.linear_2.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let c_embedder_linear_2_bias = state_dict["txt_in.c_embedder.linear_2.bias"].to(torch.float)
+      .cpu().numpy()
+    cLinear2.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: c_embedder_linear_2_weight)))
+    cLinear2.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: c_embedder_linear_2_bias)))
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
+  return (Model([txt, t], [out]), reader)
+}
+
+func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
+  Float
+> {
+  precondition(embeddingSize % 2 == 0)
+  var embedding = Tensor<Float>(.CPU, .NC(batchSize, embeddingSize))
+  let half = embeddingSize / 2
+  for i in 0..<half {
+    let freq: Float = exp(-log(Float(maxPeriod)) * Float(i) / Float(half)) * timesteps
+    let cosFreq = cos(freq)
+    let sinFreq = sin(freq)
+    for j in 0..<batchSize {
+      embedding[j, i] = cosFreq
+      embedding[j, i + half] = sinFreq
+    }
+  }
+  return embedding
+}
+
 let graph = DynamicGraph()
 graph.withNoGrad {
   let text_encoder_state_dict = hunyuan_video_sampler.pipeline.text_encoder.model.state_dict()
@@ -214,4 +424,13 @@ graph.withNoGrad {
     95..<106, 0..<4096
   ].copied()  // We don't need attention mask, just reduce the hidden states.
   debugPrint(lastHiddenStates)
+  let timestep = timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
+  debugPrint(timestep)
+  let transformer_state_dict = hunyuan_video_sampler.pipeline.transformer.state_dict()
+  print(transformer_state_dict.keys())
+  let (hunyuan, hunyuan_reader) = Hunyuan(textLength: 11)
+  let tGPU = graph.variable(Tensor<Float16>(from: timestep)).toGPU(1)
+  hunyuan.compile(inputs: lastHiddenStates, tGPU)
+  hunyuan_reader(transformer_state_dict)
+  debugPrint(hunyuan(inputs: lastHiddenStates, tGPU))
 }
