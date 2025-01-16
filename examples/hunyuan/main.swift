@@ -56,13 +56,13 @@ let text_inputs_2 = hunyuan_video_sampler.pipeline.text_encoder_2.text2tokens(
   [prompt], data_type: "video")
 let prompt_outputs_2 = hunyuan_video_sampler.pipeline.text_encoder_2.encode(
   text_inputs_2, data_type: "video", device: torch.device("cuda:0"))
-let x = torch.randn([1, 16, 3, 68, 120], dtype: torch.float16, device: torch.device("cuda:0"))
+let x = torch.randn([1, 16, 33, 68, 120], dtype: torch.float16, device: torch.device("cuda:0"))
 let t = torch.tensor([1000], dtype: torch.float, device: torch.device("cuda:0"))
 let text_states_2 = prompt_outputs_2.hidden_state.to(torch.float16)
 let guidance = torch.tensor([3500], dtype: torch.float, device: torch.device("cuda:0"))
 let hyvideo_modules_posemb_layers = Python.import("hyvideo.modules.posemb_layers")
 let (freqs_cos, freqs_sin) = hyvideo_modules_posemb_layers.get_nd_rotary_pos_embed(
-  [16, 56, 56], [3, 34, 60], use_real: true, theta: 256, theta_rescale_factor: 1
+  [16, 56, 56], [33, 34, 60], use_real: true, theta: 256, theta_rescale_factor: 1
 ).tuple2
 print("freqs_cos \(freqs_cos), freqs_sin \(freqs_sin)")
 
@@ -969,9 +969,9 @@ graph.withNoGrad {
   debugPrint(timestep)
   let transformer_state_dict = hunyuan_video_sampler.pipeline.transformer.state_dict()
   print(transformer_state_dict.keys())
-  let rotNdTensor = graph.variable(.CPU, .NHWC(1, 3 * 34 * 60, 1, 128), of: Float.self)
-  let rotNdTensor2 = graph.variable(.CPU, .NHWC(1, 3 * 34 * 60 + 11, 1, 128), of: Float.self)
-  for t in 0..<3 {
+  var rotNdTensor = graph.variable(.CPU, .NHWC(1, 33 * 34 * 60, 24, 128), of: Float.self)
+  var rotNdTensor2 = graph.variable(.CPU, .NHWC(1, 33 * 34 * 60 + 11, 24, 128), of: Float.self)
+  for t in 0..<33 {
     for y in 0..<34 {
       for x in 0..<60 {
         let i = t * 34 * 60 + y * 60 + x
@@ -1005,18 +1005,24 @@ graph.withNoGrad {
       }
     }
   }
-  for i in 3 * 34 * 60..<(3 * 34 * 60 + 11) {
+  for i in 33 * 34 * 60..<(33 * 34 * 60 + 11) {
     for k in 0..<64 {
       rotNdTensor2[0, i, 0, k * 2] = 1
       rotNdTensor2[0, i, 0, k * 2 + 1] = 0
     }
   }
-  let (hunyuan, hunyuan_reader) = Hunyuan(time: 3, height: 68, width: 120, textLength: 11)
+  for i in 1..<24 {
+    rotNdTensor[0..<1, 0..<(33 * 34 * 60), i..<(i + 1), 0..<128] =
+      rotNdTensor[0..<1, 0..<(33 * 34 * 60), 0..<1, 0..<128]
+    rotNdTensor2[0..<1, 0..<(33 * 34 * 60 + 11), i..<(i + 1), 0..<128] =
+      rotNdTensor2[0..<1, 0..<(33 * 34 * 60 + 11), 0..<1, 0..<128]
+  }
+  let (hunyuan, hunyuanReader) = Hunyuan(time: 33, height: 68, width: 120, textLength: 11)
   let tGPU = graph.variable(Tensor<Float16>(from: timestep)).toGPU(2)
   let xTensor = graph.variable(
     Tensor<Float16>(from: try! Tensor<Float>(numpy: x.to(torch.float).cpu().numpy())).toGPU(2)
-  ).reshaped(format: .NHWC, shape: [1, 16, 3 * 34, 2, 60, 2]).permuted(0, 2, 4, 1, 3, 5).copied()
-    .reshaped(format: .NHWC, shape: [1, 3 * 34 * 60, 16 * 2 * 2])
+  ).reshaped(format: .NHWC, shape: [1, 16, 33 * 34, 2, 60, 2]).permuted(0, 2, 4, 1, 3, 5).copied()
+    .reshaped(format: .NHWC, shape: [1, 33 * 34 * 60, 16 * 2 * 2])
   let guidanceEmbed = timeEmbedding(
     timesteps: 3500, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
   let gGPU = graph.variable(Tensor<Float16>(from: guidanceEmbed)).toGPU(2)
@@ -1027,7 +1033,7 @@ graph.withNoGrad {
   let rotNdTensor2GPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor2).toGPU(2)
   hunyuan.compile(
     inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU)
-  hunyuan_reader(transformer_state_dict)
+  hunyuanReader(transformer_state_dict)
   debugPrint(
     hunyuan(inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU))
 }
