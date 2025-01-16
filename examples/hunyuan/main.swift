@@ -52,11 +52,13 @@ let text_inputs = hunyuan_video_sampler.pipeline.text_encoder.text2tokens(
   [prompt], data_type: "video")
 let prompt_outputs = hunyuan_video_sampler.pipeline.text_encoder.encode(
   text_inputs, data_type: "video", device: torch.device("cuda:0"))
-print(prompt_outputs)
+let text_inputs_2 = hunyuan_video_sampler.pipeline.text_encoder_2.text2tokens(
+  [prompt], data_type: "video")
+let prompt_outputs_2 = hunyuan_video_sampler.pipeline.text_encoder_2.encode(
+  text_inputs_2, data_type: "video", device: torch.device("cuda:0"))
 let x = torch.randn([1, 16, 3, 68, 120], dtype: torch.float16, device: torch.device("cuda:0"))
 let t = torch.tensor([1000], dtype: torch.float, device: torch.device("cuda:0"))
-let text_states_2 =
-  torch.randn([1, 768], dtype: torch.float16, device: torch.device("cuda:0")) * 0.001
+let text_states_2 = prompt_outputs_2.hidden_state.to(torch.float16)
 let guidance = torch.tensor([3500], dtype: torch.float, device: torch.device("cuda:0"))
 let hyvideo_modules_posemb_layers = Python.import("hyvideo.modules.posemb_layers")
 let (freqs_cos, freqs_sin) = hyvideo_modules_posemb_layers.get_nd_rotary_pos_embed(
