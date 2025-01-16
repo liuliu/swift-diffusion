@@ -616,7 +616,6 @@ func JointTransformerBlock(
   }
 }
 
-/*
 func SingleTransformerBlock(
   prefix: String, k: Int, h: Int, b: Int, t: Int, hw: Int, contextBlockPreOnly: Bool
 ) -> ((PythonObject) -> Void, Model) {
@@ -626,7 +625,7 @@ func SingleTransformerBlock(
   let xAdaLNs = (0..<3).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
   let xChunks = xAdaLNs.map { $0(c) }
   let xNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  var xOut = (1 + xChunks[1]) .* xNorm1(x) + xChunks[0]
+  var xOut = (1 + xChunks[1]) .* xNorm1(x).to(.Float16) + xChunks[0]
   let xToKeys = Dense(count: k * h, name: "x_k")
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
@@ -637,30 +636,21 @@ func SingleTransformerBlock(
   let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
   let xV = xToValues(xOut).reshaped([b, t + hw, h, k])
-  var keys = xK
-  var values = xV
-  var queries = xQ
-  queries = Functional.cmul(left: queries, right: rot)
-  keys = Functional.cmul(left: keys, right: rot)
+  let queries = Functional.cmul(left: xQ, right: rot)
+  let keys = Functional.cmul(left: xK, right: rot)
+  let values = xV
   // Now run attention.
-  keys = keys.permuted(0, 2, 1, 3)
-  queries = ((1.0 / Float(k).squareRoot()) * queries)
-    .permuted(0, 2, 1, 3)
-  values = values.permuted(0, 2, 1, 3)
-  var dot = Matmul(transposeB: (2, 3))(queries, keys)
-  dot = dot.reshaped([b * h * (t + hw), t + hw])
-  dot = dot.softmax()
-  dot = dot.reshaped([b, h, (t + hw), t + hw])
-  var out = dot * values
-  out = out.reshaped([b, h, (t + hw), k]).transposed(1, 2).reshaped([b, (t + hw), h * k])
+  let scaledDotProductAttention = ScaledDotProductAttention(
+    scale: 1.0 / Float(k).squareRoot(), flags: [.Float16])
+  var out = scaledDotProductAttention(queries, keys, values).reshaped([b, (t + hw), k * h])
   var xIn: Model.IO = x
   if contextBlockPreOnly {
-    out = out.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
+    out = out.reshaped([b, hw, h * k], strides: [(t + hw) * h * k, h * k, 1])
       .contiguous()
-    xIn = x.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
+    xIn = x.reshaped([b, hw, h * k], strides: [(t + hw) * h * k, h * k, 1])
       .contiguous()
     xOut = xOut.reshaped(
-      [b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1]
+      [b, hw, h * k], strides: [(t + hw) * h * k, h * k, 1]
     )
     .contiguous()
   }
@@ -668,7 +658,7 @@ func SingleTransformerBlock(
   let xLinear1 = Dense(count: k * h * 4, name: "x_linear1")
   let xOutProjection = Dense(count: k * h, name: "x_out_proj")
   out = xUnifyheads(out) + xOutProjection(xLinear1(xOut).GELU(approximate: .tanh))
-  out = xIn + xChunks[2] .* out
+  out = xIn + (xChunks[2] .* out).to(of: xIn)
   let reader: (PythonObject) -> Void = { state_dict in
     let linear1_weight = state_dict["\(prefix).linear1.weight"].to(
       torch.float
@@ -677,56 +667,65 @@ func SingleTransformerBlock(
       torch.float
     ).cpu().numpy()
     xToQueries.weight.copy(
-      from: try! Tensor<Float>(numpy: linear1_weight[..<(k * h), ...]))
-    xToQueries.bias.copy(from: try! Tensor<Float>(numpy: linear1_bias[..<(k * h)]))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: linear1_weight[..<(k * h), ...])))
+    xToQueries.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: linear1_bias[..<(k * h)])))
     xToKeys.weight.copy(
-      from: try! Tensor<Float>(numpy: linear1_weight[(k * h)..<(2 * k * h), ...]))
-    xToKeys.bias.copy(from: try! Tensor<Float>(numpy: linear1_bias[(k * h)..<(2 * k * h)]))
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: linear1_weight[(k * h)..<(2 * k * h), ...])))
+    xToKeys.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: linear1_bias[(k * h)..<(2 * k * h)])))
     xToValues.weight.copy(
-      from: try! Tensor<Float>(numpy: linear1_weight[(2 * k * h)..<(3 * k * h), ...]))
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: linear1_weight[(2 * k * h)..<(3 * k * h), ...])))
     xToValues.bias.copy(
-      from: try! Tensor<Float>(numpy: linear1_bias[(2 * k * h)..<(3 * k * h)]))
-    let key_norm_scale = state_dict["\(prefix).norm.key_norm.scale"].to(torch.float).cpu().numpy()
-    normK.weight.copy(from: try! Tensor<Float>(numpy: key_norm_scale))
-    let query_norm_scale = state_dict["\(prefix).norm.query_norm.scale"].to(torch.float).cpu()
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: linear1_bias[(2 * k * h)..<(3 * k * h)])))
+    let key_norm_scale = state_dict["\(prefix).k_norm.weight"].to(torch.float).cpu().numpy()
+    normK.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: key_norm_scale)))
+    let query_norm_scale = state_dict["\(prefix).q_norm.weight"].to(torch.float).cpu()
       .numpy()
-    normQ.weight.copy(from: try! Tensor<Float>(numpy: query_norm_scale))
+    normQ.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: query_norm_scale)))
     xLinear1.weight.copy(
-      from: try! Tensor<Float>(numpy: linear1_weight[(3 * k * h)..<(7 * k * h), ...]))
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: linear1_weight[(3 * k * h)..<(7 * k * h), ...])))
     xLinear1.bias.copy(
-      from: try! Tensor<Float>(numpy: linear1_bias[(3 * k * h)..<(7 * k * h)]))
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: linear1_bias[(3 * k * h)..<(7 * k * h)])))
     let linear2_weight = state_dict["\(prefix).linear2.weight"].to(
       torch.float
     ).cpu().numpy()
     xUnifyheads.weight.copy(
-      from: try! Tensor<Float>(numpy: linear2_weight[..., 0..<(k * h)]))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: linear2_weight[..., 0..<(k * h)])))
     xOutProjection.weight.copy(
-      from: try! Tensor<Float>(numpy: linear2_weight[..., (k * h)..<(k * h * 5)]))
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: linear2_weight[..., (k * h)..<(k * h * 5)])))
     let linear2_bias = state_dict["\(prefix).linear2.bias"].to(
       torch.float
     ).cpu().numpy()
     xOutProjection.bias.copy(
-      from: try! Tensor<Float>(numpy: linear2_bias))
-    let norm1_linear_weight = state_dict["\(prefix).modulation.lin.weight"]
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: linear2_bias)))
+    let norm1_linear_weight = state_dict["\(prefix).modulation.linear.weight"]
       .to(
         torch.float
       ).cpu().numpy()
-    let norm1_linear_bias = state_dict["\(prefix).modulation.lin.bias"]
+    let norm1_linear_bias = state_dict["\(prefix).modulation.linear.bias"]
       .to(
         torch.float
       ).cpu().numpy()
     for i in 0..<3 {
       xAdaLNs[i].weight.copy(
-        from: try! Tensor<Float>(
-          numpy: norm1_linear_weight[(k * h * i)..<(k * h * (i + 1)), ...]))
+        from: Tensor<Float16>(
+          from: try! Tensor<Float>(
+            numpy: norm1_linear_weight[(k * h * i)..<(k * h * (i + 1)), ...])))
       xAdaLNs[i].bias.copy(
-        from: try! Tensor<Float>(
-          numpy: norm1_linear_bias[(k * h * i)..<(k * h * (i + 1))]))
+        from: Tensor<Float16>(
+          from: try! Tensor<Float>(
+            numpy: norm1_linear_bias[(k * h * i)..<(k * h * (i + 1))])))
     }
   }
   return (reader, Model([x, c, rot], [out]))
 }
-*/
 
 func Hunyuan(time: Int, height: Int, width: Int, textLength: Int) -> (Model, (PythonObject) -> Void)
 {
@@ -769,6 +768,21 @@ func Hunyuan(time: Int, height: Int, width: Int, textLength: Int) -> (Model, (Py
     context = blockOut[1]
     readers.append(reader)
   }
+  let rot2 = Input()
+  out = Functional.concat(axis: 1, out, context)
+  for i in 0..<40 {
+    let (reader, block) = SingleTransformerBlock(
+      prefix: "single_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: time * h * w,
+      contextBlockPreOnly: i == 39)
+    out = block(out, vec, rot2)
+    readers.append(reader)
+  }
+  let scale = Dense(count: 3072, name: "ada_ln_0")
+  let shift = Dense(count: 3072, name: "ada_ln_1")
+  let normFinal = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  out = (1 + scale(vec)) .* normFinal(out).to(.Float16) + shift(vec)
+  let projOut = Dense(count: 2 * 2 * 16, name: "linear")
+  out = projOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let img_in_proj_weight = state_dict["img_in.proj.weight"].to(
       torch.float
@@ -874,8 +888,30 @@ func Hunyuan(time: Int, height: Int, width: Int, textLength: Int) -> (Model, (Py
     for reader in readers {
       reader(state_dict)
     }
+    let norm_out_linear_weight = state_dict["final_layer.adaLN_modulation.1.weight"].to(torch.float)
+      .cpu().numpy()
+    let norm_out_linear_bias = state_dict["final_layer.adaLN_modulation.1.bias"].to(torch.float)
+      .cpu().numpy()
+    shift.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm_out_linear_weight[0..<3072, ...])))
+    scale.weight.copy(
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: norm_out_linear_weight[3072..<(3072 * 2), ...])))
+    shift.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm_out_linear_bias[0..<3072])))
+    scale.bias.copy(
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(numpy: norm_out_linear_bias[3072..<(3072 * 2)])))
+    let proj_out_weight = state_dict["final_layer.linear.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    projOut.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: proj_out_weight)))
+    let proj_out_bias = state_dict["final_layer.linear.bias"].to(
+      torch.float
+    ).cpu().numpy()
+    projOut.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: proj_out_bias)))
   }
-  return (Model([x, rot, txt, t, vector, guidanceEmbed], [out, context]), reader)
+  return (Model([x, rot, rot2, txt, t, vector, guidanceEmbed], [out]), reader)
 }
 
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
@@ -931,7 +967,8 @@ graph.withNoGrad {
   debugPrint(timestep)
   let transformer_state_dict = hunyuan_video_sampler.pipeline.transformer.state_dict()
   print(transformer_state_dict.keys())
-  var rotNdTensor = graph.variable(.CPU, .NHWC(1, 3 * 34 * 60, 24, 128), of: Float.self)
+  let rotNdTensor = graph.variable(.CPU, .NHWC(1, 3 * 34 * 60, 1, 128), of: Float.self)
+  let rotNdTensor2 = graph.variable(.CPU, .NHWC(1, 3 * 34 * 60 + 11, 1, 128), of: Float.self)
   for t in 0..<3 {
     for y in 0..<34 {
       for x in 0..<60 {
@@ -942,6 +979,8 @@ graph.withNoGrad {
           let costheta = cos(theta)
           rotNdTensor[0, i, 0, k * 2] = Float(costheta)
           rotNdTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
+          rotNdTensor2[0, i, 0, k * 2] = Float(costheta)
+          rotNdTensor2[0, i, 0, k * 2 + 1] = Float(sintheta)
         }
         for k in 0..<28 {
           let theta = Double(y) * 1.0 / pow(256, Double(k) / 28)
@@ -949,6 +988,8 @@ graph.withNoGrad {
           let costheta = cos(theta)
           rotNdTensor[0, i, 0, (k + 8) * 2] = Float(costheta)
           rotNdTensor[0, i, 0, (k + 8) * 2 + 1] = Float(sintheta)
+          rotNdTensor2[0, i, 0, (k + 8) * 2] = Float(costheta)
+          rotNdTensor2[0, i, 0, (k + 8) * 2 + 1] = Float(sintheta)
         }
         for k in 0..<28 {
           let theta = Double(x) * 1.0 / pow(256, Double(k) / 28)
@@ -956,13 +997,17 @@ graph.withNoGrad {
           let costheta = cos(theta)
           rotNdTensor[0, i, 0, (k + 8 + 28) * 2] = Float(costheta)
           rotNdTensor[0, i, 0, (k + 8 + 28) * 2 + 1] = Float(sintheta)
+          rotNdTensor2[0, i, 0, (k + 8 + 28) * 2] = Float(costheta)
+          rotNdTensor2[0, i, 0, (k + 8 + 28) * 2 + 1] = Float(sintheta)
         }
       }
     }
   }
-  for i in 1..<24 {
-    rotNdTensor[0..<1, 0..<(3 * 34 * 60), i..<(i + 1), 0..<128] =
-      rotNdTensor[0..<1, 0..<(3 * 34 * 60), 0..<1, 0..<128]
+  for i in 3 * 34 * 60..<(3 * 34 * 60 + 11) {
+    for k in 0..<64 {
+      rotNdTensor2[0, i, 0, k * 2] = 1
+      rotNdTensor2[0, i, 0, k * 2 + 1] = 0
+    }
   }
   let (hunyuan, hunyuan_reader) = Hunyuan(time: 3, height: 68, width: 120, textLength: 11)
   let tGPU = graph.variable(Tensor<Float16>(from: timestep)).toGPU(2)
@@ -977,7 +1022,10 @@ graph.withNoGrad {
     Tensor<Float16>(from: try! Tensor<Float>(numpy: text_states_2.to(torch.float).cpu().numpy()))
       .reshaped(.WC(1, 768)).toGPU(2))
   let rotNdTensorGPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor).toGPU(2)
-  hunyuan.compile(inputs: xTensor, rotNdTensorGPU, lastHiddenStates, tGPU, vector, gGPU)
+  let rotNdTensor2GPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor2).toGPU(2)
+  hunyuan.compile(
+    inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU)
   hunyuan_reader(transformer_state_dict)
-  debugPrint(hunyuan(inputs: xTensor, rotNdTensorGPU, lastHiddenStates, tGPU, vector, gGPU))
+  debugPrint(
+    hunyuan(inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU))
 }
