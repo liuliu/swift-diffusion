@@ -992,8 +992,8 @@ swift_binary(
 )
 
 swift_binary(
-    name = "hunyuan",
-    srcs = ["hunyuan/main.swift"],
+    name = "hunyuan_converter",
+    srcs = ["hunyuan_converter/main.swift"],
     data = [
         "hunyuan/merges.txt",
         "hunyuan/vocab.json",

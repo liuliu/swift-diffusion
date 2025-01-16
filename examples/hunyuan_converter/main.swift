@@ -212,7 +212,7 @@ func Transformer<T: TensorNumeric>(
   return (Model([tokens, rot], (hiddenStates.map { [$0] } ?? []) + [out]), reader)
 }
 
-func VectorEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
+func MLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
   let x = Input()
   let fc0 = Dense(count: channels, name: "\(name)_embedder_0")
   var out = fc0(x).swish()
@@ -738,9 +738,9 @@ func Hunyuan(time: Int, height: Int, width: Int, textLength: Int) -> (Model, (Py
   let t = Input()
   let vector = Input()
   let guidanceEmbed = Input()
-  let (tMlp0, tMlp2, timeEmbedder) = VectorEmbedder(channels: 3_072, name: "txt_in_t")
+  let (tMlp0, tMlp2, timeEmbedder) = MLPEmbedder(channels: 3_072, name: "txt_in_t")
   var c = txt.reduced(.mean, axis: [1])
-  let (cLinear1, cLinear2, contextEmbedder) = VectorEmbedder(channels: 3_072, name: "c")
+  let (cLinear1, cLinear2, contextEmbedder) = MLPEmbedder(channels: 3_072, name: "c")
   c = timeEmbedder(t) + contextEmbedder(c)
   c = c.reshaped([1, 1, 3072]).swish()
   let inputEmbedder = Dense(count: 3_072, name: "input_embedder")
@@ -754,9 +754,9 @@ func Hunyuan(time: Int, height: Int, width: Int, textLength: Int) -> (Model, (Py
   }
   context = context.to(.Float32)
   var out = imgIn(x).to(.Float32)
-  let (timeInMlp0, timeInMlp2, timeIn) = VectorEmbedder(channels: 3_072, name: "t")
-  let (vMlp0, vMlp2, vectorIn) = VectorEmbedder(channels: 3_072, name: "vector")
-  let (gMlp0, gMlp2, guidanceIn) = VectorEmbedder(channels: 3_072, name: "guidance")
+  let (timeInMlp0, timeInMlp2, timeIn) = MLPEmbedder(channels: 3_072, name: "t")
+  let (vMlp0, vMlp2, vectorIn) = MLPEmbedder(channels: 3_072, name: "vector")
+  let (gMlp0, gMlp2, guidanceIn) = MLPEmbedder(channels: 3_072, name: "guidance")
   var vec = timeIn(t) + vectorIn(vector) + guidanceIn(guidanceEmbed)
   vec = vec.reshaped([1, 1, 3072]).swish()
   let h = height / 2
@@ -964,6 +964,9 @@ graph.withNoGrad {
   let lastHiddenStates = transformer(inputs: tokensTensorGPU, rotTensorGPU)[0].as(of: Float16.self)[
     95..<106, 0..<4096
   ].reshaped(.HWC(1, 11, 4096)).toGPU(2)  // We don't need attention mask, just reduce the hidden states.
+  graph.openStore("/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_f16.ckpt") {
+    $0.write("llava", model: transformer)
+  }
   debugPrint(lastHiddenStates)
   let timestep = timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
   debugPrint(timestep)
@@ -1036,4 +1039,7 @@ graph.withNoGrad {
   hunyuanReader(transformer_state_dict)
   debugPrint(
     hunyuan(inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU))
+  graph.openStore("/home/liu/workspace/swift-diffusion/hunyuan_video_t2v_720p_f16.ckpt") {
+    $0.write("dit", model: hunyuan)
+  }
 }
