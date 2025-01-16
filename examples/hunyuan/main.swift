@@ -322,7 +322,11 @@ func FeedForward(hiddenSize: Int, intermediateSize: Int, upcast: Bool, name: Str
   let x = Input()
   let linear1 = Dense(count: intermediateSize, name: "\(name)_linear1")
   var out = linear1(x).GELU(approximate: .tanh)
-  // The scale down is integrated into out proj weights / bias.
+  // The scale down is integrated into out proj bias.
+  if upcast {
+    let scaleFactor: Float = 8
+    out = (1 / scaleFactor) * out
+  }
   let outProjection = Dense(count: hiddenSize, name: "\(name)_out_proj")
   out = outProjection(out)
   if upcast {
@@ -526,12 +530,11 @@ func JointTransformerBlock(
       contextLinear1.bias.copy(
         from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_context_linear_1_bias)))
       let ff_context_out_projection_weight =
-        ((1 / scaleFactor).pythonObject
-        * state_dict[
+        state_dict[
           "\(prefix).txt_mlp.fc2.weight"
         ].to(
           torch.float
-        ).cpu()).numpy()
+        ).cpu().numpy()
       contextOutProjection.weight.copy(
         from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_context_out_projection_weight)))
       let ff_context_out_projection_bias =
@@ -555,10 +558,9 @@ func JointTransformerBlock(
     xLinear1.bias.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_linear_1_bias)))
     let ff_out_projection_weight =
-      ((1 / scaleFactor).pythonObject
-      * state_dict["\(prefix).img_mlp.fc2.weight"].to(
+      state_dict["\(prefix).img_mlp.fc2.weight"].to(
         torch.float
-      ).cpu()).numpy()
+      ).cpu().numpy()
     xOutProjection.weight.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_out_projection_weight)))
     let ff_out_projection_bias =
