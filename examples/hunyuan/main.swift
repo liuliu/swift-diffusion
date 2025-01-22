@@ -522,8 +522,8 @@ graph.withNoGrad {
   }
   debugPrint(lastHiddenStates)
   let timestep = timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-  var rotNdTensor = graph.variable(.CPU, .NHWC(1, 33 * 34 * 60, 24, 128), of: Float.self)
-  var rotNdTensor2 = graph.variable(.CPU, .NHWC(1, 33 * 34 * 60 + 11, 24, 128), of: Float.self)
+  var rotNdTensor = graph.variable(.CPU, .NHWC(1, 33 * 34 * 60, 1, 128), of: Float.self)
+  var rotNdTensor2 = graph.variable(.CPU, .NHWC(1, 33 * 34 * 60 + 11, 1, 128), of: Float.self)
   for t in 0..<33 {
     for y in 0..<34 {
       for x in 0..<60 {
@@ -563,12 +563,6 @@ graph.withNoGrad {
       rotNdTensor2[0, i, 0, k * 2] = 1
       rotNdTensor2[0, i, 0, k * 2 + 1] = 0
     }
-  }
-  for i in 1..<24 {
-    rotNdTensor[0..<1, 0..<(33 * 34 * 60), i..<(i + 1), 0..<128] =
-      rotNdTensor[0..<1, 0..<(33 * 34 * 60), 0..<1, 0..<128]
-    rotNdTensor2[0..<1, 0..<(33 * 34 * 60 + 11), i..<(i + 1), 0..<128] =
-      rotNdTensor2[0..<1, 0..<(33 * 34 * 60 + 11), 0..<1, 0..<128]
   }
   let (hunyuan, hunyuanReader) = Hunyuan(time: 33, height: 68, width: 120, textLength: 11)
   hunyuan.maxConcurrency = .limit(1)
