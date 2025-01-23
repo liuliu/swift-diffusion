@@ -136,14 +136,6 @@ new_git_repository(
     shallow_since = "1676404655 +0000",
 )
 
-new_git_repository(
-    name = "SwiftProtobuf",
-    build_file = "swift-protobuf.BUILD",
-    commit = "7cbb5279dd7e997c8f0f5537e46d4513be894ff1",
-    remote = "https://github.com/apple/swift-protobuf.git",
-    shallow_since = "1658527939 -0700",
-)
-
 load("@s4nnc//:deps.bzl", "s4nnc_extra_deps")
 
 s4nnc_extra_deps()

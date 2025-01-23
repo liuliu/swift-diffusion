@@ -1,10 +1,14 @@
 import Diffusion
 import Foundation
 import NNC
+import PNG
+import TensorBoard
 
 struct PythonObject {}
 
-DynamicGraph.setSeed(42)
+DynamicGraph.setSeed(40)
+
+let graph = DynamicGraph()
 
 let tokenizer = GPT2Tokenizer(
   vocabulary: "/home/liu/workspace/swift-diffusion/examples/hunyuan/vocab.json",
@@ -356,7 +360,7 @@ func SingleTransformerBlock(
   let xLinear1 = Dense(count: k * h * 4, name: "x_linear1")
   let xOutProjection = Dense(count: k * h, name: "x_out_proj")
   out = xUnifyheads(out) + xOutProjection(xLinear1(xOut).GELU(approximate: .tanh))
-  out = xIn + (xChunks[2] .* out).to(of: xIn)
+  out = xIn + xChunks[2].to(of: xIn) .* out.to(of: xIn)
   let reader: (PythonObject) -> Void = { state_dict in
   }
   return (reader, Model([x, c, rot], [out]))
@@ -397,7 +401,7 @@ func Hunyuan(time: Int, height: Int, width: Int, textLength: Int) -> (Model, (Py
   for i in 0..<20 {
     let (reader, block) = JointTransformerBlock(
       prefix: "double_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: time * h * w,
-      contextBlockPreOnly: false, upcast: i > 5)
+      contextBlockPreOnly: false, upcast: true)
     let blockOut = block(out, context, vec, rot)
     out = blockOut[0]
     context = blockOut[1]
@@ -444,9 +448,8 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
   return embedding
 }
 
-let graph = DynamicGraph()
 graph.maxConcurrency = .limit(1)
-graph.withNoGrad {
+let z = graph.withNoGrad {
   let pooled = graph.withNoGrad {
     let tokenizer = CLIPTokenizer(
       vocabulary: "/home/liu/workspace/swift-diffusion/examples/clip/vocab.json",
@@ -474,7 +477,7 @@ graph.withNoGrad {
       batchSize: 1, intermediateSize: 3072)
     textModel0.compile(inputs: tokensTensorGPU, positionTensorGPU, causalAttentionMaskGPU)
     graph.openStore("/home/liu/workspace/swift-diffusion/clip_vit_l14_f32.ckpt") {
-      $0.read("text_model", model: textModel0)
+      try! $0.read("text_model", model: textModel0, strict: true)
     }
     let c = textModel0(inputs: tokensTensorGPU, positionTensorGPU, causalAttentionMaskGPU).map {
       $0.as(of: Float16.self)
@@ -514,7 +517,7 @@ graph.withNoGrad {
     let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
     transformer.compile(inputs: tokensTensorGPU, rotTensorGPU)
     graph.openStore("/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_f16.ckpt") {
-      $0.read("llava", model: transformer)
+      try! $0.read("llava", model: transformer, strict: true)
     }
     return transformer(inputs: tokensTensorGPU, rotTensorGPU)[0].as(of: Float16.self)[
       95..<106, 0..<4096
@@ -570,7 +573,7 @@ graph.withNoGrad {
   var xTensor = graph.variable(.GPU(0), .HWC(1, 33 * 34 * 60, 64), of: Float16.self)
   xTensor.randn()
   let guidanceEmbed = timeEmbedding(
-    timesteps: 3500, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
+    timesteps: 6000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
   let gGPU = graph.variable(Tensor<Float16>(from: guidanceEmbed)).toGPU(0)
   let vector = pooled
   let rotNdTensorGPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor).toGPU(0)
@@ -578,8 +581,331 @@ graph.withNoGrad {
   hunyuan.compile(
     inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU)
   graph.openStore("/home/liu/workspace/swift-diffusion/hunyuan_video_t2v_720p_f16.ckpt") {
-    $0.read("dit", model: hunyuan)
+    try! $0.read("dit", model: hunyuan, strict: true)
   }
-  debugPrint(
-    hunyuan(inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU))
+  let samplingSteps = 30
+  for i in (1...samplingSteps).reversed() {
+    let t = Float(i) / Float(samplingSteps) * 1_000
+    let tGPU = graph.variable(
+      Tensor<Float16>(
+        from: timeEmbedding(timesteps: t, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
+          .toGPU(0)))
+    let v = hunyuan(
+      inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU)[0].as(
+        of: Float16.self)
+    xTensor = xTensor - (1 / Float(samplingSteps)) * v
+    debugPrint(xTensor)
+  }
+  let z = xTensor.reshaped(format: .NCHW, shape: [1, 33, 34, 60, 16, 2, 2]).permuted(
+    0, 4, 1, 2, 5, 3, 6
+  )
+  .contiguous().reshaped(format: .NCHW, shape: [1, 16, 33, 68, 120])
+  return z
+}
+
+func ResnetBlockCausal3D(
+  prefix: String, inChannels: Int, outChannels: Int, shortcut: Bool, depth: Int, height: Int,
+  width: Int
+) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let norm1 = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  var out = norm1(x.reshaped([inChannels, depth, height, width])).reshaped([
+    1, inChannels, depth, height, width,
+  ])
+  out = Swish()(out)
+  let conv1 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+  out = conv1(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+  let norm2 = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  out = norm2(out.reshaped([outChannels, depth, height, width])).reshaped([
+    1, outChannels, depth, height, width,
+  ])
+  out = Swish()(out)
+  let conv2 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+  out = conv2(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+  let ninShortcut: Model?
+  if shortcut {
+    let nin = Convolution(
+      groups: 1, filters: outChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+    out = nin(x) + out
+    ninShortcut = nin
+  } else {
+    ninShortcut = nil
+    out = x + out
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+  }
+  return (reader, Model([x], [out]))
+}
+
+func AttnBlockCausal3D(
+  prefix: String, inChannels: Int, depth: Int, height: Int, width: Int
+) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let causalAttentionMask = Input()
+  let norm = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  var out = norm(x.reshaped([inChannels, depth, height, width])).reshaped([
+    1, inChannels, depth, height, width,
+  ])
+  let hw = width * height * depth
+  let tokeys = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+  let k = tokeys(out).reshaped([1, inChannels, hw])
+  let toqueries = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+  let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
+    1, inChannels, hw,
+  ])
+  var dot =
+    Matmul(transposeA: (1, 2))(q, k).reshaped([
+      depth, height * width, depth, height * width,
+    ]) + causalAttentionMask
+  dot = dot.reshaped([hw, hw])
+  dot = dot.softmax()
+  dot = dot.reshaped([1, hw, hw])
+  let tovalues = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+  let v = tovalues(out).reshaped([1, inChannels, hw])
+  out = Matmul(transposeB: (1, 2))(v, dot)
+  let projOut = Convolution(
+    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+  out = x + projOut(out.reshaped([1, inChannels, depth, height, width]))
+  let reader: (PythonObject) -> Void = { state_dict in
+  }
+  return (reader, Model([x, causalAttentionMask], [out]))
+}
+
+func EncoderCausal3D(
+  channels: [Int], numRepeat: Int, startWidth: Int, startHeight: Int, startDepth: Int
+)
+  -> ((PythonObject) -> Void, Model)
+{
+  let x = Input()
+  let causalAttentionMask = Input()
+  var previousChannel = channels[0]
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+  var out = convIn(x.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+  var readers = [(PythonObject) -> Void]()
+  var height = startHeight
+  var width = startWidth
+  var depth = startDepth
+  for i in 1..<channels.count {
+    height *= 2
+    width *= 2
+    if i > 1 {
+      depth = (depth - 1) * 2 + 1
+    }
+  }
+  for (i, channel) in channels.enumerated() {
+    for j in 0..<numRepeat {
+      let (reader, block) = ResnetBlockCausal3D(
+        prefix: "encoder.down_blocks.\(i).resnets.\(j)", inChannels: previousChannel,
+        outChannels: channel,
+        shortcut: previousChannel != channel, depth: depth, height: height, width: width)
+      readers.append(reader)
+      out = block(out)
+      previousChannel = channel
+    }
+    if i < channels.count - 1 {
+      // Conv always pad left first, then right, and pad top first then bottom.
+      // Thus, we cannot have (0, 1, 0, 1) (left 0, right 1, top 0, bottom 1) padding as in
+      // Stable Diffusion. Instead, we pad to (2, 1, 2, 1) and simply discard the first row and first column.
+      height /= 2
+      width /= 2
+      let strideZ: Int
+      if i > 0 {
+        depth = (depth - 1) / 2 + 1
+        strideZ = 2
+      } else {
+        strideZ = 1
+      }
+      let conv2d = Convolution(
+        groups: 1, filters: channel, filterSize: [3, 3, 3],
+        hint: Hint(
+          stride: [strideZ, 2, 2], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+      out = conv2d(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+      let downLayer = i
+      let reader: (PythonObject) -> Void = { state_dict in
+      }
+      readers.append(reader)
+    }
+  }
+  let (midBlockReader1, midBlock1) = ResnetBlockCausal3D(
+    prefix: "encoder.mid_block.resnets.0", inChannels: previousChannel,
+    outChannels: previousChannel,
+    shortcut: false, depth: depth, height: height, width: width)
+  out = midBlock1(out)
+  let (midAttnReader1, midAttn1) = AttnBlockCausal3D(
+    prefix: "encoder.mid_block.attentions.0", inChannels: previousChannel, depth: depth,
+    height: height, width: width)
+  out = midAttn1(out, causalAttentionMask)
+  let (midBlockReader2, midBlock2) = ResnetBlockCausal3D(
+    prefix: "encoder.mid_block.resnets.1", inChannels: previousChannel,
+    outChannels: previousChannel,
+    shortcut: false, depth: depth, height: height, width: width)
+  out = midBlock2(out)
+  let normOut = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  out = normOut(out.reshaped([previousChannel, depth, height, width])).reshaped([
+    1, previousChannel, depth, height, width,
+  ])
+  out = out.swish()
+  let convOut = Convolution(
+    groups: 1, filters: 32, filterSize: [3, 3, 3])
+  out = convOut(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+  let quantConv = Convolution(groups: 1, filters: 32, filterSize: [1, 1, 1])
+  out = quantConv(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    for reader in readers {
+      reader(state_dict)
+    }
+    midBlockReader1(state_dict)
+    midAttnReader1(state_dict)
+    midBlockReader2(state_dict)
+  }
+  return (reader, Model([x, causalAttentionMask], [out]))
+}
+
+func DecoderCausal3D(
+  channels: [Int], numRepeat: Int, startWidth: Int, startHeight: Int,
+  startDepth: Int
+)
+  -> ((PythonObject) -> Void, Model)
+{
+  let x = Input()
+  let causalAttentionMask = Input()
+  var previousChannel = channels[channels.count - 1]
+  let postQuantConv = Convolution(groups: 1, filters: 16, filterSize: [1, 1, 1])
+  var out = postQuantConv(x)
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+  out = convIn(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+  let (midBlockReader1, midBlock1) = ResnetBlockCausal3D(
+    prefix: "decoder.mid_block.resnets.0", inChannels: previousChannel,
+    outChannels: previousChannel, shortcut: false, depth: startDepth, height: startHeight,
+    width: startWidth)
+  out = midBlock1(out)
+  let (midAttnReader1, midAttn1) = AttnBlockCausal3D(
+    prefix: "decoder.mid_block.attentions.0", inChannels: previousChannel, depth: startDepth,
+    height: startHeight, width: startWidth)
+  out = midAttn1(out, causalAttentionMask)
+  let (midBlockReader2, midBlock2) = ResnetBlockCausal3D(
+    prefix: "decoder.mid_block.resnets.1", inChannels: previousChannel,
+    outChannels: previousChannel, shortcut: false, depth: startDepth, height: startHeight,
+    width: startWidth)
+  out = midBlock2(out)
+  var width = startWidth
+  var height = startHeight
+  var depth = startDepth
+  var readers = [(PythonObject) -> Void]()
+  for (i, channel) in channels.enumerated().reversed() {
+    for j in 0..<numRepeat + 1 {
+      let (reader, block) = ResnetBlockCausal3D(
+        prefix: "decoder.up_blocks.\(channels.count - 1 - i).resnets.\(j)",
+        inChannels: previousChannel, outChannels: channel,
+        shortcut: previousChannel != channel, depth: depth, height: height, width: width)
+      readers.append(reader)
+      out = block(out)
+      previousChannel = channel
+    }
+    if i > 0 {
+      out = Upsample(.nearest, widthScale: 2, heightScale: 2)(
+        out.reshaped([channel, depth, height, width])
+      ).reshaped([1, channel, depth, height * 2, width * 2])
+      width *= 2
+      height *= 2
+      if i < channels.count - 1 {  // Scale time too.
+        let first = out.reshaped(
+          [channel, 1, height * width], strides: [depth * height * width, height * width, 1]
+        ).contiguous()
+        let more = out.reshaped(
+          [channel, (depth - 1), 1, height * width], offset: [0, 1, 0, 0],
+          strides: [depth * height * width, height * width, height * width, 1]
+        ).contiguous()
+        out = Functional.concat(
+          axis: 1, first,
+          Functional.concat(axis: 2, more, more).reshaped([
+            channel, (depth - 1) * 2, height * width,
+          ]))
+        depth = 1 + (depth - 1) * 2
+        out = out.reshaped([1, channel, depth, height, width])
+      }
+      let conv2d = Convolution(
+        groups: 1, filters: channel, filterSize: [3, 3, 3],
+        hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+      out = conv2d(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+      let upLayer = channels.count - 1 - i
+      let reader: (PythonObject) -> Void = { state_dict in
+      }
+      readers.append(reader)
+    }
+  }
+  let normOut = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  out = normOut(out.reshaped([channels[0], depth, height, width])).reshaped([
+    1, channels[0], depth, height, width,
+  ])
+  out = out.swish()
+  let convOut = Convolution(
+    groups: 1, filters: 3, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+  out = convOut(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+  let reader: (PythonObject) -> Void = { state_dict in
+    midBlockReader1(state_dict)
+    midAttnReader1(state_dict)
+    midBlockReader2(state_dict)
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
+  return (reader, Model([x, causalAttentionMask], [out]))
+}
+
+graph.withNoGrad {
+  let zTensor =
+    (1.0 / 0.476986)
+    * DynamicGraph.Tensor<Float>(
+      from: z[0..<1, 0..<16, 0..<17, 18..<(18 + 32), 44..<(44 + 32)].copied())
+  let (_, decoder) = DecoderCausal3D(
+    channels: [128, 256, 512, 512], numRepeat: 2, startWidth: 32, startHeight: 32, startDepth: 17)
+  let causalAttentionMask = graph.variable(Tensor<Float>(.CPU, .NCHW(17, 1, 17, 1)))
+  causalAttentionMask.full(0)
+  for i in 0..<16 {
+    for j in (i + 1)..<17 {
+      causalAttentionMask[i, 0, j, 0] = -Float.greatestFiniteMagnitude
+    }
+  }
+  let causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
+  decoder.compile(inputs: zTensor, causalAttentionMaskGPU)
+  graph.openStore("/home/liu/workspace/swift-diffusion/hunyuan_video_vae_f32.ckpt") {
+    try! $0.read("decoder", model: decoder, strict: true)
+  }
+  let image = decoder(inputs: zTensor, causalAttentionMaskGPU)[0].as(of: Float.self).rawValue
+    .toCPU()
+  for k in 0..<65 {
+    var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 32 * 8 * 32 * 8)
+    for y in 0..<(32 * 8) {
+      for x in 0..<(32 * 8) {
+        let (r, g, b) = (image[0, 0, k, y, x], image[0, 1, k, y, x], image[0, 2, k, y, x])
+        rgba[y * 32 * 8 + x].r = UInt8(
+          min(max(Int(Float(r.isFinite ? (r + 1) / 2 : 0) * 255), 0), 255))
+        rgba[y * 32 * 8 + x].g = UInt8(
+          min(max(Int(Float(g.isFinite ? (g + 1) / 2 : 0) * 255), 0), 255))
+        rgba[y * 32 * 8 + x].b = UInt8(
+          min(max(Int(Float(b.isFinite ? (b + 1) / 2 : 0) * 255), 0), 255))
+      }
+    }
+    let image = PNG.Data.Rectangular(
+      packing: rgba, size: (32 * 8, 32 * 8),
+      layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+    try! image.compress(path: "/home/liu/workspace/swift-diffusion/frame-\(k).png", level: 4)
+  }
 }

@@ -1020,5 +1020,6 @@ swift_binary(
         "@SwiftNumerics//:Numerics",
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
+        "@s4nnc//tensorboard",
     ],
 )
