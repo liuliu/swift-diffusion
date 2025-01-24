@@ -17,11 +17,13 @@ let tokenizer = GPT2Tokenizer(
     "<|start_header_id|>": 128006, "<|end_header_id|>": 128007, "<|eot_id|>": 128009,
     "<|begin_of_text|>": 128000, "<|end_of_text|>": 128001,
   ])
-let prompt = "A cat walks on the grass, realistic style."
+// let prompt = "A cat walks on the grass, realistic style."
+let prompt = "A woman wear a leafy green t-shirt with logo, seating in the coffee shop."
 let promptWithTemplate =
   "<|start_header_id|>system<|end_header_id|>\n\nDescribe the video by detailing the following aspects: 1. The main content and theme of the video.2. The color, shape, size, texture, quantity, text, and spatial relationships of the objects.3. Actions, events, behaviors temporal relationships, physical movement changes of the objects.4. background environment, light, style and atmosphere.5. camera angles, movements, and transitions used in the video:<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n\(prompt)<|eot_id|>"
 print(promptWithTemplate)
 let result = tokenizer.tokenize(text: promptWithTemplate, addSpecialTokens: true)
+print(result.count)
 print(result)
 
 func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
@@ -492,19 +494,18 @@ let z = graph.withNoGrad {
     return pooled
   }
   debugPrint(pooled)
+  let tokenLength = result.count - 95
   let lastHiddenStates = graph.withNoGrad {
     let (transformer, reader) = Transformer(
-      Float16.self, vocabularySize: 128_320, maxLength: 351, width: 4_096, tokenLength: 351,
-      layers: 32, MLP: 14336, heads: 32, outputHiddenStates: 29, batchSize: 1)
-    let tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [351], of: Int32.self)
+      Float16.self, vocabularySize: 128_320, maxLength: result.count, width: 4_096,
+      tokenLength: result.count, layers: 32, MLP: 14336, heads: 32, outputHiddenStates: 29,
+      batchSize: 1)
+    let tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [result.count], of: Int32.self)
     for i in 0..<result.count {
       tokensTensor[i] = result[i]
     }
-    for i in result.count..<351 {
-      tokensTensor[i] = 128258
-    }
-    let rotTensor = graph.variable(.CPU, .NHWC(1, 351, 1, 128), of: Float.self)
-    for i in 0..<351 {
+    let rotTensor = graph.variable(.CPU, .NHWC(1, result.count, 1, 128), of: Float.self)
+    for i in 0..<result.count {
       for k in 0..<64 {
         let theta = Double(i) * 1.0 / pow(500_000, Double(k) * 2 / 128)
         let sintheta = sin(theta)
@@ -516,17 +517,18 @@ let z = graph.withNoGrad {
     let tokensTensorGPU = tokensTensor.toGPU(0)
     let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
     transformer.compile(inputs: tokensTensorGPU, rotTensorGPU)
-    graph.openStore("/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_q6p.ckpt") {
+    graph.openStore("/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_q8p.ckpt") {
       try! $0.read("llava", model: transformer, strict: true, codec: [.jit, .q6p, .q8p, .ezm7])
     }
     return transformer(inputs: tokensTensorGPU, rotTensorGPU)[0].as(of: Float16.self)[
-      95..<106, 0..<4096
-    ].reshaped(.HWC(1, 11, 4096)).copied()  // We don't need attention mask, just reduce the hidden states.
+      95..<result.count, 0..<4096
+    ].reshaped(.HWC(1, tokenLength, 4096)).copied()  // We don't need attention mask, just reduce the hidden states.
   }
   debugPrint(lastHiddenStates)
   let timestep = timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
   var rotNdTensor = graph.variable(.CPU, .NHWC(1, 33 * 34 * 60, 1, 128), of: Float.self)
-  var rotNdTensor2 = graph.variable(.CPU, .NHWC(1, 33 * 34 * 60 + 11, 1, 128), of: Float.self)
+  var rotNdTensor2 = graph.variable(
+    .CPU, .NHWC(1, 33 * 34 * 60 + tokenLength, 1, 128), of: Float.self)
   for t in 0..<33 {
     for y in 0..<34 {
       for x in 0..<60 {
@@ -561,13 +563,13 @@ let z = graph.withNoGrad {
       }
     }
   }
-  for i in 33 * 34 * 60..<(33 * 34 * 60 + 11) {
+  for i in 33 * 34 * 60..<(33 * 34 * 60 + tokenLength) {
     for k in 0..<64 {
       rotNdTensor2[0, i, 0, k * 2] = 1
       rotNdTensor2[0, i, 0, k * 2 + 1] = 0
     }
   }
-  let (hunyuan, hunyuanReader) = Hunyuan(time: 33, height: 68, width: 120, textLength: 11)
+  let (hunyuan, hunyuanReader) = Hunyuan(time: 33, height: 68, width: 120, textLength: tokenLength)
   hunyuan.maxConcurrency = .limit(1)
   let tGPU = graph.variable(Tensor<Float16>(from: timestep)).toGPU(0)
   var xTensor = graph.variable(.GPU(0), .HWC(1, 33 * 34 * 60, 64), of: Float16.self)
@@ -870,17 +872,14 @@ func DecoderCausal3D(
 }
 
 graph.withNoGrad {
-  let zTensor =
-    (1.0 / 0.476986)
-    * DynamicGraph.Tensor<Float>(
-      from: z[0..<1, 0..<16, 0..<17, 18..<(18 + 32), 44..<(44 + 32)].copied())
+  let zTensor = (1.0 / 0.476986) * z[0..<1, 0..<16, 0..<17, 18..<(18 + 32), 44..<(44 + 32)].copied()
   let (_, decoder) = DecoderCausal3D(
     channels: [128, 256, 512, 512], numRepeat: 2, startWidth: 32, startHeight: 32, startDepth: 17)
-  let causalAttentionMask = graph.variable(Tensor<Float>(.CPU, .NCHW(17, 1, 17, 1)))
+  let causalAttentionMask = graph.variable(Tensor<Float16>(.CPU, .NCHW(17, 1, 17, 1)))
   causalAttentionMask.full(0)
   for i in 0..<16 {
     for j in (i + 1)..<17 {
-      causalAttentionMask[i, 0, j, 0] = -Float.greatestFiniteMagnitude
+      causalAttentionMask[i, 0, j, 0] = -Float16.greatestFiniteMagnitude
     }
   }
   let causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
@@ -888,7 +887,7 @@ graph.withNoGrad {
   graph.openStore("/home/liu/workspace/swift-diffusion/hunyuan_video_vae_f16.ckpt") {
     try! $0.read("decoder", model: decoder, strict: true)
   }
-  let image = decoder(inputs: zTensor, causalAttentionMaskGPU)[0].as(of: Float.self).rawValue
+  let image = decoder(inputs: zTensor, causalAttentionMaskGPU)[0].as(of: Float16.self).rawValue
     .toCPU()
   for k in 0..<65 {
     var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 32 * 8 * 32 * 8)
