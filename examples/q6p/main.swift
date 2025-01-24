@@ -3,12 +3,12 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/flux_1_dev_de_distill_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/flux_1_dev_de_distill_q5p.ckpt",
+    "/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_q6p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -26,6 +26,7 @@ graph.openStore(
       print("write \(key) \(tensor)")
       if key.contains("embedder") || key.contains("pos_embed") || key.contains("-linear-")  // || key.contains("ada_ln")
         || key.contains("_embeddings") || key.contains("register_tokens")
+        || key.contains("refiner_")
       {
         $0.write(key, tensor: tensor)
         continue
@@ -83,7 +84,7 @@ graph.openStore(
         continue
       }
       if shape.count == 2 && n > 1 {
-        $0.write(key, tensor: tensor, codec: [.q5p, .ezm7])
+        $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
       } else {

@@ -6,7 +6,7 @@ import TensorBoard
 
 struct PythonObject {}
 
-DynamicGraph.setSeed(40)
+DynamicGraph.setSeed(42)
 
 let graph = DynamicGraph()
 
@@ -516,8 +516,8 @@ let z = graph.withNoGrad {
     let tokensTensorGPU = tokensTensor.toGPU(0)
     let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
     transformer.compile(inputs: tokensTensorGPU, rotTensorGPU)
-    graph.openStore("/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_f16.ckpt") {
-      try! $0.read("llava", model: transformer, strict: true)
+    graph.openStore("/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_q6p.ckpt") {
+      try! $0.read("llava", model: transformer, strict: true, codec: [.jit, .q6p, .q8p, .ezm7])
     }
     return transformer(inputs: tokensTensorGPU, rotTensorGPU)[0].as(of: Float16.self)[
       95..<106, 0..<4096
@@ -580,8 +580,8 @@ let z = graph.withNoGrad {
   let rotNdTensor2GPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor2).toGPU(0)
   hunyuan.compile(
     inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/hunyuan_video_t2v_720p_f16.ckpt") {
-    try! $0.read("dit", model: hunyuan, strict: true)
+  graph.openStore("/home/liu/workspace/swift-diffusion/hunyuan_video_t2v_720p_q8p.ckpt") {
+    try! $0.read("dit", model: hunyuan, strict: true, codec: [.jit, .q8p, .ezm7])
   }
   let samplingSteps = 30
   for i in (1...samplingSteps).reversed() {
@@ -885,7 +885,7 @@ graph.withNoGrad {
   }
   let causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
   decoder.compile(inputs: zTensor, causalAttentionMaskGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/hunyuan_video_vae_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/hunyuan_video_vae_f16.ckpt") {
     try! $0.read("decoder", model: decoder, strict: true)
   }
   let image = decoder(inputs: zTensor, causalAttentionMaskGPU)[0].as(of: Float.self).rawValue
