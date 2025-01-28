@@ -48,7 +48,6 @@ let hunyuan_video_sampler = hyvideo_inference.HunyuanVideoSampler.from_pretraine
 /*
 print(hunyuan_video_sampler.pipeline.text_encoder.model)
 print(hunyuan_video_sampler.pipeline.transformer)
-*/
 print(hunyuan_video_sampler.pipeline.vae)
 
 let text_inputs = hunyuan_video_sampler.pipeline.text_encoder.text2tokens(
@@ -79,9 +78,9 @@ let outputs = hunyuan_video_sampler.pipeline.transformer(
   freqs_sin: freqs_sin, guidance: guidance, return_dict: true)
 print(outputs)
 torch.set_autocast_enabled("cuda", false)
+*/
 
 // Offload to CPU.
-/*
 hunyuan_video_sampler.pipeline.text_encoder.model.to(torch.device("cpu"))
 hunyuan_video_sampler.pipeline.transformer.to(torch.device("cpu"))
 let vae = hunyuan_video_sampler.pipeline.vae
@@ -89,7 +88,6 @@ vae.to(torch.float)
 let z = torch.randn([1, 16, 17, 32, 32]).to(torch.float).cuda()
 let sample = vae.decode(z).sample
 vae.encode(sample)
-*/
 let graph = DynamicGraph()
 
 func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
@@ -997,6 +995,7 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
 }
 
 graph.withNoGrad {
+  /*
   let text_encoder_state_dict = hunyuan_video_sampler.pipeline.text_encoder.model.state_dict()
   let (transformer, reader) = Transformer(
     Float16.self, vocabularySize: 128_320, maxLength: 351, width: 4_096, tokenLength: 351,
@@ -1025,11 +1024,9 @@ graph.withNoGrad {
   let lastHiddenStates = transformer(inputs: tokensTensorGPU, rotTensorGPU)[0].as(of: Float16.self)[
     95..<106, 0..<4096
   ].reshaped(.HWC(1, 11, 4096)).toGPU(2)  // We don't need attention mask, just reduce the hidden states.
-  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_f16.ckpt") {
     $0.write("llava", model: transformer)
   }
-  */
   debugPrint(lastHiddenStates)
   let timestep = timeEmbedding(timesteps: 900, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
   debugPrint(timestep)
@@ -1095,13 +1092,11 @@ graph.withNoGrad {
   hunyuanReader(transformer_state_dict)
   debugPrint(
     hunyuan(inputs: xTensor, rotNdTensorGPU, rotNdTensor2GPU, lastHiddenStates, tGPU, vector, gGPU))
-  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/hunyuan_video_t2v_720p_f16.ckpt") {
     $0.write("dit", model: hunyuan)
   }
   */
 }
-/*
 
 func ResnetBlockCausal3D(
   prefix: String, inChannels: Int, outChannels: Int, shortcut: Bool, depth: Int, height: Int,
@@ -1110,28 +1105,33 @@ func ResnetBlockCausal3D(
   (PythonObject) -> Void, Model
 ) {
   let x = Input()
-  let norm1 = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  let norm1 = GroupNorm(
+    axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3], name: "resnet_norm1")
   var out = norm1(x.reshaped([inChannels, depth, height, width])).reshaped([
     1, inChannels, depth, height, width,
   ])
   out = Swish()(out)
   let conv1 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3, 3],
-    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "resnet_conv1")
   out = conv1(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
-  let norm2 = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  let norm2 = GroupNorm(
+    axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3], name: "resnet_norm2")
   out = norm2(out.reshaped([outChannels, depth, height, width])).reshaped([
     1, outChannels, depth, height, width,
   ])
   out = Swish()(out)
   let conv2 = Convolution(
     groups: 1, filters: outChannels, filterSize: [3, 3, 3],
-    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "resnet_conv2")
   out = conv2(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
   let ninShortcut: Model?
   if shortcut {
     let nin = Convolution(
-      groups: 1, filters: outChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+      groups: 1, filters: outChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+      name: "resnet_shortcut")
     out = nin(x) + out
     ninShortcut = nin
   } else {
@@ -1176,16 +1176,18 @@ func AttnBlockCausal3D(
 ) {
   let x = Input()
   let causalAttentionMask = Input()
-  let norm = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  let norm = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3], name: "attn_norm")
   var out = norm(x.reshaped([inChannels, depth, height, width])).reshaped([
     1, inChannels, depth, height, width,
   ])
   let hw = width * height * depth
   let tokeys = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+    name: "to_k")
   let k = tokeys(out).reshaped([1, inChannels, hw])
   let toqueries = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+    name: "to_q")
   let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
     1, inChannels, hw,
   ])
@@ -1197,11 +1199,13 @@ func AttnBlockCausal3D(
   dot = dot.softmax()
   dot = dot.reshaped([1, hw, hw])
   let tovalues = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+    name: "to_v")
   let v = tovalues(out).reshaped([1, inChannels, hw])
   out = Matmul(transposeB: (1, 2))(v, dot)
   let projOut = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]))
+    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+    name: "proj_out")
   out = x + projOut(out.reshaped([1, inChannels, depth, height, width]))
   let reader: (PythonObject) -> Void = { state_dict in
     let norm_weight = state_dict["\(prefix).group_norm.weight"].to(torch.float).cpu().numpy()
@@ -1238,7 +1242,8 @@ func EncoderCausal3D(
   var previousChannel = channels[0]
   let convIn = Convolution(
     groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
-    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "conv_in")
   var out = convIn(x.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
   var readers = [(PythonObject) -> Void]()
   var height = startHeight
@@ -1277,7 +1282,8 @@ func EncoderCausal3D(
       let conv2d = Convolution(
         groups: 1, filters: channel, filterSize: [3, 3, 3],
         hint: Hint(
-          stride: [strideZ, 2, 2], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+          stride: [strideZ, 2, 2], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+        name: "downsample")
       out = conv2d(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
       let downLayer = i
       let reader: (PythonObject) -> Void = { state_dict in
@@ -1310,15 +1316,15 @@ func EncoderCausal3D(
     outChannels: previousChannel,
     shortcut: false, depth: depth, height: height, width: width)
   out = midBlock2(out)
-  let normOut = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  let normOut = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3], name: "norm_out")
   out = normOut(out.reshaped([previousChannel, depth, height, width])).reshaped([
     1, previousChannel, depth, height, width,
   ])
   out = out.swish()
   let convOut = Convolution(
-    groups: 1, filters: 32, filterSize: [3, 3, 3])
+    groups: 1, filters: 32, filterSize: [3, 3, 3], name: "conv_out")
   out = convOut(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
-  let quantConv = Convolution(groups: 1, filters: 32, filterSize: [1, 1, 1])
+  let quantConv = Convolution(groups: 1, filters: 32, filterSize: [1, 1, 1], name: "quant_conv")
   out = quantConv(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let conv_in_weight = state_dict["encoder.conv_in.conv.weight"].to(torch.float).cpu().numpy()
@@ -1356,11 +1362,13 @@ func DecoderCausal3D(
   let x = Input()
   let causalAttentionMask = Input()
   var previousChannel = channels[channels.count - 1]
-  let postQuantConv = Convolution(groups: 1, filters: 16, filterSize: [1, 1, 1])
+  let postQuantConv = Convolution(
+    groups: 1, filters: 16, filterSize: [1, 1, 1], name: "post_quant_conv")
   var out = postQuantConv(x)
   let convIn = Convolution(
     groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
-    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "conv_in")
   out = convIn(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
   let (midBlockReader1, midBlock1) = ResnetBlockCausal3D(
     prefix: "decoder.mid_block.resnets.0", inChannels: previousChannel,
@@ -1414,7 +1422,8 @@ func DecoderCausal3D(
       }
       let conv2d = Convolution(
         groups: 1, filters: channel, filterSize: [3, 3, 3],
-        hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+        hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+        name: "upsample")
       out = conv2d(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
       let upLayer = channels.count - 1 - i
       let reader: (PythonObject) -> Void = { state_dict in
@@ -1431,14 +1440,15 @@ func DecoderCausal3D(
       readers.append(reader)
     }
   }
-  let normOut = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3])
+  let normOut = GroupNorm(axis: 0, groups: 32, epsilon: 1e-6, reduce: [1, 2, 3], name: "norm_out")
   out = normOut(out.reshaped([channels[0], depth, height, width])).reshaped([
     1, channels[0], depth, height, width,
   ])
   out = out.swish()
   let convOut = Convolution(
     groups: 1, filters: 3, filterSize: [3, 3, 3],
-    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "conv_out")
   out = convOut(out.padded(.replication, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
   let reader: (PythonObject) -> Void = { state_dict in
     let post_quant_conv_weight = state_dict["post_quant_conv.weight"].to(torch.float).cpu().numpy()
@@ -1495,4 +1505,3 @@ graph.withNoGrad {
     $0.write("encoder", model: encoder)
   }
 }
-*/
