@@ -4,12 +4,52 @@ import NNC
 import NNCPythonConversion
 import PythonKit
 
+let graph = DynamicGraph()
+
 let torch = Python.import("torch")
 
 torch.set_grad_enabled(false)
 
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
+
+let transformers = Python.import("transformers")
+let pipe = transformers.pipeline(
+  "image-to-text", model: "xtuner/llava-llama-3-8b-v1_1-transformers", device: 0)
+print(pipe.model.multi_modal_projector)
+func MultiModalProjector(channels: Int) -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  let linear1 = Dense(count: channels)
+  let linear2 = Dense(count: channels)
+  let out = linear2(linear1(x).GELU())
+  let reader: (PythonObject) -> Void = { state_dict in
+    let linear_1_weight = state_dict["linear_1.weight"].type(torch.float).cpu().numpy()
+    linear1.weight.copy(from: try! Tensor<Float>(numpy: linear_1_weight))
+    let linear_1_bias = state_dict["linear_1.bias"].type(torch.float).cpu().numpy()
+    linear1.bias.copy(from: try! Tensor<Float>(numpy: linear_1_bias))
+    let linear_2_weight = state_dict["linear_2.weight"].type(torch.float).cpu().numpy()
+    linear2.weight.copy(from: try! Tensor<Float>(numpy: linear_2_weight))
+    let linear_2_bias = state_dict["linear_2.bias"].type(torch.float).cpu().numpy()
+    linear2.bias.copy(from: try! Tensor<Float>(numpy: linear_2_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+let x = torch.randn([1, 576, 1024], dtype: torch.float)
+print(pipe.model.multi_modal_projector(x.cuda()))
+let multi_modal_projector_state_dict = pipe.model.multi_modal_projector.state_dict()
+graph.withNoGrad {
+  let xTensor = graph.variable(try! Tensor<Float>(numpy: x.cpu().numpy()))
+  let (reader, proj) = MultiModalProjector(channels: 4096)
+  proj.compile(inputs: xTensor)
+  reader(multi_modal_projector_state_dict)
+  debugPrint(proj(inputs: xTensor))
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_multi_modal_projector_f32.ckpt"
+  ) {
+    $0.write("projector", model: proj)
+  }
+}
+exit(0)
 
 let numpy = Python.import("numpy")
 
@@ -88,7 +128,6 @@ vae.to(torch.float)
 let z = torch.randn([1, 16, 17, 32, 32]).to(torch.float).cuda()
 let sample = vae.decode(z).sample
 vae.encode(sample)
-let graph = DynamicGraph()
 
 func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
   Model, (PythonObject) -> Void

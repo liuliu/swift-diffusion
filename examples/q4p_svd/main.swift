@@ -9,37 +9,35 @@ let torch = Python.import("torch")
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/hunyuan_video_t2v_720p_f16.ckpt",
+  "/home/liu/workspace/draw-things-community/skyreels_v1_hunyuan_i2v_f16.ckpt",
   // "/fast/Data/SD/flux_1_dev_f16.ckpt",
   flags: .readOnly
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/hunyuan_video_t2v_720p_q5p.ckpt",
+    "/home/liu/workspace/draw-things-community/skyreels_v1_hunyuan_i2v_q5p.ckpt",
     // "/fast/Data/SD/flux_1_dev_q5p.ckpt",
     flags: .readOnly
   ) { bench in
     graph.openStore(
-      "/home/liu/workspace/swift-diffusion/hunyuan_video_t2v_720p_q5p_svd.ckpt",
+      "/home/liu/workspace/draw-things-community/skyreels_v1_hunyuan_i2v_q5p_svd.ckpt",
       // "/home/liu/workspace/swift-diffusion/flux_1_dev_q5p_svd.ckpt",
       flags: .truncateWhenClose
     ) { writer in
       graph.openStore(
-        "/home/liu/workspace/swift-diffusion/hunyuan_video_t2v_720p_q5p.ckpt",
+        "/home/liu/workspace/draw-things-community/skyreels_v1_hunyuan_i2v_q5p.ckpt",
         // "/fast/Data/SD/flux_1_dev_q5p.ckpt",
         flags: .readOnly
       ) {
         for key in keys {
           guard var codec = $0.codec(for: key) else { continue }
           guard codec == .q5p else {
-            /*
             codec.subtract([.externalData, .jit, .externalOnDemand])
             guard let tensor = $0.read(key, codec: codec.union([.jit, .externalData])) else {
               continue
             }
             print("transwrite key \(key)")
             writer.write(key, tensor: tensor, codec: codec)
-            */
             continue
           }
           guard let tensor = (store.read(key).map { Tensor<Float32>(from: $0).toCPU() }) else {
@@ -47,6 +45,7 @@ graph.openStore(
           }
           print("key \(key)")
           let f32 = torch.from_numpy(tensor)
+          /*
           let benchTensor =
             (bench.read(key, codec: [.q5p, .q8p]).map { Tensor<Float32>(from: $0).toCPU() })
           let qTensor =
@@ -63,6 +62,7 @@ graph.openStore(
           let qdiff = (f32 - b32)
           print("\(key) \((qrdiff * qrdiff).sum()) \((qdiff * qdiff).sum())")
           continue
+          */
           let (du, ds, dv) = torch.linalg.svd(f32.double()).tuple3
           let up = torch.matmul(du[..., 0..<32], torch.diag(ds[0..<32])).half().float()  // truncate to half then float.
           let down = dv[0..<32, ...].half().float()

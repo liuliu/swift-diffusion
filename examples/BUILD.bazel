@@ -1023,3 +1023,19 @@ swift_binary(
         "@s4nnc//tensorboard",
     ],
 )
+
+swift_binary(
+    name = "wan",
+    srcs = ["wan/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+        "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
