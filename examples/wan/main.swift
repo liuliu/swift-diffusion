@@ -679,10 +679,10 @@ graph.withNoGrad {
 }
 
 let z = torch.randn([16, 3, 60, 104]).to(torch.float).cuda()
-wan_t2v.vae.decode([z])
-print(wan_t2v.vae.model.decoder)
+let zOut = wan_t2v.vae.decode([z])[0]
+wan_t2v.vae.encode([zOut])
+print(wan_t2v.vae.model.encoder)
 let vae_state_dict = wan_t2v.vae.model.state_dict()
-print(vae_state_dict.keys())
 
 func ResnetBlockCausal3D(
   prefix: String, inChannels: Int, outChannels: Int, shortcut: Bool, depth: Int, height: Int,
@@ -763,15 +763,13 @@ func AttnBlockCausal3D(
   let tokeys = Convolution(
     groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
     name: "to_k")
-  let k = tokeys(out).reshaped([1, inChannels, depth, hw]).transposed(0, 2).reshaped([
-    depth, inChannels, hw,
-  ])
+  let k = tokeys(out).reshaped([inChannels, depth, hw]).transposed(0, 1)
   let toqueries = Convolution(
     groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
     name: "to_q")
   let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
-    1, inChannels, depth, hw,
-  ]).transposed(0, 2).reshaped([depth, inChannels, hw])
+    inChannels, depth, hw,
+  ]).transposed(0, 1)
   var dot =
     Matmul(transposeA: (1, 2))(q, k)
   dot = dot.reshaped([depth * hw, hw])
@@ -780,9 +778,7 @@ func AttnBlockCausal3D(
   let tovalues = Convolution(
     groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
     name: "to_v")
-  let v = tovalues(out).reshaped([1, inChannels, depth, hw]).transposed(0, 2).reshaped([
-    depth, inChannels, hw,
-  ])
+  let v = tovalues(out).reshaped([inChannels, depth, hw]).transposed(0, 1)
   out = Matmul(transposeB: (1, 2))(v, dot)
   let projOut = Convolution(
     groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
@@ -848,7 +844,7 @@ func DecoderCausal3D(
   var readers = [(PythonObject) -> Void]()
   var k = 0
   for (i, channel) in channels.enumerated().reversed() {
-    for j in 0..<numRepeat + 1 {
+    for _ in 0..<numRepeat + 1 {
       let (reader, block) = ResnetBlockCausal3D(
         prefix: "decoder.upsamples.\(k)",
         inChannels: previousChannel, outChannels: channel,
@@ -859,7 +855,7 @@ func DecoderCausal3D(
       k += 1
     }
     if i > 0 {
-      if i > 1 {  // Need to bump up on the depth axis.
+      if i > 1 && startDepth > 1 {  // Need to bump up on the depth axis.
         let first = out.reshaped(
           [channel, 1, height, width], strides: [depth * height * width, height * width, width, 1]
         ).contiguous()
@@ -869,7 +865,8 @@ func DecoderCausal3D(
         ).contiguous().reshaped([1, channel, depth - 1, height, width])
         let timeConv = Convolution(
           groups: 1, filters: channel * 2, filterSize: [3, 1, 1],
-          hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+          hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+          name: "time_conv")
         var expanded = timeConv(more.padded(.zero, begin: [0, 0, 2, 0, 0], end: [0, 0, 0, 0, 0]))
         let upLayer = k
         let reader: (PythonObject) -> Void = { state_dict in
@@ -952,6 +949,146 @@ func DecoderCausal3D(
   return (reader, Model([x], [out]))
 }
 
+func EncoderCausal3D(
+  channels: [Int], numRepeat: Int, startWidth: Int, startHeight: Int, startDepth: Int
+)
+  -> ((PythonObject) -> Void, Model)
+{
+  let x = Input()
+  var previousChannel = channels[0]
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "conv_in")
+  var out = convIn(x.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+  var readers = [(PythonObject) -> Void]()
+  var height = startHeight
+  var width = startWidth
+  var depth = startDepth
+  for i in 1..<channels.count {
+    height *= 2
+    width *= 2
+    if i > 1 {
+      depth = (depth - 1) * 2 + 1
+    }
+  }
+  var k = 0
+  for (i, channel) in channels.enumerated() {
+    for _ in 0..<numRepeat {
+      let (reader, block) = ResnetBlockCausal3D(
+        prefix: "encoder.downsamples.\(k)", inChannels: previousChannel,
+        outChannels: channel,
+        shortcut: previousChannel != channel, depth: depth, height: height, width: width)
+      readers.append(reader)
+      out = block(out)
+      previousChannel = channel
+      k += 1
+    }
+    if i < channels.count - 1 {
+      height /= 2
+      width /= 2
+      let conv2d = Convolution(
+        groups: 1, filters: channel, filterSize: [1, 3, 3],
+        hint: Hint(
+          stride: [1, 2, 2], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+        name: "downsample")
+      out = conv2d(out.padded(.zero, begin: [0, 0, 0, 0, 0], end: [0, 0, 0, 1, 1]))
+      let downLayer = k
+      let reader: (PythonObject) -> Void = { state_dict in
+        let conv_weight = state_dict[
+          "encoder.downsamples.\(downLayer).resample.1.weight"
+        ].to(
+          torch.float
+        ).cpu()
+          .numpy()
+        let conv_bias = state_dict["encoder.downsamples.\(downLayer).resample.1.bias"]
+          .to(torch.float)
+          .cpu().numpy()
+        conv2d.weight.copy(from: try! Tensor<Float>(numpy: conv_weight))
+        conv2d.bias.copy(from: try! Tensor<Float>(numpy: conv_bias))
+      }
+      readers.append(reader)
+      if i > 0 && depth > 1 {
+        let first = out.reshaped(
+          [1, channel, 1, height, width],
+          strides: [depth * height * width, depth * height * width, height * width, width, 1]
+        ).contiguous()
+        let timeConv = Convolution(
+          groups: 1, filters: channel, filterSize: [3, 1, 1],
+          hint: Hint(
+            stride: [2, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+          name: "time_conv")
+        let shrunk = timeConv(out)
+        let upLayer = k
+        let reader: (PythonObject) -> Void = { state_dict in
+          let time_conv_weight = state_dict["encoder.downsamples.\(upLayer).time_conv.weight"]
+            .to(torch.float)
+            .cpu().numpy()
+          let time_conv_bias = state_dict["encoder.downsamples.\(upLayer).time_conv.bias"].to(
+            torch.float
+          ).cpu()
+            .numpy()
+          timeConv.weight.copy(from: try! Tensor<Float>(numpy: time_conv_weight))
+          timeConv.bias.copy(from: try! Tensor<Float>(numpy: time_conv_bias))
+        }
+        readers.append(reader)
+        depth = (depth - 1) / 2 + 1
+        out = Functional.concat(axis: 2, first, shrunk)
+      }
+      k += 1
+    }
+  }
+  let (midBlockReader1, midBlock1) = ResnetBlockCausal3D(
+    prefix: "encoder.middle.0", inChannels: previousChannel,
+    outChannels: previousChannel,
+    shortcut: false, depth: depth, height: height, width: width)
+  out = midBlock1(out)
+  let (midAttnReader1, midAttn1) = AttnBlockCausal3D(
+    prefix: "encoder.middle.1", inChannels: previousChannel, depth: depth,
+    height: height, width: width)
+  out = midAttn1(out)
+  let (midBlockReader2, midBlock2) = ResnetBlockCausal3D(
+    prefix: "encoder.middle.2", inChannels: previousChannel,
+    outChannels: previousChannel,
+    shortcut: false, depth: depth, height: height, width: width)
+  out = midBlock2(out)
+  let normOut = RMSNorm(epsilon: 1e-6, axis: [0], name: "norm_out")
+  out = normOut(out.reshaped([previousChannel, depth, height, width])).reshaped([
+    1, previousChannel, depth, height, width,
+  ])
+  out = out.swish()
+  let convOut = Convolution(
+    groups: 1, filters: 32, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "conv_out")
+  out = convOut(out.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+  let quantConv = Convolution(groups: 1, filters: 32, filterSize: [1, 1, 1], name: "quant_conv")
+  out = quantConv(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let conv_in_weight = state_dict["encoder.conv1.weight"].to(torch.float).cpu().numpy()
+    let conv_in_bias = state_dict["encoder.conv1.bias"].to(torch.float).cpu().numpy()
+    convIn.weight.copy(from: try! Tensor<Float>(numpy: conv_in_weight))
+    convIn.bias.copy(from: try! Tensor<Float>(numpy: conv_in_bias))
+    for reader in readers {
+      reader(state_dict)
+    }
+    midBlockReader1(state_dict)
+    midAttnReader1(state_dict)
+    midBlockReader2(state_dict)
+    let norm_out_weight = state_dict["encoder.head.0.gamma"].to(torch.float).cpu().numpy()
+    normOut.weight.copy(from: try! Tensor<Float>(numpy: norm_out_weight))
+    let conv_out_weight = state_dict["encoder.head.2.weight"].to(torch.float).cpu().numpy()
+    let conv_out_bias = state_dict["encoder.head.2.bias"].to(torch.float).cpu().numpy()
+    convOut.weight.copy(from: try! Tensor<Float>(numpy: conv_out_weight))
+    convOut.bias.copy(from: try! Tensor<Float>(numpy: conv_out_bias))
+    let quant_conv_weight = state_dict["conv1.weight"].to(torch.float).cpu().numpy()
+    let quant_conv_bias = state_dict["conv1.bias"].to(torch.float).cpu().numpy()
+    quantConv.weight.copy(from: try! Tensor<Float>(numpy: quant_conv_weight))
+    quantConv.bias.copy(from: try! Tensor<Float>(numpy: quant_conv_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
 graph.withNoGrad {
   /*
   let mean = graph.variable(Tensor<Float>([
@@ -972,7 +1109,11 @@ graph.withNoGrad {
   decoder.compile(inputs: zTensor)
   decoderReader(vae_state_dict)
   let image = decoder(inputs: zTensor)[0].as(of: Float.self)
-  debugPrint(image)
+  let (encoderReader, encoder) = EncoderCausal3D(
+    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 104, startHeight: 60, startDepth: 3)
+  encoder.compile(inputs: image)
+  encoderReader(vae_state_dict)
+  debugPrint(encoder(inputs: image)[0].as(of: Float.self))
 }
 
 /*
