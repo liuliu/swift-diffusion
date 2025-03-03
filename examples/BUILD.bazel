@@ -1025,8 +1025,8 @@ swift_binary(
 )
 
 swift_binary(
-    name = "wan",
-    srcs = ["wan/main.swift"],
+    name = "wan_converter",
+    srcs = ["wan_converter/main.swift"],
     data = [
     ],
     deps = [
@@ -1036,6 +1036,20 @@ swift_binary(
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
         "@s4nnc//nnc:nnc_python",
+        "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
+
+swift_binary(
+    name = "wan",
+    srcs = ["wan/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
         "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )

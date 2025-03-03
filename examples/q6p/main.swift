@@ -3,12 +3,12 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_multi_modal_projector_f32.ckpt",
+  "/home/liu/workspace/swift-diffusion/wan_v2.1_1.3b_480p_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/llava_llama_3_8b_v1.1_multi_modal_projector_f16.ckpt",
+    "/home/liu/workspace/swift-diffusion/wan_v2.1_1.3b_480p_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -26,7 +26,8 @@ graph.openStore(
       print("write \(key) \(tensor)")
       if key.contains("embedder") || key.contains("pos_embed") || key.contains("-linear-")  // || key.contains("ada_ln")
         || key.contains("_embeddings") || key.contains("register_tokens")
-        || key.contains("refiner_")
+        || key.contains("refiner_") || key.contains("position_embedding")
+        || key.contains("-shared-")
       {
         $0.write(key, tensor: tensor)
         continue
