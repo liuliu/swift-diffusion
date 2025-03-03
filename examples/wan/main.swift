@@ -1,9 +1,12 @@
 import Diffusion
 import Foundation
 import NNC
+import PNG
 import SentencePiece
 
 struct PythonObject {}
+
+DynamicGraph.setSeed(42)
 
 let graph = DynamicGraph()
 
@@ -180,8 +183,6 @@ let context = graph.withNoGrad {
     .as(of: Float16.self)
   return output[0..<tokens2.count, 0..<4096].copied()
 }
-debugPrint(context)
-exit(0)
 
 func FeedForward(hiddenSize: Int, intermediateSize: Int, upcast: Bool, name: String) -> (
   Model, Model, Model
@@ -211,7 +212,7 @@ func WanAttentionBlock(
   let c = (0..<6).map { _ in Input() }
   let rot = Input()
   let modulations = (0..<6).map {
-    Parameter<Float16>(.GPU(2), .HWC(1, 1, k * h), name: "attn_ada_ln_\($0)")
+    Parameter<Float16>(.GPU(0), .HWC(1, 1, k * h), name: "attn_ada_ln_\($0)")
   }
   let chunks = zip(c, modulations).map { $0 + $1 }
   let xNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
@@ -308,8 +309,8 @@ func Wan(
     out = block([out, context, rot] + tOut)
     readers.append(reader)
   }
-  let scale = Parameter<Float16>(.GPU(2), .HWC(1, 1, channels), name: "ada_ln_0")
-  let shift = Parameter<Float16>(.GPU(2), .HWC(1, 1, channels), name: "ada_ln_1")
+  let scale = Parameter<Float16>(.GPU(0), .HWC(1, 1, channels), name: "ada_ln_0")
+  let shift = Parameter<Float16>(.GPU(0), .HWC(1, 1, channels), name: "ada_ln_1")
   let normFinal = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   out = (1 + scale + vector) .* normFinal(out).to(.Float16) + (vector + shift)
   let projOut = Dense(count: 2 * 2 * 16, name: "linear")
@@ -340,7 +341,8 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
   return embedding
 }
 
-graph.withNoGrad {
+graph.maxConcurrency = .limit(1)
+let z = graph.withNoGrad {
   var rotNdTensor = graph.variable(.CPU, .NHWC(1, 21 * 30 * 52, 1, 128), of: Float.self)
   for t in 0..<21 {
     for y in 0..<30 {
@@ -371,25 +373,45 @@ graph.withNoGrad {
     }
   }
   let (wan, reader) = Wan(
+    // channels: 1536, layers: 30, intermediateSize: 8960, time: 21, height: 60, width: 104,
     channels: 5120, layers: 40, intermediateSize: 13824, time: 21, height: 60, width: 104,
     textLength: 512)
-  let xTensor = graph.variable(.GPU(2), .HWC(1, 21 * 30 * 52, 16 * 2 * 2), of: Float16.self)
+  var xTensor = graph.variable(.GPU(0), .HWC(1, 21 * 30 * 52, 16 * 2 * 2), of: Float16.self)
   xTensor.randn()
-  let txt = context.reshaped(.WC(28, 4096)).toGPU(2)
-  var txtIn = graph.variable(.GPU(2), .WC(512, 4096), of: Float16.self)
+  let txt = context.reshaped(.WC(28, 4096)).toGPU(0)
+  var txtIn = graph.variable(.GPU(0), .WC(512, 4096), of: Float16.self)
   txtIn.full(0)
   txtIn[0..<28, 0..<4096] = txt
   txtIn = txtIn.reshaped(.HWC(1, 512, 4096))
   let timestep = timeEmbedding(timesteps: 900, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-  let tGPU = graph.variable(Tensor<Float16>(from: timestep)).toGPU(2)
-  let rotNdTensorGPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor).toGPU(2)
+  let tGPU = graph.variable(Tensor<Float16>(from: timestep)).toGPU(0)
+  let rotNdTensorGPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor).toGPU(0)
   wan.compile(inputs: xTensor, txtIn, tGPU, rotNdTensorGPU)
   graph.openStore(
     "/home/liu/workspace/swift-diffusion/wan_v2.1_14b_720p_f16.ckpt", flags: [.readOnly]
   ) {
     $0.read("dit", model: wan)
   }
-  debugPrint(wan(inputs: xTensor, txtIn, tGPU, rotNdTensorGPU))
+  let samplingSteps = 30
+  for i in (1...samplingSteps).reversed() {
+    let t = Float(i) / Float(samplingSteps) * 1_000
+    let tGPU = graph.variable(
+      Tensor<Float16>(
+        from: timeEmbedding(timesteps: t, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
+          .toGPU(0)))
+    var v = wan(
+      inputs: xTensor, txtIn, tGPU, rotNdTensorGPU)[0].as(
+        of: Float16.self)
+    v = v.reshaped(format: .NCHW, shape: [1, 21 * 30 * 52, 2, 2, 16]).permuted(0, 1, 4, 2, 3)
+      .contiguous().reshaped(.CHW(1, 21 * 30 * 52, 16 * 2 * 2))
+    xTensor = xTensor - (1 / Float(samplingSteps)) * v
+    debugPrint(xTensor)
+  }
+  let z = xTensor.reshaped(format: .NCHW, shape: [1, 21, 30, 52, 16, 2, 2]).permuted(
+    0, 4, 1, 2, 5, 3, 6
+  )
+  .contiguous().reshaped(format: .NCHW, shape: [1, 16, 21, 60, 104])
+  return z
 }
 
 func ResnetBlockCausal3D(
@@ -691,32 +713,49 @@ func EncoderCausal3D(
 }
 
 graph.withNoGrad {
-  /*
-  let mean = graph.variable(Tensor<Float>([
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-    0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
-  ], format: .NCHW, shape: [1, 16, 1, 1, 1])).toGPU(1)
-  let std = graph.variable(Tensor<Float>([
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-    3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
-  ], format: .NCHW, shape: [1, 16, 1, 1, 1])).toGPU(1)
-  var zTensor = graph.variable(try! Tensor<Float>(numpy: z.to(torch.float).cpu().numpy())).reshaped(
-    format: .NCHW, shape: [1, 16, 3, 60, 104]
-  ).toGPU(1)
-  // zTensor = zTensor / std + mean
+  let mean = graph.variable(
+    Tensor<Float>(
+      [
+        -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+        0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
+      ], kind: .GPU(0), format: .NCHW, shape: [1, 16, 1, 1, 1]))
+  let std = graph.variable(
+    Tensor<Float>(
+      [
+        2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+        3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
+      ], kind: .GPU(0), format: .NCHW, shape: [1, 16, 1, 1, 1]))
+  let zTensor = (DynamicGraph.Tensor<Float>(from: z) .* std + mean)[
+    0..<1, 0..<16, 0..<3, 0..<60, 0..<104
+  ].copied()
+  debugPrint(zTensor)
   let (decoderReader, decoder) = DecoderCausal3D(
     channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 104, startHeight: 60, startDepth: 3)
   decoder.compile(inputs: zTensor)
-  decoderReader(vae_state_dict)
-  let image = decoder(inputs: zTensor)[0].as(of: Float.self)
-  let (encoderReader, encoder) = EncoderCausal3D(
-    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 104, startHeight: 60, startDepth: 3)
-  encoder.compile(inputs: image)
-  encoderReader(vae_state_dict)
-  debugPrint(encoder(inputs: image)[0].as(of: Float.self))
-  graph.openStore("/home/liu/workspace/swift-diffusion/wan_v2.1_video_vae_f32.ckpt", flags: [.readOnly]) {
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/wan_v2.1_video_vae_f32.ckpt", flags: [.readOnly]
+  ) {
     $0.read("decoder", model: decoder)
-    $0.read("encoder", model: encoder)
   }
-  */
+  let image = decoder(inputs: zTensor)[0].as(of: Float.self).toCPU()
+  debugPrint(image)
+  for k in 0..<9 {
+    var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 104 * 8 * 60 * 8)
+    for y in 0..<(60 * 8) {
+      for x in 0..<(104 * 8) {
+        let (r, g, b) = (image[0, 0, k, y, x], image[0, 1, k, y, x], image[0, 2, k, y, x])
+        rgba[y * 104 * 8 + x].r = UInt8(
+          min(max(Int(Float(r.isFinite ? (r + 1) / 2 : 0) * 255), 0), 255))
+        rgba[y * 104 * 8 + x].g = UInt8(
+          min(max(Int(Float(g.isFinite ? (g + 1) / 2 : 0) * 255), 0), 255))
+        rgba[y * 104 * 8 + x].b = UInt8(
+          min(max(Int(Float(b.isFinite ? (b + 1) / 2 : 0) * 255), 0), 255))
+      }
+    }
+    let image = PNG.Data.Rectangular(
+      packing: rgba, size: (104 * 8, 60 * 8),
+      layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+    try! image.compress(path: "/home/liu/workspace/swift-diffusion/frame-\(k).png", level: 4)
+  }
+  debugPrint(image)
 }
