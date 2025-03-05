@@ -13,11 +13,17 @@ let graph = DynamicGraph()
 let prompt =
   "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
 
+let negativePrompt =
+  "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
 let sentencePiece = SentencePiece(
   file: "/home/liu/workspace/Wan2.1/Wan2.1-T2V-1.3B/google/umt5-xxl/spiece.model")
-var tokens2 = sentencePiece.encode(prompt).map { return $0.id }
-tokens2.append(1)
-print(tokens2)
+var tokens = sentencePiece.encode(prompt).map { return $0.id }
+tokens.append(1)
+print(tokens)
+var negativeTokens = sentencePiece.encode(negativePrompt).map { return $0.id }
+negativeTokens.append(1)
+print(negativeTokens)
 
 func UMT5TextEmbedding(vocabularySize: Int, embeddingSize: Int, name: String) -> Model {
   let tokenEmbed = Embedding(
@@ -159,17 +165,22 @@ func relativePositionBuckets(sequenceLength: Int, numBuckets: Int, maxDistance: 
 }
 
 let context = graph.withNoGrad {
-  let tokensTensor2 = graph.variable(.CPU, .C(256), of: Int32.self)
+  let tokensTensor = graph.variable(.CPU, .C(256), of: Int32.self)
   for i in 0..<256 {
-    tokensTensor2[i] = i < tokens2.count ? tokens2[i] : 0
+    tokensTensor[i] = i < tokens.count ? tokens[i] : 0
+  }
+  let negativeTokensTensor = graph.variable(.CPU, .C(256), of: Int32.self)
+  for i in 0..<256 {
+    negativeTokensTensor[i] = i < negativeTokens.count ? negativeTokens[i] : 0
   }
   let (reader, textModel) = UMT5ForConditionalGeneration(b: 1, t: 256)
   let relativePositionBuckets = relativePositionBuckets(
     sequenceLength: 256, numBuckets: 32, maxDistance: 128)
-  let tokensTensorGPU = tokensTensor2.toGPU(0)
+  let tokensTensorGPU = tokensTensor.toGPU(0)
+  let negativeTokensTensorGPU = negativeTokensTensor.toGPU(0)
   var attentionMask = Tensor<Float16>(.CPU, .NCHW(1, 1, 1, 256))
   for i in 0..<256 {
-    attentionMask[0, 0, 0, i] = i < tokens2.count ? 0 : -Float16.greatestFiniteMagnitude
+    attentionMask[0, 0, 0, i] = i < tokens.count ? 0 : -Float16.greatestFiniteMagnitude
   }
   let attentionMaskGPU = graph.variable(attentionMask.toGPU(0))
   let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
@@ -179,9 +190,15 @@ let context = graph.withNoGrad {
   ) {
     $0.read("text_model", model: textModel)
   }
-  let output = textModel(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)[0]
+  var output = textModel(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)[0]
     .as(of: Float16.self)
-  return output[0..<tokens2.count, 0..<4096].copied()
+  let context = output[0..<tokens.count, 0..<4096].copied()
+  output = textModel(inputs: negativeTokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)[
+    0
+  ]
+  .as(of: Float16.self)
+  let negativeContext = output[0..<negativeTokens.count, 0..<4096].copied()
+  return (context, negativeContext)
 }
 
 func FeedForward(hiddenSize: Int, intermediateSize: Int, upcast: Bool, name: String) -> (
@@ -378,11 +395,16 @@ let z = graph.withNoGrad {
     textLength: 512)
   var xTensor = graph.variable(.GPU(0), .HWC(1, 21 * 30 * 52, 16 * 2 * 2), of: Float16.self)
   xTensor.randn()
-  let txt = context.reshaped(.WC(28, 4096)).toGPU(0)
+  let txt = context.0.reshaped(.WC(tokens.count, 4096)).toGPU(0)
   var txtIn = graph.variable(.GPU(0), .WC(512, 4096), of: Float16.self)
   txtIn.full(0)
-  txtIn[0..<28, 0..<4096] = txt
+  txtIn[0..<tokens.count, 0..<4096] = txt
   txtIn = txtIn.reshaped(.HWC(1, 512, 4096))
+  let negTxt = context.1.reshaped(.WC(negativeTokens.count, 4096)).toGPU(0)
+  var negTxtIn = graph.variable(.GPU(0), .WC(512, 4096), of: Float16.self)
+  negTxtIn.full(0)
+  negTxtIn[0..<negativeTokens.count, 0..<4096] = negTxt
+  negTxtIn = negTxtIn.reshaped(.HWC(1, 512, 4096))
   let timestep = timeEmbedding(timesteps: 900, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
   let tGPU = graph.variable(Tensor<Float16>(from: timestep)).toGPU(0)
   let rotNdTensorGPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor).toGPU(0)
@@ -399,11 +421,17 @@ let z = graph.withNoGrad {
       Tensor<Float16>(
         from: timeEmbedding(timesteps: t, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
           .toGPU(0)))
-    var v = wan(
+    var vc = wan(
       inputs: xTensor, txtIn, tGPU, rotNdTensorGPU)[0].as(
         of: Float16.self)
-    v = v.reshaped(format: .NCHW, shape: [1, 21 * 30 * 52, 2, 2, 16]).permuted(0, 1, 4, 2, 3)
+    vc = vc.reshaped(format: .NCHW, shape: [1, 21 * 30 * 52, 2, 2, 16]).permuted(0, 1, 4, 2, 3)
       .contiguous().reshaped(.CHW(1, 21 * 30 * 52, 16 * 2 * 2))
+    var vu = wan(
+      inputs: xTensor, negTxtIn, tGPU, rotNdTensorGPU)[0].as(
+        of: Float16.self)
+    vu = vu.reshaped(format: .NCHW, shape: [1, 21 * 30 * 52, 2, 2, 16]).permuted(0, 1, 4, 2, 3)
+      .contiguous().reshaped(.CHW(1, 21 * 30 * 52, 16 * 2 * 2))
+    let v = vu + 6 * (vc - vu)
     xTensor = xTensor - (1 / Float(samplingSteps)) * v
     debugPrint(xTensor)
   }
