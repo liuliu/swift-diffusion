@@ -280,11 +280,11 @@ func WanAttentionBlock(
   let c = (0..<6).map { _ in Input() }
   let rot = Input()
   let modulations = (0..<6).map {
-    Parameter<Float16>(.GPU(2), .HWC(1, 1, k * h), name: "attn_ada_ln_\($0)")
+    Parameter<Float>(.GPU(2), .HWC(1, 1, k * h), name: "attn_ada_ln_\($0)")
   }
   let chunks = zip(c, modulations).map { $0 + $1 }
   let xNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  var xOut = (1 + chunks[1]) .* xNorm1(x).to(.Float16) + chunks[0]
+  var xOut = ((1 + chunks[1]) .* xNorm1(x) + chunks[0]).to(.Float16)
   let xToKeys = Dense(count: k * h, name: "x_k")
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
@@ -303,7 +303,7 @@ func WanAttentionBlock(
   var out = scaledDotProductAttention(queries, keys, values).reshaped([b, hw, k * h])
   let xUnifyheads = Dense(count: k * h, name: "x_o")
   out = xUnifyheads(out)
-  out = x + chunks[2].to(of: x) .* out.to(of: x)
+  out = x + chunks[2] .* out.to(of: x)
   let xNorm3 = LayerNorm(epsilon: 1e-6, axis: [2], name: "x_norm_3")
   xOut = xNorm3(out).to(.Float16)
   let contextToKeys = Dense(count: k * h, name: "c_k")
@@ -325,7 +325,7 @@ func WanAttentionBlock(
   let (xLinear1, xOutProjection, xFF) = FeedForward(
     hiddenSize: k * h, intermediateSize: intermediateSize, upcast: false, name: "x")
   out =
-    out + (xFF((1 + chunks[4]) .* xNorm2(out).to(.Float16) + chunks[3]) .* chunks[5]).to(of: out)
+    out + xFF(((1 + chunks[4]) .* xNorm2(out) + chunks[3]).to(.Float16)).to(of: out) .* chunks[5]
   let reader: (PythonObject) -> Void = { state_dict in
     let modulation_bias = state_dict["\(prefix).modulation"]
       .to(
@@ -333,7 +333,7 @@ func WanAttentionBlock(
       ).cpu().numpy()
     for i in 0..<6 {
       modulations[i].weight.copy(
-        from: Tensor<Float16>(
+        from: Tensor<Float>(
           from: try! Tensor<Float>(
             numpy: modulation_bias[0..<1, i..<(i + 1), 0..<(k * h)])))
     }
@@ -543,10 +543,10 @@ func Wan(
     out = block([out, context, rot] + tOut)
     readers.append(reader)
   }
-  let scale = Parameter<Float16>(.GPU(2), .HWC(1, 1, channels), name: "ada_ln_0")
-  let shift = Parameter<Float16>(.GPU(2), .HWC(1, 1, channels), name: "ada_ln_1")
+  let scale = Parameter<Float>(.GPU(2), .HWC(1, 1, channels), name: "ada_ln_0")
+  let shift = Parameter<Float>(.GPU(2), .HWC(1, 1, channels), name: "ada_ln_1")
   let normFinal = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  out = (1 + scale + vector) .* normFinal(out).to(.Float16) + (vector + shift)
+  out = ((1 + scale + vector) .* normFinal(out) + (vector + shift)).to(.Float16)
   let projOut = Dense(count: 2 * 2 * 16, name: "linear")
   out = projOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
@@ -583,18 +583,18 @@ func Wan(
     let time_embedding_0_bias = state_dict["time_embedding.0.bias"].to(torch.float)
       .cpu().numpy()
     timeInMlp0.weight.copy(
-      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: time_embedding_0_weight)))
+      from: Tensor<Float>(from: try! Tensor<Float>(numpy: time_embedding_0_weight)))
     timeInMlp0.bias.copy(
-      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: time_embedding_0_bias)))
+      from: Tensor<Float>(from: try! Tensor<Float>(numpy: time_embedding_0_bias)))
     let time_embedding_2_weight = state_dict["time_embedding.2.weight"].to(
       torch.float
     ).cpu().numpy()
     let time_embedding_2_bias = state_dict["time_embedding.2.bias"].to(torch.float)
       .cpu().numpy()
     timeInMlp2.weight.copy(
-      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: time_embedding_2_weight)))
+      from: Tensor<Float>(from: try! Tensor<Float>(numpy: time_embedding_2_weight)))
     timeInMlp2.bias.copy(
-      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: time_embedding_2_bias)))
+      from: Tensor<Float>(from: try! Tensor<Float>(numpy: time_embedding_2_bias)))
     let time_projection_1_weight = state_dict["time_projection.1.weight"].to(
       torch.float
     ).cpu().numpy()
@@ -602,11 +602,11 @@ func Wan(
       .cpu().numpy()
     for i in 0..<6 {
       timeProjections[i].weight.copy(
-        from: Tensor<Float16>(
+        from: Tensor<Float>(
           from: try! Tensor<Float>(
             numpy: time_projection_1_weight[(i * channels)..<((i + 1) * channels), ...])))
       timeProjections[i].bias.copy(
-        from: Tensor<Float16>(
+        from: Tensor<Float>(
           from: try! Tensor<Float>(
             numpy: time_projection_1_bias[(i * channels)..<((i + 1) * channels)])))
     }
@@ -616,11 +616,11 @@ func Wan(
     let modulation_bias = state_dict["head.modulation"].to(torch.float)
       .cpu().numpy()
     shift.weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(
           numpy: modulation_bias[0..<1, 0..<1, 0..<channels])))
     scale.weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(
           numpy: modulation_bias[0..<1, 1..<2, 0..<channels])))
     let head_head_weight = state_dict["head.head.weight"].to(torch.float)
@@ -684,6 +684,7 @@ graph.withNoGrad {
     }
   }
   let (wan, reader) = Wan(
+    // channels: 1536, layers: 30, intermediateSize: 8960, time: 21, height: 60, width: 104,
     channels: 5120, layers: 40, intermediateSize: 13824, time: 21, height: 60, width: 104,
     textLength: 512)
   let xTensor = graph.variable(
@@ -698,7 +699,7 @@ graph.withNoGrad {
   txtIn[0..<28, 0..<4096] = txt
   txtIn = txtIn.reshaped(.HWC(1, 512, 4096))
   let timestep = timeEmbedding(timesteps: 900, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-  let tGPU = graph.variable(Tensor<Float16>(from: timestep)).toGPU(2)
+  let tGPU = graph.variable(Tensor<Float>(from: timestep)).toGPU(2)
   let rotNdTensorGPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor).toGPU(2)
   wan.compile(inputs: xTensor, txtIn, tGPU, rotNdTensorGPU)
   reader(wan_state_dict)
