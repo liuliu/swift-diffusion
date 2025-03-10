@@ -3,18 +3,23 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/wan_v2.1_1.3b_480p_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/wan_v2.1_14b_720p_f16.ckpt",
   flags: .truncateWhenClose
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/wan_v2.1_1.3b_480p_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/wan_v2.1_14b_720p_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
-      guard let tensor = (store.read(key).map { Tensor<Float16>(from: $0).toCPU() }) else {
+      guard let anyTensor = store.read(key) else { continue }
+      guard anyTensor.dataType != .Float32 else {
+        // If it is already in FP32, skip transcode to FP16. Only useful for UMT5 XXL / Wan v2.1 models.
+        let tensor = Tensor<Float32>(anyTensor).toCPU()
+        $0.write(key, tensor: tensor)
         continue
       }
+      let tensor = Tensor<Float16>(from: anyTensor).toCPU()
       if key.contains("__stage_c_fixed__") && (key.contains("key") || key.contains("value")) {
         continue
       }

@@ -186,9 +186,9 @@ let context = graph.withNoGrad {
   let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
   textModel.compile(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/umt5_xxl_encoder_f16.ckpt", flags: [.readOnly]
+    "/home/liu/workspace/swift-diffusion/umt5_xxl_encoder_q8p.ckpt", flags: [.readOnly]
   ) {
-    $0.read("text_model", model: textModel)
+    $0.read("text_model", model: textModel, codec: [.jit, .q8p, .ezm7])
   }
   var output = textModel(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)[0]
     .as(of: Float16.self)
@@ -390,8 +390,8 @@ let z = graph.withNoGrad {
     }
   }
   let (wan, reader) = Wan(
-    // channels: 1536, layers: 30, intermediateSize: 8960, time: 21, height: 60, width: 104,
-    channels: 5120, layers: 40, intermediateSize: 13824, time: 21, height: 60, width: 104,
+    channels: 1536, layers: 30, intermediateSize: 8960, time: 21, height: 60, width: 104,
+    // channels: 5120, layers: 40, intermediateSize: 13824, time: 21, height: 60, width: 104,
     textLength: 512)
   var xTensor = graph.variable(.GPU(0), .HWC(1, 21 * 30 * 52, 16 * 2 * 2), of: Float16.self)
   xTensor.randn()
@@ -410,9 +410,9 @@ let z = graph.withNoGrad {
   let rotNdTensorGPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor).toGPU(0)
   wan.compile(inputs: xTensor, txtIn, tGPU, rotNdTensorGPU)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/wan_v2.1_14b_720p_f16.ckpt", flags: [.readOnly]
+    "/home/liu/workspace/swift-diffusion/wan_v2.1_1.3b_480p_q8p.ckpt", flags: [.readOnly]
   ) {
-    $0.read("dit", model: wan)
+    $0.read("dit", model: wan, codec: [.jit, .q8p, .ezm7])
   }
   let samplingSteps = 30
   for i in (1...samplingSteps).reversed() {
@@ -442,87 +442,139 @@ let z = graph.withNoGrad {
   return z
 }
 
-func ResnetBlockCausal3D(
-  prefix: String, inChannels: Int, outChannels: Int, shortcut: Bool, depth: Int, height: Int,
-  width: Int
-) -> (
-  (PythonObject) -> Void, Model
-) {
-  let x = Input()
-  let norm1 = RMSNorm(epsilon: 1e-6, axis: [0], name: "resnet_norm1")
-  var out = norm1(x.reshaped([inChannels, depth, height, width])).reshaped([
-    1, inChannels, depth, height, width,
-  ])
-  out = out.swish()
-  let conv1 = Convolution(
-    groups: 1, filters: outChannels, filterSize: [3, 3, 3],
-    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
-    name: "resnet_conv1")
-  out = conv1(out.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
-  let norm2 = RMSNorm(epsilon: 1e-6, axis: [0], name: "resnet_norm2")
-  out = norm2(out.reshaped([outChannels, depth, height, width])).reshaped([
-    1, outChannels, depth, height, width,
-  ])
-  out = out.swish()
-  let conv2 = Convolution(
-    groups: 1, filters: outChannels, filterSize: [3, 3, 3],
-    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
-    name: "resnet_conv2")
-  out = conv2(out.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
-  let ninShortcut: Model?
-  if shortcut {
-    let nin = Convolution(
-      groups: 1, filters: outChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
-      name: "resnet_shortcut")
-    out = nin(x) + out
-    ninShortcut = nin
-  } else {
-    ninShortcut = nil
-    out = x + out
+struct ResnetBlockCausal3D {
+  private let norm1: Model
+  private let conv1: Model
+  private let norm2: Model
+  private let conv2: Model
+  private let ninShortcut: Model?
+  init(outChannels: Int, shortcut: Bool) {
+    norm1 = RMSNorm(epsilon: 1e-6, axis: [0], name: "resnet_norm1")
+    conv1 = Convolution(
+      groups: 1, filters: outChannels, filterSize: [3, 3, 3],
+      hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+      name: "resnet_conv1")
+    norm2 = RMSNorm(epsilon: 1e-6, axis: [0], name: "resnet_norm2")
+    conv2 = Convolution(
+      groups: 1, filters: outChannels, filterSize: [3, 3, 3],
+      hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+      name: "resnet_conv2")
+    if shortcut {
+      ninShortcut = Convolution(
+        groups: 1, filters: outChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+        name: "resnet_shortcut")
+    } else {
+      ninShortcut = nil
+    }
   }
-  let reader: (PythonObject) -> Void = { state_dict in
+  private var conv1Inputs: Model.IO? = nil
+  private var conv2Inputs: Model.IO? = nil
+  mutating func callAsFunction(
+    input x: Model.IO, prefix: String, inChannels: Int, outChannels: Int, shortcut: Bool,
+    depth: Int, height: Int, width: Int, inputsOnly: Bool
+  ) -> (
+    (PythonObject) -> Void, Model.IO
+  ) {
+    var out = norm1(x.reshaped([inChannels, depth, height, width]))
+    var pre = out.swish()
+    if let conv1Inputs = conv1Inputs {
+      out = conv1(
+        Functional.concat(axis: 1, conv1Inputs, pre).reshaped([
+          1, inChannels, depth + 2, height, width,
+        ]).padded(.zero, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
+    } else {
+      out = conv1(
+        pre.reshaped([
+          1, inChannels, depth, height, width,
+        ]).padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+    }
+    if !inputsOnly {
+      conv1Inputs = pre.reshaped(
+        [inChannels, 2, height, width], offset: [0, depth - 2, 0, 0],
+        strides: [depth * height * width, height * width, width, 1]
+      ).contiguous()
+    } else {
+      conv1Inputs = nil
+    }
+    out = norm2(out.reshaped([outChannels, depth, height, width]))
+    pre = out.swish()
+    if let conv2Inputs = conv2Inputs {
+      out = conv2(
+        Functional.concat(axis: 1, conv2Inputs, pre).reshaped([
+          1, outChannels, depth + 2, height, width,
+        ]).padded(.zero, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
+    } else {
+      out = conv2(
+        pre.reshaped([
+          1, outChannels, depth, height, width,
+        ]).padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+    }
+    if !inputsOnly {
+      conv2Inputs = pre.reshaped(
+        [outChannels, 2, height, width], offset: [0, depth - 2, 0, 0],
+        strides: [depth * height * width, height * width, width, 1]
+      ).contiguous()
+    } else {
+      conv2Inputs = nil
+    }
+    if let ninShortcut = ninShortcut {
+      out = ninShortcut(x) + out
+    } else {
+      out = x + out
+    }
+    let reader: (PythonObject) -> Void = { state_dict in
+    }
+    return (reader, out)
   }
-  return (reader, Model([x], [out]))
 }
 
-func AttnBlockCausal3D(
-  prefix: String, inChannels: Int, depth: Int, height: Int, width: Int
-) -> (
-  (PythonObject) -> Void, Model
-) {
-  let x = Input()
-  let norm = RMSNorm(epsilon: 1e-6, axis: [0], name: "attn_norm")
-  var out = norm(x.reshaped([inChannels, depth, height, width])).reshaped([
-    1, inChannels, depth, height, width,
-  ])
-  let hw = width * height
-  let tokeys = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
-    name: "to_k")
-  let k = tokeys(out).reshaped([inChannels, depth, hw]).transposed(0, 1)
-  let toqueries = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
-    name: "to_q")
-  let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
-    inChannels, depth, hw,
-  ]).transposed(0, 1)
-  var dot =
-    Matmul(transposeA: (1, 2))(q, k)
-  dot = dot.reshaped([depth * hw, hw])
-  dot = dot.softmax()
-  dot = dot.reshaped([depth, hw, hw])
-  let tovalues = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
-    name: "to_v")
-  let v = tovalues(out).reshaped([inChannels, depth, hw]).transposed(0, 1)
-  out = Matmul(transposeB: (1, 2))(v, dot)
-  let projOut = Convolution(
-    groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
-    name: "proj_out")
-  out = x + projOut(out.transposed(0, 1).reshaped([1, inChannels, depth, height, width]))
-  let reader: (PythonObject) -> Void = { state_dict in
+struct AttnBlockCausal3D {
+  let norm: Model
+  let toqueries: Model
+  let tokeys: Model
+  let tovalues: Model
+  let projOut: Model
+  init(inChannels: Int) {
+    norm = RMSNorm(epsilon: 1e-6, axis: [0], name: "attn_norm")
+    tokeys = Convolution(
+      groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+      name: "to_k")
+    toqueries = Convolution(
+      groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+      name: "to_q")
+    tovalues = Convolution(
+      groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+      name: "to_v")
+    projOut = Convolution(
+      groups: 1, filters: inChannels, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+      name: "proj_out")
   }
-  return (reader, Model([x], [out]))
+  func callAsFunction(
+    prefix: String, inChannels: Int, depth: Int, height: Int, width: Int
+  ) -> (
+    (PythonObject) -> Void, Model
+  ) {
+    let x = Input()
+    var out = norm(x.reshaped([inChannels, depth, height, width])).reshaped([
+      1, inChannels, depth, height, width,
+    ])
+    let hw = width * height
+    let k = tokeys(out).reshaped([inChannels, depth, hw]).transposed(0, 1)
+    let q = ((1.0 / Float(inChannels).squareRoot()) * toqueries(out)).reshaped([
+      inChannels, depth, hw,
+    ]).transposed(0, 1)
+    var dot =
+      Matmul(transposeA: (1, 2))(q, k)
+    dot = dot.reshaped([depth * hw, hw])
+    dot = dot.softmax()
+    dot = dot.reshaped([depth, hw, hw])
+    let v = tovalues(out).reshaped([inChannels, depth, hw]).transposed(0, 1)
+    out = Matmul(transposeB: (1, 2))(v, dot)
+    out = x + projOut(out.transposed(0, 1).reshaped([1, inChannels, depth, height, width]))
+    let reader: (PythonObject) -> Void = { state_dict in
+    }
+    return (reader, Model([x], [out]))
+  }
 }
 
 func DecoderCausal3D(
@@ -534,102 +586,219 @@ func DecoderCausal3D(
   let x = Input()
   var previousChannel = channels[channels.count - 1]
   let postQuantConv = Convolution(
-    groups: 1, filters: 16, filterSize: [1, 1, 1], name: "post_quant_conv")
-  var out = postQuantConv(x)
+    groups: 1, filters: 16, filterSize: [1, 1, 1], hint: Hint(stride: [1, 1, 1]),
+    name: "post_quant_conv")
+  let postQuantX = postQuantConv(x)
   let convIn = Convolution(
     groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
     hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
     name: "conv_in")
-  out = convIn(out.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
-  let (midBlockReader1, midBlock1) = ResnetBlockCausal3D(
-    prefix: "decoder.middle.0", inChannels: previousChannel,
-    outChannels: previousChannel, shortcut: false, depth: startDepth, height: startHeight,
-    width: startWidth)
-  out = midBlock1(out)
-  let (midAttnReader1, midAttn1) = AttnBlockCausal3D(
-    prefix: "decoder.middle.1", inChannels: previousChannel, depth: startDepth,
-    height: startHeight, width: startWidth)
-  out = midAttn1(out)
-  let (midBlockReader2, midBlock2) = ResnetBlockCausal3D(
-    prefix: "decoder.middle.2", inChannels: previousChannel,
-    outChannels: previousChannel, shortcut: false, depth: startDepth, height: startHeight,
-    width: startWidth)
-  out = midBlock2(out)
-  var width = startWidth
-  var height = startHeight
-  var depth = startDepth
-  var readers = [(PythonObject) -> Void]()
-  var k = 0
-  for (i, channel) in channels.enumerated().reversed() {
-    for _ in 0..<numRepeat + 1 {
-      let (reader, block) = ResnetBlockCausal3D(
-        prefix: "decoder.upsamples.\(k)",
-        inChannels: previousChannel, outChannels: channel,
-        shortcut: previousChannel != channel, depth: depth, height: height, width: width)
-      readers.append(reader)
-      out = block(out)
-      previousChannel = channel
-      k += 1
-    }
-    if i > 0 {
-      if i > 1 && startDepth > 1 {  // Need to bump up on the depth axis.
-        let first = out.reshaped(
-          [channel, 1, height, width], strides: [depth * height * width, height * width, width, 1]
-        ).contiguous()
-        let more = out.reshaped(
-          [channel, (depth - 1), height, width], offset: [0, 1, 0, 0],
-          strides: [depth * height * width, height * width, width, 1]
-        ).contiguous().reshaped([1, channel, depth - 1, height, width])
-        let timeConv = Convolution(
-          groups: 1, filters: channel * 2, filterSize: [3, 1, 1],
-          hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
-          name: "time_conv")
-        var expanded = timeConv(more.padded(.zero, begin: [0, 0, 2, 0, 0], end: [0, 0, 0, 0, 0]))
-        let upLayer = k
-        let reader: (PythonObject) -> Void = { state_dict in
-        }
-        readers.append(reader)
-        expanded = expanded.reshaped([2, channel, depth - 1, height, width]).permuted(1, 2, 0, 3, 4)
-          .contiguous().reshaped([channel, 2 * (depth - 1), height, width])
-        out = Functional.concat(axis: 1, first, expanded)
-        depth = 1 + (depth - 1) * 2
-        out = out.reshaped([1, channel, depth, height, width])
-      }
-      out = Upsample(.nearest, widthScale: 2, heightScale: 2)(
-        out.reshaped([channel, depth, height, width])
-      ).reshaped([1, channel, depth, height * 2, width * 2])
-      width *= 2
-      height *= 2
-      let conv2d = Convolution(
-        groups: 1, filters: channel / 2, filterSize: [1, 3, 3],
-        hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 1, 1], end: [0, 1, 1])),
-        name: "upsample")
-      out = conv2d(out)
-      previousChannel = channel / 2
-      let upLayer = k
-      let reader: (PythonObject) -> Void = { state_dict in
-      }
-      readers.append(reader)
-      k += 1
-    }
-  }
-  let normOut = RMSNorm(epsilon: 1e-6, axis: [0], name: "norm_out")
-  out = normOut(out.reshaped([channels[0], depth, height, width])).reshaped([
-    1, channels[0], depth, height, width,
-  ])
-  out = out.swish()
   let convOut = Convolution(
     groups: 1, filters: 3, filterSize: [3, 3, 3],
     hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
     name: "conv_out")
-  out = convOut(out.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
-  let reader: (PythonObject) -> Void = { state_dict in
-    midBlockReader1(state_dict)
-    midAttnReader1(state_dict)
-    midBlockReader2(state_dict)
-    for reader in readers {
-      reader(state_dict)
+  let normOut = RMSNorm(epsilon: 1e-6, axis: [0], name: "norm_out")
+  var finalOut: Model.IO? = nil
+  var midBlock1Builder = ResnetBlockCausal3D(outChannels: previousChannel, shortcut: false)
+  let midAttn1Builder = AttnBlockCausal3D(inChannels: previousChannel)
+  var midBlock2Builder = ResnetBlockCausal3D(outChannels: previousChannel, shortcut: false)
+  var upBlockBuilders = [ResnetBlockCausal3D]()
+  for (i, channel) in channels.enumerated().reversed() {
+    for _ in 0..<numRepeat + 1 {
+      upBlockBuilders.append(
+        ResnetBlockCausal3D(outChannels: channel, shortcut: previousChannel != channel))
+      previousChannel = channel
     }
+    if i > 0 {
+      previousChannel = channel / 2
+    }
+  }
+  let timeConvs = (0..<(channels.count - 2)).map { i in
+    return Convolution(
+      groups: 1, filters: channels[channels.count - i - 1] * 2, filterSize: [3, 1, 1],
+      hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+      name: "time_conv")
+  }
+  let upsampleConv2d = (0..<(channels.count - 1)).map { i in
+    return Convolution(
+      groups: 1, filters: channels[channels.count - i - 1] / 2, filterSize: [1, 3, 3],
+      hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 1, 1], end: [0, 1, 1])),
+      name: "upsample")
+  }
+  var timeInputs: [Model.IO?] = Array(repeating: nil, count: channels.count - 2)
+  var convOutInputs: Model.IO? = nil
+  for d in stride(from: 0, to: startDepth - 1, by: 2) {
+    previousChannel = channels[channels.count - 1]
+    var out: Model.IO
+    if d == 0 {
+      out = postQuantX.reshaped(
+        [1, 16, min(startDepth - d, 3), startHeight, startWidth], offset: [0, 0, d, 0, 0],
+        strides: [
+          16 * startDepth * startHeight * startWidth, startDepth * startHeight * startWidth,
+          startHeight * startWidth, startWidth, 1,
+        ]
+      ).contiguous()
+      out = convIn(out.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+    } else {
+      out = postQuantX.reshaped(
+        [1, 16, min(startDepth - (d - 1), 4), startHeight, startWidth],
+        offset: [0, 0, d - 1, 0, 0],
+        strides: [
+          16 * startDepth * startHeight * startWidth, startDepth * startHeight * startWidth,
+          startHeight * startWidth, startWidth, 1,
+        ]
+      ).contiguous()
+      if let last = finalOut {
+        out.add(dependencies: [last])
+      }
+      out = convIn(out.padded(.zero, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
+    }
+    let inputsOnly = startDepth - 1 - d <= 2  // This is the last one.
+    let startDepth = d > 0 ? min(startDepth - 1 - d, 2) : 3
+    let (midBlockReader1, midBlock1Out) = midBlock1Builder(
+      input: out,
+      prefix: "decoder.middle.0", inChannels: previousChannel,
+      outChannels: previousChannel, shortcut: false, depth: startDepth, height: startHeight,
+      width: startWidth, inputsOnly: inputsOnly)
+    out = midBlock1Out
+    let (midAttnReader1, midAttn1) = midAttn1Builder(
+      prefix: "decoder.middle.1", inChannels: previousChannel, depth: startDepth,
+      height: startHeight, width: startWidth)
+    out = midAttn1(out)
+    let (midBlockReader2, midBlock2Out) = midBlock2Builder(
+      input: out,
+      prefix: "decoder.middle.2", inChannels: previousChannel,
+      outChannels: previousChannel, shortcut: false, depth: startDepth, height: startHeight,
+      width: startWidth, inputsOnly: inputsOnly)
+    out = midBlock2Out
+    var width = startWidth
+    var height = startHeight
+    var depth = startDepth
+    var readers = [(PythonObject) -> Void]()
+    var j = 0
+    var k = 0
+    for (i, channel) in channels.enumerated().reversed() {
+      for _ in 0..<numRepeat + 1 {
+        let (reader, blockOut) = upBlockBuilders[j](
+          input: out,
+          prefix: "decoder.upsamples.\(k)",
+          inChannels: previousChannel, outChannels: channel,
+          shortcut: previousChannel != channel, depth: depth, height: height, width: width,
+          inputsOnly: inputsOnly)
+        readers.append(reader)
+        out = blockOut
+        previousChannel = channel
+        j += 1
+        k += 1
+      }
+      if i > 0 {
+        if i > 1 && startDepth > 1 {  // Need to bump up on the depth axis.
+          if d == 0 {  // Special case for first frame.
+            let first = out.reshaped(
+              [channel, 1, height, width],
+              strides: [depth * height * width, height * width, width, 1]
+            ).contiguous()
+            let more = out.reshaped(
+              [channel, (depth - 1), height, width], offset: [0, 1, 0, 0],
+              strides: [depth * height * width, height * width, width, 1]
+            ).contiguous()
+            var expanded: Model.IO
+            if let timeInputs = timeInputs[channels.count - i - 1] {
+              expanded = timeConvs[channels.count - i - 1](
+                Functional.concat(axis: 1, timeInputs, more).reshaped([
+                  1, channel, depth - 1 + 2, height, width,
+                ]))
+            } else {
+              expanded = timeConvs[channels.count - i - 1](
+                more.reshaped([1, channel, depth - 1, height, width]).padded(
+                  .zero, begin: [0, 0, 2, 0, 0], end: [0, 0, 0, 0, 0]))
+            }
+            if !inputsOnly {
+              timeInputs[channels.count - i - 1] = out.reshaped(
+                [channel, 2, height, width], offset: [0, depth - 2, 0, 0],
+                strides: [depth * height * width, height * width, width, 1]
+              ).contiguous()
+            }
+            let upLayer = k
+            let reader: (PythonObject) -> Void = { state_dict in
+            }
+            readers.append(reader)
+            expanded = expanded.reshaped([2, channel, depth - 1, height, width]).permuted(
+              1, 2, 0, 3, 4
+            )
+            .contiguous().reshaped([channel, 2 * (depth - 1), height, width])
+            out = Functional.concat(axis: 1, first, expanded)
+            depth = 1 + (depth - 1) * 2
+            out = out.reshaped([1, channel, depth, height, width])
+          } else {
+            let expanded: Model.IO
+            if let timeInputs = timeInputs[channels.count - i - 1] {
+              let more = out.reshaped([channel, depth, height, width])
+              expanded = timeConvs[channels.count - i - 1](
+                Functional.concat(axis: 1, timeInputs, more).reshaped([
+                  1, channel, depth + 2, height, width,
+                ]))
+            } else {
+              expanded = timeConvs[channels.count - i - 1](
+                out.reshaped([1, channel, depth, height, width]).padded(
+                  .zero, begin: [0, 0, 2, 0, 0], end: [0, 0, 0, 0, 0]))
+            }
+            if !inputsOnly {
+              timeInputs[channels.count - i - 1] = out.reshaped(
+                [channel, 2, height, width], offset: [0, depth - 2, 0, 0],
+                strides: [depth * height * width, height * width, width, 1]
+              ).contiguous()
+            }
+            let upLayer = k
+            let reader: (PythonObject) -> Void = { state_dict in
+            }
+            readers.append(reader)
+            out = expanded.reshaped([2, channel, depth, height, width]).permuted(1, 2, 0, 3, 4)
+              .contiguous().reshaped([1, channel, 2 * depth, height, width])
+            depth = depth * 2
+          }
+        }
+        out = Upsample(.nearest, widthScale: 2, heightScale: 2)(
+          out.reshaped([channel, depth, height, width])
+        ).reshaped([1, channel, depth, height * 2, width * 2])
+        width *= 2
+        height *= 2
+        out = upsampleConv2d[channels.count - i - 1](out)
+        previousChannel = channel / 2
+        let upLayer = k
+        let reader: (PythonObject) -> Void = { state_dict in
+        }
+        readers.append(reader)
+        k += 1
+      }
+    }
+    out = normOut(out.reshaped([channels[0], depth, height, width]))
+    let pre = out.swish()
+    if let convOutInputs = convOutInputs {
+      out = convOut(
+        Functional.concat(axis: 1, convOutInputs, pre).reshaped([
+          1, channels[0], depth + 2, height, width,
+        ]).padded(.zero, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
+    } else {
+      out = convOut(
+        pre.reshaped([
+          1, channels[0], depth, height, width,
+        ]).padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
+    }
+    if !inputsOnly {
+      convOutInputs = pre.reshaped(
+        [channels[0], 2, height, width], offset: [0, depth - 2, 0, 0],
+        strides: [depth * height * width, height * width, width, 1]
+      ).contiguous()
+    }
+    if let otherOut = finalOut {
+      finalOut = Functional.concat(axis: 2, otherOut, out)
+    } else {
+      finalOut = out
+    }
+  }
+  let out = finalOut!
+  let reader: (PythonObject) -> Void = { state_dict in
   }
   return (reader, Model([x], [out]))
 }
@@ -660,12 +829,15 @@ func EncoderCausal3D(
   var k = 0
   for (i, channel) in channels.enumerated() {
     for _ in 0..<numRepeat {
-      let (reader, block) = ResnetBlockCausal3D(
+      var builder = ResnetBlockCausal3D(outChannels: channel, shortcut: previousChannel != channel)
+      let (reader, blockOut) = builder(
+        input: out,
         prefix: "encoder.downsamples.\(k)", inChannels: previousChannel,
         outChannels: channel,
-        shortcut: previousChannel != channel, depth: depth, height: height, width: width)
+        shortcut: previousChannel != channel, depth: depth, height: height, width: width,
+        inputsOnly: true)
       readers.append(reader)
-      out = block(out)
+      out = blockOut
       previousChannel = channel
       k += 1
     }
@@ -703,20 +875,25 @@ func EncoderCausal3D(
       k += 1
     }
   }
-  let (midBlockReader1, midBlock1) = ResnetBlockCausal3D(
+  var midBlock1Builder = ResnetBlockCausal3D(outChannels: previousChannel, shortcut: false)
+  let (midBlockReader1, midBlock1Out) = midBlock1Builder(
+    input: out,
     prefix: "encoder.middle.0", inChannels: previousChannel,
     outChannels: previousChannel,
-    shortcut: false, depth: depth, height: height, width: width)
-  out = midBlock1(out)
-  let (midAttnReader1, midAttn1) = AttnBlockCausal3D(
+    shortcut: false, depth: depth, height: height, width: width, inputsOnly: true)
+  out = midBlock1Out
+  var midAttn1Builder = AttnBlockCausal3D(inChannels: previousChannel)
+  let (midAttnReader1, midAttn1) = midAttn1Builder(
     prefix: "encoder.middle.1", inChannels: previousChannel, depth: depth,
     height: height, width: width)
   out = midAttn1(out)
-  let (midBlockReader2, midBlock2) = ResnetBlockCausal3D(
+  var midBlock2Builder = ResnetBlockCausal3D(outChannels: previousChannel, shortcut: false)
+  let (midBlockReader2, midBlock2Out) = midBlock2Builder(
+    input: out,
     prefix: "encoder.middle.2", inChannels: previousChannel,
     outChannels: previousChannel,
-    shortcut: false, depth: depth, height: height, width: width)
-  out = midBlock2(out)
+    shortcut: false, depth: depth, height: height, width: width, inputsOnly: true)
+  out = midBlock2Out
   let normOut = RMSNorm(epsilon: 1e-6, axis: [0], name: "norm_out")
   out = normOut(out.reshaped([previousChannel, depth, height, width])).reshaped([
     1, previousChannel, depth, height, width,
@@ -753,21 +930,23 @@ graph.withNoGrad {
         2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
         3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
       ], kind: .GPU(0), format: .NCHW, shape: [1, 16, 1, 1, 1]))
-  let zTensor = (DynamicGraph.Tensor<Float>(from: z) .* std + mean)[
-    0..<1, 0..<16, 0..<3, 0..<60, 0..<104
-  ].copied()
+  let zTensor = DynamicGraph.Tensor<Float16>(
+    from: (DynamicGraph.Tensor<Float>(from: z) .* std + mean)[
+      0..<1, 0..<16, 0..<21, 0..<60, 0..<104
+    ].copied())
   debugPrint(zTensor)
   let (decoderReader, decoder) = DecoderCausal3D(
-    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 104, startHeight: 60, startDepth: 3)
+    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 104, startHeight: 60, startDepth: 21)
   decoder.compile(inputs: zTensor)
   graph.openStore(
     "/home/liu/workspace/swift-diffusion/wan_v2.1_video_vae_f32.ckpt", flags: [.readOnly]
   ) {
     $0.read("decoder", model: decoder)
   }
-  let image = decoder(inputs: zTensor)[0].as(of: Float.self).toCPU()
+  // DynamicGraph.logLevel = .verbose
+  let image = decoder(inputs: zTensor)[0].as(of: Float16.self).toCPU()
   debugPrint(image)
-  for k in 0..<9 {
+  for k in 0..<81 {
     var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: 104 * 8 * 60 * 8)
     for y in 0..<(60 * 8) {
       for x in 0..<(104 * 8) {
