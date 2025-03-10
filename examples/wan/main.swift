@@ -479,7 +479,7 @@ struct ResnetBlockCausal3D {
     var pre = out.swish()
     if let conv1Inputs = conv1Inputs {
       out = conv1(
-        Functional.concat(axis: 1, conv1Inputs, pre).reshaped([
+        Functional.concat(axis: 1, conv1Inputs, pre, flags: [.disableOpt]).reshaped([
           1, inChannels, depth + 2, height, width,
         ]).padded(.zero, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
     } else {
@@ -500,7 +500,7 @@ struct ResnetBlockCausal3D {
     pre = out.swish()
     if let conv2Inputs = conv2Inputs {
       out = conv2(
-        Functional.concat(axis: 1, conv2Inputs, pre).reshaped([
+        Functional.concat(axis: 1, conv2Inputs, pre, flags: [.disableOpt]).reshaped([
           1, outChannels, depth + 2, height, width,
         ]).padded(.zero, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
     } else {
@@ -654,26 +654,25 @@ func DecoderCausal3D(
       out = convIn(out.padded(.zero, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
     }
     let inputsOnly = startDepth - 1 - d <= 2  // This is the last one.
-    let startDepth = d > 0 ? min(startDepth - 1 - d, 2) : 3
+    var width = startWidth
+    var height = startHeight
+    var depth = d > 0 ? min(startDepth - 1 - d, 2) : 3
     let (midBlockReader1, midBlock1Out) = midBlock1Builder(
       input: out,
       prefix: "decoder.middle.0", inChannels: previousChannel,
-      outChannels: previousChannel, shortcut: false, depth: startDepth, height: startHeight,
-      width: startWidth, inputsOnly: inputsOnly)
+      outChannels: previousChannel, shortcut: false, depth: depth, height: height,
+      width: width, inputsOnly: inputsOnly)
     out = midBlock1Out
     let (midAttnReader1, midAttn1) = midAttn1Builder(
-      prefix: "decoder.middle.1", inChannels: previousChannel, depth: startDepth,
-      height: startHeight, width: startWidth)
+      prefix: "decoder.middle.1", inChannels: previousChannel, depth: depth,
+      height: height, width: width)
     out = midAttn1(out)
     let (midBlockReader2, midBlock2Out) = midBlock2Builder(
       input: out,
       prefix: "decoder.middle.2", inChannels: previousChannel,
-      outChannels: previousChannel, shortcut: false, depth: startDepth, height: startHeight,
-      width: startWidth, inputsOnly: inputsOnly)
+      outChannels: previousChannel, shortcut: false, depth: depth, height: height,
+      width: width, inputsOnly: inputsOnly)
     out = midBlock2Out
-    var width = startWidth
-    var height = startHeight
-    var depth = startDepth
     var readers = [(PythonObject) -> Void]()
     var j = 0
     var k = 0
@@ -702,17 +701,9 @@ func DecoderCausal3D(
               [channel, (depth - 1), height, width], offset: [0, 1, 0, 0],
               strides: [depth * height * width, height * width, width, 1]
             ).contiguous()
-            var expanded: Model.IO
-            if let timeInputs = timeInputs[channels.count - i - 1] {
-              expanded = timeConvs[channels.count - i - 1](
-                Functional.concat(axis: 1, timeInputs, more).reshaped([
-                  1, channel, depth - 1 + 2, height, width,
-                ]))
-            } else {
-              expanded = timeConvs[channels.count - i - 1](
-                more.reshaped([1, channel, depth - 1, height, width]).padded(
-                  .zero, begin: [0, 0, 2, 0, 0], end: [0, 0, 0, 0, 0]))
-            }
+            var expanded = timeConvs[channels.count - i - 1](
+              more.reshaped([1, channel, depth - 1, height, width]).padded(
+                .zero, begin: [0, 0, 2, 0, 0], end: [0, 0, 0, 0, 0]))
             if !inputsOnly {
               timeInputs[channels.count - i - 1] = out.reshaped(
                 [channel, 2, height, width], offset: [0, depth - 2, 0, 0],
@@ -730,19 +721,12 @@ func DecoderCausal3D(
             out = Functional.concat(axis: 1, first, expanded)
             depth = 1 + (depth - 1) * 2
             out = out.reshaped([1, channel, depth, height, width])
-          } else {
-            let expanded: Model.IO
-            if let timeInputs = timeInputs[channels.count - i - 1] {
-              let more = out.reshaped([channel, depth, height, width])
-              expanded = timeConvs[channels.count - i - 1](
-                Functional.concat(axis: 1, timeInputs, more).reshaped([
-                  1, channel, depth + 2, height, width,
-                ]))
-            } else {
-              expanded = timeConvs[channels.count - i - 1](
-                out.reshaped([1, channel, depth, height, width]).padded(
-                  .zero, begin: [0, 0, 2, 0, 0], end: [0, 0, 0, 0, 0]))
-            }
+          } else if let timeInput = timeInputs[channels.count - i - 1] {
+            let more = out.reshaped([channel, depth, height, width])
+            let expanded = timeConvs[channels.count - i - 1](
+              Functional.concat(axis: 1, timeInput, more, flags: [.disableOpt]).reshaped([
+                1, channel, depth + 2, height, width,
+              ]))
             if !inputsOnly {
               timeInputs[channels.count - i - 1] = out.reshaped(
                 [channel, 2, height, width], offset: [0, depth - 2, 0, 0],
@@ -776,7 +760,7 @@ func DecoderCausal3D(
     let pre = out.swish()
     if let convOutInputs = convOutInputs {
       out = convOut(
-        Functional.concat(axis: 1, convOutInputs, pre).reshaped([
+        Functional.concat(axis: 1, convOutInputs, pre, flags: [.disableOpt]).reshaped([
           1, channels[0], depth + 2, height, width,
         ]).padded(.zero, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
     } else {
@@ -792,7 +776,7 @@ func DecoderCausal3D(
       ).contiguous()
     }
     if let otherOut = finalOut {
-      finalOut = Functional.concat(axis: 2, otherOut, out)
+      finalOut = Functional.concat(axis: 2, otherOut, out, flags: [.disableOpt])
     } else {
       finalOut = out
     }
