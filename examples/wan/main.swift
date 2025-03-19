@@ -182,7 +182,7 @@ let context = graph.withNoGrad {
   for i in 0..<256 {
     attentionMask[0, 0, 0, i] = i < tokens.count ? 0 : -Float16.greatestFiniteMagnitude
   }
-  let attentionMaskGPU = graph.variable(attentionMask.toGPU(0))
+  var attentionMaskGPU = graph.variable(attentionMask.toGPU(0))
   let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
   textModel.compile(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)
   graph.openStore(
@@ -193,6 +193,10 @@ let context = graph.withNoGrad {
   var output = textModel(inputs: tokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)[0]
     .as(of: Float16.self)
   let context = output[0..<tokens.count, 0..<4096].copied()
+  for i in 0..<256 {
+    attentionMask[0, 0, 0, i] = i < negativeTokens.count ? 0 : -Float16.greatestFiniteMagnitude
+  }
+  attentionMaskGPU = graph.variable(attentionMask.toGPU(0))
   output = textModel(inputs: negativeTokensTensorGPU, attentionMaskGPU, relativePositionBucketsGPU)[
     0
   ]
@@ -414,7 +418,7 @@ let z = graph.withNoGrad {
   ) {
     $0.read("dit", model: wan, codec: [.jit, .q8p, .ezm7])
   }
-  let samplingSteps = 30
+  let samplingSteps = 50
   for i in (1...samplingSteps).reversed() {
     let t = Float(i) / Float(samplingSteps) * 1_000
     let tGPU = graph.variable(
@@ -431,7 +435,7 @@ let z = graph.withNoGrad {
         of: Float16.self)
     vu = vu.reshaped(format: .NCHW, shape: [1, 21 * 30 * 52, 2, 2, 16]).permuted(0, 1, 4, 2, 3)
       .contiguous().reshaped(.CHW(1, 21 * 30 * 52, 16 * 2 * 2))
-    let v = vu + 6 * (vc - vu)
+    let v = vu + 5 * (vc - vu)
     xTensor = xTensor - (1 / Float(samplingSteps)) * v
     debugPrint(xTensor)
   }

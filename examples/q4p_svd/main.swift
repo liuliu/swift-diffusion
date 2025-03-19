@@ -9,23 +9,23 @@ let torch = Python.import("torch")
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/draw-things-community/skyreels_v1_hunyuan_i2v_f16.ckpt",
+  "/fast/Data/SD/wan_v2.1_14b_720p_f16.ckpt",
   // "/fast/Data/SD/flux_1_dev_f16.ckpt",
   flags: .readOnly
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/draw-things-community/skyreels_v1_hunyuan_i2v_q5p.ckpt",
+    "/fast/Data/SD/wan_v2.1_14b_720p_q5p.ckpt",
     // "/fast/Data/SD/flux_1_dev_q5p.ckpt",
     flags: .readOnly
   ) { bench in
     graph.openStore(
-      "/home/liu/workspace/draw-things-community/skyreels_v1_hunyuan_i2v_q5p_svd.ckpt",
+      "/fast/Data/SD/wan_v2.1_14b_720p_q5p_svd.ckpt",
       // "/home/liu/workspace/swift-diffusion/flux_1_dev_q5p_svd.ckpt",
       flags: .truncateWhenClose
     ) { writer in
       graph.openStore(
-        "/home/liu/workspace/draw-things-community/skyreels_v1_hunyuan_i2v_q5p.ckpt",
+        "/fast/Data/SD/wan_v2.1_14b_720p_q5p.ckpt",
         // "/fast/Data/SD/flux_1_dev_q5p.ckpt",
         flags: .readOnly
       ) {

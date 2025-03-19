@@ -8,7 +8,7 @@ graph.openStore(
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/wan_v2.1_14b_720p_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/wan_v2.1_14b_720p_q5p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -90,7 +90,7 @@ graph.openStore(
         continue
       }
       if shape.count == 2 && n > 1 {
-        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+        $0.write(key, tensor: tensor, codec: [.q5p, .ezm7])
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
       } else {
