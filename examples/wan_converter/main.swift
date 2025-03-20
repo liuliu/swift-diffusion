@@ -16,11 +16,14 @@ torch.cuda.manual_seed_all(42)
 
 let wan = Python.import("wan")
 let wan_utils_utils = Python.import("wan.utils.utils")
+let Image = Python.import("PIL.Image")
+let torch_nn_functional = Python.import("torch.nn.functional")
+let torchvision_transforms_functional = Python.import("torchvision.transforms.functional")
 
-let cfg = wan.configs.WAN_CONFIGS["t2v-14B"]
-let wan_t2v = wan.WanT2V(
+let cfg = wan.configs.WAN_CONFIGS["i2v-14B"]
+let wan_i2v = wan.WanI2V(
   config: cfg,
-  checkpoint_dir: "/home/liu/workspace/Wan2.1/Wan2.1-T2V-14B",
+  checkpoint_dir: "/home/liu/workspace/Wan2.1/Wan2.1-I2V-14B-720P",
   device_id: 0,
   rank: 0,
   t5_fsdp: false,
@@ -29,9 +32,158 @@ let wan_t2v = wan.WanT2V(
   t5_cpu: false
 )
 
-wan_t2v.text_encoder.model.cpu()
+var img = Image.open("/home/liu/workspace/Wan2.1/examples/i2v_input.JPG").convert("RGB")
+img = torchvision_transforms_functional.to_tensor(img).sub_(0.5).div_(0.5).to(wan_i2v.device)
 
-let text_encoder_state_dict = wan_t2v.text_encoder.model.state_dict()
+let visual_state_dict = wan_i2v.clip.model.visual.state_dict()
+/*
+img = img[Python.slice(Python.None, Python.None, Python.None), Python.None, Python.slice(Python.None, Python.None, Python.None), Python.slice(Python.None, Python.None, Python.None)]
+let clip_context = wan_i2v.clip.visual([img])
+let resized = torch_nn_functional.interpolate(img.transpose(0, 1), size: [224, 224], mode: "bicubic", align_corners: false)
+let transformed = wan_i2v.clip.transforms.transforms[-1](resized.mul_(0.5).add_(0.5))
+print(transformed.shape)
+print(clip_context)
+print(visual_state_dict.keys())
+*/
+
+func CLIPSelfAttention(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model, Model, Model) {
+  let x = Input()
+  let tokeys = Dense(count: k * h)
+  let toqueries = Dense(count: k * h)
+  let tovalues = Dense(count: k * h)
+  let keys = tokeys(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t, h, k])
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys)
+  dot = dot.reshaped([b * h * t, t])
+  dot = dot.softmax()
+  dot = dot.reshaped([b, h, t, t])
+  var out = dot * values
+  out = out.reshaped([b, h, t, k]).transposed(1, 2).reshaped([b * t, h * k])
+  let unifyheads = Dense(count: k * h)
+  out = unifyheads(out)
+  return (toqueries, tokeys, tovalues, unifyheads, Model([x], [out]))
+}
+
+func CLIPResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let ln1 = LayerNorm(epsilon: 1e-5, axis: [2])
+  let (toqueries, tokeys, tovalues, unifyheads, attention) = CLIPSelfAttention(
+    k: k, h: h, b: b, t: t)
+  var out = x.reshaped([b * t, h * k]) + attention(ln1(x))
+  let ln2 = LayerNorm(epsilon: 1e-5, axis: [1])
+  let fc = Dense(count: k * h * 4)
+  let gelu = GELU()
+  let proj = Dense(count: k * h)
+  out = out + proj(gelu(fc(ln2(out))))
+  let reader: (PythonObject) -> Void = { state_dict in
+    let ln_1_weight = state_dict["\(prefix).norm1.weight"].type(torch.float).cpu().numpy()
+    let ln_1_bias = state_dict["\(prefix).norm1.bias"].type(torch.float).cpu().numpy()
+    ln1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: ln_1_weight))
+    ln1.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ln_1_bias))
+    let in_proj_weight = state_dict["\(prefix).attn.to_qkv.weight"].type(torch.float).cpu().numpy()
+    let in_proj_bias = state_dict["\(prefix).attn.to_qkv.bias"].type(torch.float).cpu().numpy()
+    toqueries.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: in_proj_weight[..<(k * h), ...]))
+    toqueries.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: in_proj_bias[..<(k * h)]))
+    tokeys.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: in_proj_weight[(k * h)..<(2 * k * h), ...]))
+    tokeys.parameters(for: .bias).copy(
+      from: try! Tensor<Float>(numpy: in_proj_bias[(k * h)..<(2 * k * h)]))
+    tovalues.parameters(for: .weight).copy(
+      from: try! Tensor<Float>(numpy: in_proj_weight[(2 * k * h)..., ...]))
+    tovalues.parameters(for: .bias).copy(
+      from: try! Tensor<Float>(numpy: in_proj_bias[(2 * k * h)...]))
+    let out_proj_weight = state_dict["\(prefix).attn.proj.weight"].type(torch.float).cpu()
+      .numpy()
+    let out_proj_bias = state_dict["\(prefix).attn.proj.bias"].type(torch.float).cpu().numpy()
+    unifyheads.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: out_proj_weight))
+    unifyheads.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: out_proj_bias))
+    let ln_2_weight = state_dict["\(prefix).norm2.weight"].type(torch.float).cpu().numpy()
+    let ln_2_bias = state_dict["\(prefix).norm2.bias"].type(torch.float).cpu().numpy()
+    ln2.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: ln_2_weight))
+    ln2.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ln_2_bias))
+    let c_fc_weight = state_dict["\(prefix).mlp.0.weight"].type(torch.float).cpu().numpy()
+    let c_fc_bias = state_dict["\(prefix).mlp.0.bias"].type(torch.float).cpu().numpy()
+    fc.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: c_fc_weight))
+    fc.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: c_fc_bias))
+    let c_proj_weight = state_dict["\(prefix).mlp.2.weight"].type(torch.float).cpu().numpy()
+    let c_proj_bias = state_dict["\(prefix).mlp.2.bias"].type(torch.float).cpu().numpy()
+    proj.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: c_proj_weight))
+    proj.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: c_proj_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+func VisionTransformer<T: TensorNumeric>(
+  _ dataType: T.Type,
+  grid: Int, width: Int, layers: Int, heads: Int, batchSize: Int
+) -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  let classEmbedding = Parameter<T>(.GPU(0), .HWC(1, 1, width))
+  let positionalEmbedding = Parameter<T>(.GPU(0), .HWC(1, grid * grid + 1, width))
+  let conv1 = Convolution(
+    groups: 1, filters: width, filterSize: [14, 14], noBias: true,
+    hint: Hint(stride: [14, 14]))
+  var out = conv1(x).reshaped([batchSize, width, grid * grid]).transposed(1, 2)
+  out = Functional.concat(axis: 1, classEmbedding, out)
+  out = out + positionalEmbedding
+  let lnPre = LayerNorm(epsilon: 1e-5, axis: [2])
+  out = lnPre(out)
+  var readers = [(PythonObject) -> Void]()
+  for i in 0..<layers {
+    let (reader, block) = CLIPResidualAttentionBlock(
+      prefix: "transformer.\(i)", k: width / heads, h: heads, b: batchSize,
+      t: grid * grid + 1)
+    out = block(out.reshaped([batchSize, grid * grid + 1, width]))
+    readers.append(reader)
+  }
+  let lnPost = LayerNorm(epsilon: 1e-5, axis: [1], name: "post_layernorm")
+  out = lnPost(out.reshaped([batchSize, width], strides: [width, 1]))
+  let reader: (PythonObject) -> Void = { state_dict in
+    let class_embedding = state_dict["cls_embedding"].type(torch.float).cpu().numpy()
+    classEmbedding.weight.copy(from: try! Tensor<Float>(numpy: class_embedding))
+    let positional_embedding = state_dict["pos_embedding"].type(torch.float).cpu().numpy()
+    positionalEmbedding.weight.copy(from: try! Tensor<Float>(numpy: positional_embedding))
+    let conv1_weight = state_dict["patch_embedding.weight"].type(torch.float).cpu().numpy()
+    conv1.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: conv1_weight))
+    let ln_pre_weight = state_dict["pre_norm.weight"].type(torch.float).cpu().numpy()
+    let ln_pre_bias = state_dict["pre_norm.bias"].type(torch.float).cpu().numpy()
+    lnPre.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: ln_pre_weight))
+    lnPre.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ln_pre_bias))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let ln_post_weight = state_dict["post_norm.weight"].type(torch.float).cpu().numpy()
+    let ln_post_bias = state_dict["post_norm.bias"].type(torch.float).cpu().numpy()
+    lnPost.parameters(for: .weight).copy(from: try! Tensor<Float>(numpy: ln_post_weight))
+    lnPost.parameters(for: .bias).copy(from: try! Tensor<Float>(numpy: ln_post_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+graph.withNoGrad {
+  /*
+  let imgTensor = graph.variable(try! Tensor<Float>(numpy: transformed.cpu().numpy())).toGPU(0)
+  let (reader, vit) = VisionTransformer(
+    Float.self,
+    grid: 16, width: 1280, layers: 32, heads: 16, batchSize: 1)
+  let _ = vit(inputs: imgTensor)
+  reader(visual_state_dict)
+  let out = vit(inputs: imgTensor)[0].as(of: Float.self).toCPU()
+  debugPrint(out)
+  // graph.openStore("/home/liu/workspace/swift-diffusion/open_clip_xlm_roberta_large_vit_h14_f32.ckpt") {
+  //   $0.write("vision_model", model: vit)
+  // }
+  */
+}
+
+wan_i2v.text_encoder.model.cpu()
+
+let text_encoder_state_dict = wan_i2v.text_encoder.model.state_dict()
 
 let prompt =
   "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
@@ -244,13 +396,19 @@ torch.set_autocast_enabled("cuda", true)
 torch.set_autocast_dtype("cuda", torch.bfloat16)
 
 let x = torch.randn([16, 21, 60, 104]).to(torch.float).cuda()
+let y = torch.randn([20, 21, 60, 104]).to(torch.float).cuda()
 let t = torch.tensor([900], dtype: torch.float, device: torch.device("cuda:0"))
 let context = torch.randn([28, 4096]).to(torch.float).cuda()
-// let out = wan_t2v.model([x], t, [context], 21 * 30 * 52)
+let clip_fea = torch.randn([1, 257, 1280]).to(torch.float).cuda()
+print(wan_i2v.model)
+/*
+wan_i2v.model.half().to(torch.device("cuda:0"))
+let out = wan_i2v.model([x], t, [context], 21 * 30 * 52, clip_fea, [y])
+*/
 // print(out)
-print(wan_t2v.model)
 
-let wan_state_dict = wan_t2v.model.state_dict()
+let wan_state_dict = wan_i2v.model.state_dict()
+print(wan_state_dict.keys())
 
 func FeedForward(hiddenSize: Int, intermediateSize: Int, upcast: Bool, name: String) -> (
   Model, Model, Model
@@ -277,6 +435,7 @@ func WanAttentionBlock(
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let context = Input()
+  let contextImg = Input()
   let c = (0..<6).map { _ in Input() }
   let rot = Input()
   let modulations = (0..<6).map {
@@ -319,8 +478,18 @@ func WanAttentionBlock(
   let crossAttention = ScaledDotProductAttention(
     scale: 1 / Float(k).squareRoot(), flags: [.Float16])
   let crossOut = crossAttention(cQ, cK, cV).reshaped([b, hw, k * h])
+  let contextImgToKeys = Dense(count: k * h, name: "c_img_k")
+  let contextImgToValues = Dense(count: k * h, name: "c_img_v")
+  var cImgK = contextImgToKeys(contextImg)
+  let contextImgNormK = RMSNorm(epsilon: 1e-6, axis: [2], name: "c_img_norm_k")
+  cImgK = contextImgNormK(cImgK).reshaped([b, 257, h, k])
+  let cImgV = contextImgToValues(contextImg).reshaped([b, 257, h, k])
+  let crossAttentionImg = ScaledDotProductAttention(
+    scale: 1 / Float(k).squareRoot(), flags: [.Float16])
+  let crossOutImg = crossAttentionImg(cQ, cImgK, cImgV).reshaped([b, hw, k * h])
+  crossOutImg.add(dependencies: [crossOut])
   let contextUnifyheads = Dense(count: k * h, name: "c_o")
-  out = out + contextUnifyheads(crossOut).to(of: out)
+  out = out + contextUnifyheads(crossOut + crossOutImg).to(of: out)
   let xNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   let (xLinear1, xOutProjection, xFF) = FeedForward(
     hiddenSize: k * h, intermediateSize: intermediateSize, upcast: false, name: "x")
@@ -445,6 +614,36 @@ func WanAttentionBlock(
       ).cpu().numpy()
     contextNormQ.weight.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: cross_attn_norm_q_weight)))
+    let cross_attn_k_img_weight = state_dict["\(prefix).cross_attn.k_img.weight"]
+      .to(
+        torch.float
+      ).cpu().numpy()
+    let cross_attn_k_img_bias = state_dict["\(prefix).cross_attn.k_img.bias"]
+      .to(
+        torch.float
+      ).cpu().numpy()
+    contextImgToKeys.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: cross_attn_k_img_weight)))
+    contextImgToKeys.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: cross_attn_k_img_bias)))
+    let cross_attn_v_img_weight = state_dict["\(prefix).cross_attn.v_img.weight"]
+      .to(
+        torch.float
+      ).cpu().numpy()
+    let cross_attn_v_img_bias = state_dict["\(prefix).cross_attn.v_img.bias"]
+      .to(
+        torch.float
+      ).cpu().numpy()
+    contextImgToValues.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: cross_attn_v_img_weight)))
+    contextImgToValues.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: cross_attn_v_img_bias)))
+    let cross_attn_norm_k_img_weight = state_dict["\(prefix).cross_attn.norm_k_img.weight"]
+      .to(
+        torch.float
+      ).cpu().numpy()
+    contextImgNormK.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: cross_attn_norm_k_img_weight)))
     let cross_attn_o_weight = state_dict["\(prefix).cross_attn.o.weight"]
       .to(
         torch.float
@@ -494,7 +693,7 @@ func WanAttentionBlock(
     xOutProjection.bias.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ffn_2_bias)))
   }
-  return (reader, Model([x, context, rot] + c, [out]))
+  return (reader, Model([x, context, contextImg, rot] + c, [out]))
 }
 
 func TimeEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
@@ -515,12 +714,25 @@ func MLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
   return (fc0, fc2, Model([x], [out]))
 }
 
+func MLPProj(inChannels: Int, outChannels: Int, name: String) -> (Model, Model, Model, Model, Model)
+{
+  let x = Input()
+  let ln1 = LayerNorm(epsilon: 1e-5, axis: [2], name: "\(name)_layer_norm_0")
+  let fc0 = Dense(count: inChannels, name: "\(name)_embedder_0")
+  var out = fc0(ln1(x)).GELU()
+  let fc2 = Dense(count: outChannels, name: "\(name)_embedder_1")
+  let ln2 = LayerNorm(epsilon: 1e-5, axis: [2], name: "\(name)_layer_norm_1")
+  out = ln2(fc2(out))
+  return (ln1, ln2, fc0, fc2, Model([x], [out]))
+}
+
 func Wan(
   channels: Int, layers: Int, intermediateSize: Int, time: Int, height: Int, width: Int,
   textLength: Int
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let imgIn = Dense(count: channels, name: "x_embedder")
+  let clip = Input()
   var out = imgIn(x)
   let txt = Input()
   let (cLinear1, cLinear2, contextEmbedder) = MLPEmbedder(channels: channels, name: "c")
@@ -528,6 +740,9 @@ func Wan(
   let t = Input()
   let rot = Input()
   let (timeInMlp0, timeInMlp2, timeIn) = TimeEmbedder(channels: channels, name: "t")
+  let (clipLn1, clipLn2, clipMlp0, clipMlp2, clipIn) = MLPProj(
+    inChannels: 1280, outChannels: channels, name: "clip")
+  let clipContext = clipIn(clip)
   let vector = timeIn(t).reshaped([1, 1, channels])
   let vectorIn = vector.swish()
   let timeProjections = (0..<6).map { Dense(count: channels, name: "ada_ln_\($0)") }
@@ -540,7 +755,7 @@ func Wan(
     let (reader, block) = WanAttentionBlock(
       prefix: "blocks.\(i)", k: 128, h: channels / 128, b: 1, t: textLength, hw: time * h * w,
       intermediateSize: intermediateSize)
-    out = block([out, context, rot] + tOut)
+    out = block([out, context, clipContext, rot] + tOut)
     readers.append(reader)
   }
   let scale = Parameter<Float>(.GPU(2), .HWC(1, 1, channels), name: "ada_ln_0")
@@ -595,6 +810,42 @@ func Wan(
       from: Tensor<Float>(from: try! Tensor<Float>(numpy: time_embedding_2_weight)))
     timeInMlp2.bias.copy(
       from: Tensor<Float>(from: try! Tensor<Float>(numpy: time_embedding_2_bias)))
+    let img_emb_proj_0_weight = state_dict["img_emb.proj.0.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let img_emb_proj_0_bias = state_dict["img_emb.proj.0.bias"].to(torch.float)
+      .cpu().numpy()
+    clipLn1.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_0_weight)))
+    clipLn1.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_0_bias)))
+    let img_emb_proj_1_weight = state_dict["img_emb.proj.1.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let img_emb_proj_1_bias = state_dict["img_emb.proj.1.bias"].to(torch.float)
+      .cpu().numpy()
+    clipMlp0.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_1_weight)))
+    clipMlp0.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_1_bias)))
+    let img_emb_proj_3_weight = state_dict["img_emb.proj.3.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let img_emb_proj_3_bias = state_dict["img_emb.proj.3.bias"].to(torch.float)
+      .cpu().numpy()
+    clipMlp2.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_3_weight)))
+    clipMlp2.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_3_bias)))
+    let img_emb_proj_4_weight = state_dict["img_emb.proj.4.weight"].to(
+      torch.float
+    ).cpu().numpy()
+    let img_emb_proj_4_bias = state_dict["img_emb.proj.4.bias"].to(torch.float)
+      .cpu().numpy()
+    clipLn2.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_4_weight)))
+    clipLn2.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_4_bias)))
     let time_projection_1_weight = state_dict["time_projection.1.weight"].to(
       torch.float
     ).cpu().numpy()
@@ -632,7 +883,7 @@ func Wan(
     projOut.bias.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: head_head_bias)))
   }
-  return (Model([x, txt, t, rot], [out]), reader)
+  return (Model([x, txt, clip, t, rot], [out]), reader)
 }
 
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
@@ -688,9 +939,11 @@ graph.withNoGrad {
     channels: 5120, layers: 40, intermediateSize: 13824, time: 21, height: 60, width: 104,
     textLength: 512)
   let xTensor = graph.variable(
-    Tensor<Float16>(from: try! Tensor<Float>(numpy: x.to(torch.float).cpu().numpy())).toGPU(2)
-  ).reshaped(format: .NHWC, shape: [1, 16, 21 * 30, 2, 52, 2]).permuted(0, 2, 4, 1, 3, 5).copied()
-    .reshaped(format: .NHWC, shape: [1, 21 * 30 * 52, 16 * 2 * 2])
+    Tensor<Float16>(
+      from: try! Tensor<Float>(numpy: torch.concat([x, y], dim: 0).to(torch.float).cpu().numpy())
+    ).toGPU(2)
+  ).reshaped(format: .NHWC, shape: [1, 36, 21 * 30, 2, 52, 2]).permuted(0, 2, 4, 1, 3, 5).copied()
+    .reshaped(format: .NHWC, shape: [1, 21 * 30 * 52, 36 * 2 * 2])
   let txt = graph.variable(
     Tensor<Float16>(from: try! Tensor<Float>(numpy: context.to(torch.float).cpu().numpy()))
       .reshaped(.WC(28, 4096)).toGPU(2))
@@ -698,24 +951,32 @@ graph.withNoGrad {
   txtIn.full(0)
   txtIn[0..<28, 0..<4096] = txt
   txtIn = txtIn.reshaped(.HWC(1, 512, 4096))
+  let clip = graph.variable(
+    Tensor<Float16>(from: try! Tensor<Float>(numpy: clip_fea.to(torch.float).cpu().numpy()))
+      .reshaped(.HWC(1, 257, 1280)).toGPU(2))
   let timestep = timeEmbedding(timesteps: 900, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
   let tGPU = graph.variable(Tensor<Float>(from: timestep)).toGPU(2)
   let rotNdTensorGPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor).toGPU(2)
-  wan.compile(inputs: xTensor, txtIn, tGPU, rotNdTensorGPU)
-  reader(wan_state_dict)
-  debugPrint(wan(inputs: xTensor, txtIn, tGPU, rotNdTensorGPU))
-  graph.openStore("/home/liu/workspace/swift-diffusion/wan_v2.1_14b_720p_f16.ckpt") {
+  wan.compile(inputs: xTensor, txtIn, clip, tGPU, rotNdTensorGPU)
+  graph.openStore("/slow/Data/wan_v2.1_14b_i2v_720p_f16.ckpt") {
+    $0.read("dit", model: wan)
+  }
+  // reader(wan_state_dict)
+  debugPrint(wan(inputs: xTensor, txtIn, clip, tGPU, rotNdTensorGPU))
+  /*
+  graph.openStore("/slow/Data/wan_v2.1_14b_i2v_720p_f16.ckpt") {
     $0.write("dit", model: wan)
   }
+  */
 }
 
 exit(0)
 
 let z = torch.randn([16, 3, 60, 104]).to(torch.float).cuda()
-let zOut = wan_t2v.vae.decode([z])[0]
-wan_t2v.vae.encode([zOut])
-print(wan_t2v.vae.model.encoder)
-let vae_state_dict = wan_t2v.vae.model.state_dict()
+let zOut = wan_i2v.vae.decode([z])[0]
+wan_i2v.vae.encode([zOut])
+print(wan_i2v.vae.model.encoder)
+let vae_state_dict = wan_i2v.vae.model.state_dict()
 
 func ResnetBlockCausal3D(
   prefix: String, inChannels: Int, outChannels: Int, shortcut: Bool, depth: Int, height: Int,
