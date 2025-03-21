@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/fast/Data/SD/wan_v2.1_14b_i2v_480p_f16.ckpt"
+  "/home/liu/workspace/swift-diffusion/wan_v2.1_14b_i2v_720p_f16.ckpt"
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/slow/Data/wan_v2.1_14b_i2v_480p_q8p.ckpt",
+    "/fast/Data/wan_v2.1_14b_i2v_720p_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {

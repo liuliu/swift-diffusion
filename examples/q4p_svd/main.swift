@@ -9,23 +9,23 @@ let torch = Python.import("torch")
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/fast/Data/SD/wan_v2.1_14b_720p_f16.ckpt",
+  "/home/liu/workspace/swift-diffusion/wan_v2.1_14b_i2v_720p_f16.ckpt",
   // "/fast/Data/SD/flux_1_dev_f16.ckpt",
   flags: .readOnly
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/fast/Data/SD/wan_v2.1_14b_720p_q5p.ckpt",
+    "/fast/Data/wan_v2.1_14b_i2v_720p_q5p.ckpt",
     // "/fast/Data/SD/flux_1_dev_q5p.ckpt",
     flags: .readOnly
   ) { bench in
     graph.openStore(
-      "/fast/Data/SD/wan_v2.1_14b_720p_q5p_svd.ckpt",
+      "/fast/Data/wan_v2.1_14b_i2v_720p_q5p_svd.ckpt",
       // "/home/liu/workspace/swift-diffusion/flux_1_dev_q5p_svd.ckpt",
       flags: .truncateWhenClose
     ) { writer in
       graph.openStore(
-        "/fast/Data/SD/wan_v2.1_14b_720p_q5p.ckpt",
+        "/fast/Data/wan_v2.1_14b_i2v_720p_q5p.ckpt",
         // "/fast/Data/SD/flux_1_dev_q5p.ckpt",
         flags: .readOnly
       ) {
@@ -36,8 +36,8 @@ graph.openStore(
             guard let tensor = $0.read(key, codec: codec.union([.jit, .externalData])) else {
               continue
             }
-            print("transwrite key \(key)")
-            writer.write(key, tensor: tensor, codec: codec)
+            // print("transwrite key \(key)")
+            // writer.write(key, tensor: tensor, codec: codec)
             continue
           }
           guard let tensor = (store.read(key).map { Tensor<Float32>(from: $0).toCPU() }) else {
@@ -48,19 +48,29 @@ graph.openStore(
           /*
           let benchTensor =
             (bench.read(key, codec: [.q5p, .q8p]).map { Tensor<Float32>(from: $0).toCPU() })
+          let b32 = torch.from_numpy(benchTensor)
           let qTensor =
             (writer.read(key, codec: [.q4p, .q5p, .q8p]).map { Tensor<Float32>(from: $0).toCPU() })!
-          let upTensor = (writer.read("\(key)__up__").map { Tensor<Float32>(from: $0).toCPU() })!
-          let downTensor =
-            (writer.read("\(key)__down__").map { Tensor<Float32>(from: $0).toCPU() })!
-          let b32 = torch.from_numpy(benchTensor)
           let q32 = torch.from_numpy(qTensor)
-          let tup = torch.from_numpy(upTensor)
-          let tdown = torch.from_numpy(downTensor)
-          let qr = q32 + torch.matmul(tup, tdown)
+          var qr = q32
+          if let upTensor = (writer.read("\(key)__up__").map { Tensor<Float32>(from: $0).toCPU() }),
+             let downTensor = (writer.read("\(key)__down__").map { Tensor<Float32>(from: $0).toCPU() }) {
+            let tup = torch.from_numpy(upTensor)
+            let tdown = torch.from_numpy(downTensor)
+            qr = q32 + torch.matmul(tup, tdown)
+          }
           let qrdiff = (f32 - qr)
           let qdiff = (f32 - b32)
-          print("\(key) \((qrdiff * qrdiff).sum()) \((qdiff * qdiff).sum())")
+          let qrsum = (qrdiff * qrdiff).sum()
+          let qsum = (qdiff * qdiff).sum()
+          if qrsum > qsum {
+            print("\(key) \(qrsum) \(qsum)")
+            writer.remove("\(key)__up__")
+            writer.remove("\(key)__down__")
+            writer.write(
+              key, tensor: Tensor<Float16>(from: tensor),
+              codec: [.q5p, .ezm7])
+          }
           continue
           */
           let (du, ds, dv) = torch.linalg.svd(f32.double()).tuple3
