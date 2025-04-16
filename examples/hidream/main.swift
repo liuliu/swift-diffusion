@@ -33,6 +33,20 @@ let text_encoder_4 = transformers.LlamaForCausalLM.from_pretrained(
   output_attentions: true,
   torch_dtype: torch.float16
 ).to("cuda")  // torch.bfloat16).to("cpu")
+
+let generator = torch.Generator("cuda").manual_seed(42)
+let prompt = "A cat holding a sign that says \"Hi-Dreams.ai\"."
+
+let text_inputs = tokenizer_4(
+  prompt, padding: "max_length", max_length: 128, truncation: true, add_special_tokens: true,
+  return_tensors: "pt")
+print(text_inputs.input_ids)
+print(text_inputs.attention_mask)
+
+let outputs = text_encoder_4(
+  text_inputs.input_ids.to("cuda"), text_inputs.attention_mask.to("cuda"),
+  output_hidden_states: true, output_attentions: true)
+print(outputs.hidden_states)
 /*
 let transformer = hi_diffusers.HiDreamImageTransformer2DModel.from_pretrained(
     pretrained_model_name_or_path,
@@ -49,23 +63,9 @@ let pipe = hi_diffusers.HiDreamImagePipeline.from_pretrained(
 
 pipe.enable_sequential_cpu_offload()
 pipe.transformer = transformer
-*/
-print(text_encoder_4)
 
-let generator = torch.Generator("cuda").manual_seed(42)
-let prompt = "A cat holding a sign that says \"Hi-Dreams.ai\"."
+print(transformer)
 
-let text_inputs = tokenizer_4(
-  prompt, padding: "max_length", max_length: 128, truncation: true, add_special_tokens: true,
-  return_tensors: "pt")
-print(text_inputs.input_ids)
-print(text_inputs.attention_mask)
-
-let outputs = text_encoder_4(
-  text_inputs.input_ids.to("cuda"), text_inputs.attention_mask.to("cuda"),
-  output_hidden_states: true, output_attentions: true)
-print(outputs.hidden_states)
-/*
 let image = pipe(
     prompt,
     height: 1024,
@@ -257,9 +257,27 @@ graph.withNoGrad {
     tokensTensor[i] = 128009
   }
   let rotTensor = graph.variable(.CPU, .NHWC(1, 128, 1, 128), of: Float.self)
+  let invFreqLlama = (0..<64).map { k in
+    let lowFreqWavelen = Double(8_192) / 1.0
+    let highFreqWavelen = Double(8_192) / 4.0
+    let invFreq = 1.0 / pow(500_000, Double(k) * 2 / 128)
+    let wavelen = 2.0 * .pi / invFreq
+    var invFreqLlama: Double
+    if wavelen > lowFreqWavelen {
+      invFreqLlama = invFreq / 8.0
+    } else {
+      invFreqLlama = invFreq
+    }
+    let smoothFactor = (Double(8_192) / wavelen - 1.0) / (4.0 - 1.0)
+    let smoothInvFreq = (1 - smoothFactor) * invFreqLlama / 8.0 + smoothFactor * invFreqLlama
+    if wavelen >= highFreqWavelen && wavelen <= lowFreqWavelen {
+      invFreqLlama = smoothInvFreq
+    }
+    return invFreqLlama
+  }
   for i in 0..<128 {
     for k in 0..<64 {
-      let theta = Double(i) * 1.0 / pow(500_000, Double(k) * 2 / 128)
+      let theta = Double(i) * invFreqLlama[k]
       let sintheta = sin(theta)
       let costheta = cos(theta)
       rotTensor[0, i, 0, k * 2] = Float(costheta)
@@ -281,7 +299,9 @@ graph.withNoGrad {
   let outputHiddenStates = transformer(
     inputs: tokensTensorGPU, rotTensorGPU, causalAttentionMaskGPU)
   debugPrint(outputHiddenStates)
+  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/llama_3.1_8b_instruct_f16.ckpt") {
     $0.write("text_model", model: transformer)
   }
+  */
 }
