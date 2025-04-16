@@ -1009,6 +1009,23 @@ swift_binary(
 )
 
 swift_binary(
+    name = "hunyuan_i2v",
+    srcs = ["hunyuan_i2v/main.swift"],
+    data = [
+        "hunyuan/merges.txt",
+        "hunyuan/vocab.json",
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "hunyuan",
     srcs = ["hunyuan/main.swift"],
     data = [
@@ -1051,5 +1068,20 @@ swift_binary(
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
         "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
+
+swift_binary(
+    name = "hidream",
+    srcs = ["hidream/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
     ],
 )

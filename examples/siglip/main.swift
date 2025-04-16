@@ -102,9 +102,9 @@ func SigLIPVisionTransformer(
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let posEmbed = Parameter<Float>(
-    .GPU(0), .CHW(1, 27 * 27, width), initBound: 1, name: "pos_embed")
+    .GPU(0), .CHW(1, gridX * gridY, width), initBound: 1, name: "pos_embed")
   let conv1 = Convolution(
-    groups: 1, filters: width, filterSize: [14, 14], hint: Hint(stride: [14, 14]))
+    groups: 1, filters: width, filterSize: [16, 16], hint: Hint(stride: [16, 16]))
   var out = conv1(x).reshaped([batchSize, width, gridX * gridY]).transposed(1, 2)
   out = out + posEmbed
   var readers = [(PythonObject) -> Void]()
@@ -160,15 +160,16 @@ func Redux(channels: Int) -> ((PythonObject) -> Void, Model) {
   return (reader, Model([x], [out]))
 }
 
-let x = torch.randn([1, 3, 378, 378])
-let siglip = transformers.SiglipVisionModel.from_pretrained("google/siglip-so400m-patch14-384")
+let x = torch.randn([1, 3, 512, 512])
+let siglip = transformers.SiglipVisionModel.from_pretrained("google/siglip2-so400m-patch16-512")
 let encoded = siglip(x).last_hidden_state
 let vision_encoder_state_dict = siglip.vision_model.state_dict()
 print(encoded)
 
 let img_embedder = flux_modules_image_embedders.ReduxImageEncoder(
   torch.device("cpu"),
-  redux_path: "/home/liu/workspace/swift-diffusion/flux1-redux-dev.safetensors", dtype: torch.float)
+  redux_path: "/home/liu/workspace/swift-diffusion/flex1_redux_siglip2_512.safetensors",
+  dtype: torch.float)
 img_embedder.redux_up = img_embedder.redux_up.to(torch.float)
 img_embedder.redux_down = img_embedder.redux_down.to(torch.float)
 print(img_embedder.redux_down(torch.nn.functional.silu(img_embedder.redux_up(encoded))))
@@ -177,7 +178,7 @@ let img_embedder_state_dict = img_embedder.state_dict()
 let graph = DynamicGraph()
 let xTensor = graph.variable(try! Tensor<Float>(numpy: x.numpy())).toGPU(0)
 let (reader, vit) = SigLIPVisionTransformer(
-  gridX: 27, gridY: 27, width: 1152, layers: 27, heads: 16, MLP: 4304, batchSize: 1)
+  gridX: 32, gridY: 32, width: 1152, layers: 27, heads: 16, MLP: 4304, batchSize: 1)
 
 let (reduxReader, redux) = Redux(channels: 4096)
 
@@ -190,16 +191,15 @@ graph.withNoGrad {
   }
   */
   var outs = vit(inputs: xTensor).map { $0.as(of: Float.self) }
+  debugPrint(outs)
   let _ = redux(inputs: outs[0])
   reduxReader(img_embedder_state_dict)
   outs = redux(inputs: outs[0]).map { $0.as(of: Float.self) }
   debugPrint(outs)
-  /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/siglip_so400m_384_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/siglip2_so400m_512_f32.ckpt") {
     $0.write("vit", model: vit)
   }
-  */
-  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_redux_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/flex_1_redux_siglip2_512_f32.ckpt") {
     $0.write("redux", model: redux)
   }
 }
