@@ -51,8 +51,8 @@ print(outputs.hidden_states)
 let transformer = hi_diffusers.HiDreamImageTransformer2DModel.from_pretrained(
   pretrained_model_name_or_path,
   subfolder: "transformer",
-  torch_dtype: torch.bfloat16
-).to("cuda")
+  torch_dtype: torch.float
+).to("cpu")
 
 let x = torch.randn([1, 16, 128, 128], dtype: torch.bfloat16).cuda()
 let prompt_embed_3 = torch.randn([1, 128, 4096], dtype: torch.bfloat16).cuda()
@@ -63,6 +63,7 @@ let t = torch.full([1], 1000).to(torch.bfloat16).cuda()
 let output = transformer(
   hidden_states: x, timesteps: t, encoder_hidden_states: [prompt_embed_3, prompt_embed_4],
   pooled_embeds: pooled_prompt_embed, return_dict: false)
+
 /*
 let pipe = hi_diffusers.HiDreamImagePipeline.from_pretrained(
     pretrained_model_name_or_path,
@@ -421,10 +422,10 @@ func JointTransformerBlock(
   let contextToQueries = Dense(count: k * h, name: "c_q")
   let contextToValues = Dense(count: k * h, name: "c_v")
   var contextK = contextToKeys(contextOut)
-  let normAddedK = RMSNorm(epsilon: 1e-6, axis: [2], name: "c_norm_k")
+  let normAddedK = RMSNorm(epsilon: 1e-5, axis: [2], name: "c_norm_k")
   contextK = normAddedK(contextK).reshaped([b, t.1, h, k])
   var contextQ = contextToQueries(contextOut)
-  let normAddedQ = RMSNorm(epsilon: 1e-6, axis: [2], name: "c_norm_q")
+  let normAddedQ = RMSNorm(epsilon: 1e-5, axis: [2], name: "c_norm_q")
   contextQ = normAddedQ(contextQ).reshaped([b, t.1, h, k])
   let contextV = contextToValues(contextOut).reshaped([b, t.1, h, k])
   let xAdaLNs = (0..<6).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
@@ -435,10 +436,10 @@ func JointTransformerBlock(
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
   var xK = xToKeys(xOut)
-  let normK = RMSNorm(epsilon: 1e-6, axis: [2], name: "x_norm_k")
+  let normK = RMSNorm(epsilon: 1e-5, axis: [2], name: "x_norm_k")
   xK = normK(xK).reshaped([b, hw, h, k])
   var xQ = xToQueries(xOut)
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [2], name: "x_norm_q")
+  let normQ = RMSNorm(epsilon: 1e-5, axis: [2], name: "x_norm_q")
   xQ = normQ(xQ).reshaped([b, hw, h, k])
   let xV = xToValues(xOut).reshaped([b, hw, h, k])
   var keys = Functional.concat(axis: 1, xK, contextK)
@@ -767,10 +768,10 @@ func SingleTransformerBlock(
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
   var xK = xToKeys(xOut)
-  let normK = RMSNorm(epsilon: 1e-6, axis: [2], name: "x_norm_k")
+  let normK = RMSNorm(epsilon: 1e-5, axis: [2], name: "x_norm_k")
   xK = normK(xK).reshaped([b, hw + t.1, h, k])
   var xQ = xToQueries(xOut)
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [2], name: "x_norm_q")
+  let normQ = RMSNorm(epsilon: 1e-5, axis: [2], name: "x_norm_q")
   xQ = normQ(xQ).reshaped([b, hw + t.1, h, k])
   let xV = xToValues(xOut).reshaped([b, hw + t.1, h, k])
   xQ = Functional.cmul(left: xQ, right: rot)
@@ -1196,4 +1197,9 @@ graph.withNoGrad {
     hiDream(
       inputs: xTensor,
       [rotTensorGPU, timestep, pooledPromptEmbedTensor, promptEmbed3Tensor] + promptEmbed4Tensors))
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/hidream_i1_full_f16.ckpt") {
+    $0.write("dit", model: hiDream)
+  }
+  */
 }
