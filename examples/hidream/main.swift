@@ -528,6 +528,8 @@ func FeedForward(hiddenSize: Int, intermediateSize: Int, upcast: Bool, name: Str
   if upcast {
     let scaleFactor: Float = 4
     out = out.to(.Float32) * scaleFactor
+  } else {
+    out = out.to(.Float32)
   }
   return (w1, w2, w3, Model([x], [out]))
 }
@@ -568,6 +570,8 @@ func MoEFeedForward(
   if upcast {
     let scaleFactor: Float = 4
     out = out.to(.Float32) * scaleFactor
+  } else {
+    out = out.to(.Float32)
   }
   return (gate, w1, w2, w3, Model([x], [out]))
 }
@@ -650,7 +654,7 @@ func JointTransformerBlock(
     let contextNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
     contextOut =
       contextOut
-      + ((upcast ? contextChunks[5].to(of: contextOut) : contextChunks[5])
+      + (contextChunks[5].to(of: contextOut)
       .* contextFF(
         contextNorm2(contextOut).to(.Float16) .* (1 + contextChunks[4]) + contextChunks[3])).to(
         of: contextOut)
@@ -668,8 +672,7 @@ func JointTransformerBlock(
   let xIn = xNorm2(xOut).to(.Float16) .* (1 + xChunks[4]) + xChunks[3]
   xOut =
     xOut
-    + ((upcast ? xChunks[5].to(of: xOut) : xChunks[5])
-    .* (xSharedFF(xIn) + xMoEFF(xIn))).to(of: xOut)
+    + (xChunks[5].to(of: xOut) .* (xSharedFF(xIn) + xMoEFF(xIn))).to(of: xOut)
   let reader: (PythonObject) -> Void = { _ in }
   if !contextBlockPreOnly {
     return (reader, Model([x, context, c, rot], [xOut, contextOut]))
@@ -728,9 +731,7 @@ func SingleTransformerBlock(
   let xNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   let xFFIn = xNorm2(xOut).to(.Float16) .* (1 + xChunks[4]) + xChunks[3]
   xOut =
-    xOut
-    + ((upcast ? xChunks[5].to(of: xOut) : xChunks[5])
-    .* (xSharedFF(xFFIn) + xMoEFF(xFFIn))).to(of: xOut)
+    xOut + (xChunks[5].to(of: xOut) .* (xSharedFF(xFFIn) + xMoEFF(xFFIn))).to(of: xOut)
   let reader: (PythonObject) -> Void = { _ in }
   return (reader, Model([x, c, rot], [xOut]))
 }
@@ -771,7 +772,7 @@ func HiDream(height: Int, width: Int, textLength: (Int, Int), layers: (Int, Int)
     let (reader, block) = JointTransformerBlock(
       prefix: "double_stream_blocks.\(i).block", k: 128, h: 20, b: 1,
       t: (textLength.0 + textLength.1, textLength.0 + textLength.1 * 2), hw: h * w,
-      contextBlockPreOnly: false, upcast: true)
+      contextBlockPreOnly: false, upcast: i > 12)
     readers.append(reader)
     let blockOut = block(out, contextIn, vec, rot)
     out = blockOut[0]
@@ -783,7 +784,7 @@ func HiDream(height: Int, width: Int, textLength: (Int, Int), layers: (Int, Int)
     let (reader, block) = SingleTransformerBlock(
       prefix: "single_stream_blocks.\(i).block", k: 128, h: 20, b: 1,
       t: (textLength.0 + textLength.1, textLength.0 + textLength.1 * 2), hw: h * w,
-      contextBlockPreOnly: i == layers.1 - 1, upcast: true)
+      contextBlockPreOnly: i == layers.1 - 1, upcast: false)
     readers.append(reader)
     out = block(xIn, vec, rot)
   }
