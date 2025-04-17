@@ -1072,6 +1072,21 @@ swift_binary(
 )
 
 swift_binary(
+    name = "hidream_converter",
+    srcs = ["hidream_converter/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "hidream",
     srcs = ["hidream/main.swift"],
     data = [
@@ -1082,6 +1097,6 @@ swift_binary(
         "@SwiftNumerics//:Numerics",
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
-        "@s4nnc//nnc:nnc_python",
+        "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )
