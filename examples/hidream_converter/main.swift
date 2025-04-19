@@ -18,7 +18,7 @@ let transformers = Python.import("transformers")
 let hi_diffusers_schedulers_fm_solvers_unipc = Python.import(
   "hi_diffusers.schedulers.fm_solvers_unipc")
 
-let pretrained_model_name_or_path = "HiDream-ai/HiDream-I1-Dev"
+let pretrained_model_name_or_path = "HiDream-ai/HiDream-I1-Fast"
 let scheduler = hi_diffusers_schedulers_fm_solvers_unipc.FlowUniPCMultistepScheduler(
   num_train_timesteps: 1000, shift: 3.0, use_dynamic_shifting: false)
 
@@ -51,19 +51,19 @@ print(outputs.hidden_states)
 let transformer = hi_diffusers.HiDreamImageTransformer2DModel.from_pretrained(
   pretrained_model_name_or_path,
   subfolder: "transformer",
-  torch_dtype: torch.bfloat16
-).to("cuda")
+  torch_dtype: torch.float
+).to("cpu")
 
 let x = torch.randn([1, 16, 128, 128], dtype: torch.bfloat16).cuda()
 let prompt_embed_3 = torch.randn([1, 128, 4096], dtype: torch.bfloat16).cuda()
 let prompt_embed_4 = torch.randn([32, 1, 128, 4096], dtype: torch.bfloat16).cuda()
 let pooled_prompt_embed = torch.randn([1, 2048], dtype: torch.bfloat16).cuda()
 let t = torch.full([1], 1000).to(torch.bfloat16).cuda()
-
+/*
 let output = transformer(
   hidden_states: x, timesteps: t, encoder_hidden_states: [prompt_embed_3, prompt_embed_4],
   pooled_embeds: pooled_prompt_embed, return_dict: false)
-
+*/
 /*
 let pipe = hi_diffusers.HiDreamImagePipeline.from_pretrained(
     pretrained_model_name_or_path,
@@ -380,7 +380,7 @@ func MoEFeedForward(
   let experts = route[1].reshaped([tokenLength * 2])  // This is to select into experts.
   let sort = experts.sorted(axis: 0, descending: false)
   weights = IndexSelect()(weights, sort[1])  // Reorder the weights by the sorting order.
-  let expertIds = sort[0].uniqueConsecutive(bincount: segments)
+  let expertIds = sort[0].uniqueConsecutive(count: segments)
   let indices = 0.5 * sort[1]  // Scale it to 0..<tokenLength.
   let gathered = IndexSelect()(x.reshaped([tokenLength, hiddenSize]), indices)
   let w1 = SegmentedDense(
@@ -397,7 +397,7 @@ func MoEFeedForward(
   out = w2(out, expertIds)
   // Out is tokenLength * 2, now multiply weights and scale back.
   out = out .* weights.reshaped([tokenLength * 2, 1])
-  out = Functional.scatterAdd(bincount: tokenLength, out, index: indices)
+  out = Functional.scatterAdd(count: tokenLength, out, index: indices)
   if upcast {
     let scaleFactor: Float = 8
     out = out.to(.Float32) * scaleFactor
@@ -1198,9 +1198,7 @@ graph.withNoGrad {
     hiDream(
       inputs: xTensor,
       [rotTensorGPU, timestep, pooledPromptEmbedTensor, promptEmbed3Tensor] + promptEmbed4Tensors))
-  /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/hidream_i1_dev_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/hidream_i1_fast_f16.ckpt") {
     $0.write("dit", model: hiDream)
   }
-  */
 }

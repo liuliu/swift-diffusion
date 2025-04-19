@@ -476,8 +476,8 @@ let promptEmbed4Tensors = graph.withNoGrad {
   let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
   let causalAttentionMaskGPU = causalAttentionMask.toGPU(0)
   transformer.compile(inputs: tokensTensorGPU, rotTensorGPU, causalAttentionMaskGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/llama_3.1_8b_instruct_f16.ckpt") {
-    $0.read("text_model", model: transformer)
+  graph.openStore("/home/liu/workspace/swift-diffusion/llama_3.1_8b_instruct_q8p.ckpt") {
+    $0.read("text_model", model: transformer, codec: [.jit, .q8p, .ezm7])
   }
   let outputHiddenStates = transformer(
     inputs: tokensTensorGPU, rotTensorGPU, causalAttentionMaskGPU)
@@ -549,7 +549,7 @@ func MoEFeedForward(
   let sort = experts.sorted(axis: 0, descending: false)
   let sortIndices = sort[1]
   weights = IndexSelect()(weights, sortIndices)  // Reorder the weights by the sorting order.
-  let expertIds = sort[0].uniqueConsecutive(bincount: segments)
+  let expertIds = sort[0].uniqueConsecutive(count: segments)
   let indices = 0.5 * sortIndices  // Scale it to 0..<tokenLength.
   let gathered = IndexSelect()(x.reshaped([tokenLength, hiddenSize]), indices)
   let w1 = SegmentedDense(
@@ -566,7 +566,7 @@ func MoEFeedForward(
   out = w2(out, expertIds)
   // Out is tokenLength * 2, now multiply weights and scale back.
   out = out .* weights.reshaped([tokenLength * 2, 1])
-  out = Functional.scatterAdd(bincount: tokenLength, out, index: indices)
+  out = Functional.scatterAdd(count: tokenLength, out, index: indices)
   if upcast {
     let scaleFactor: Float = 4
     out = out.to(.Float32) * scaleFactor
@@ -866,10 +866,11 @@ let z = graph.withNoGrad {
   hiDream.compile(
     inputs: [z, rotTensorGPU, timestep, pooledPromptEmbedTensor, promptEmbed3Tensor]
       + promptEmbed4Tensors)
-  graph.openStore("/home/liu/workspace/swift-diffusion/hidream_i1_dev_f16.ckpt") {
-    try! $0.read("dit", model: hiDream, strict: true)
+  graph.openStore("/home/liu/workspace/swift-diffusion/hidream_i1_dev_q8p.ckpt") {
+    try! $0.read("dit", model: hiDream, strict: true, codec: [.jit, .q8p, .ezm7])
   }
-  let samplingSteps = 30
+  hiDream.maxConcurrency = .limit(4)
+  let samplingSteps = 50
   for i in (1...samplingSteps).reversed() {
     print("\(i)")
     let t = Float(i) / Float(samplingSteps) * 1_000

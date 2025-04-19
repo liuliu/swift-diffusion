@@ -3,26 +3,22 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/siglip2_so400m_512_f32.ckpt"
+  "/home/liu/workspace/swift-diffusion/hidream_i1_fast_f16.ckpt"
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/siglip2_so400m_512_f16.ckpt",
+    "/home/liu/workspace/swift-diffusion/hidream_i1_fast_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
       guard let anyTensor = store.read(key) else { continue }
-      /*
       guard anyTensor.dataType != .Float32 else {
         // If it is already in FP32, skip transcode to FP16. Only useful for UMT5 XXL / Wan v2.1 models.
         let tensor = Tensor<Float32>(anyTensor).toCPU()
         $0.write(key, tensor: tensor)
         continue
       }
-      */
       let tensor = Tensor<Float16>(from: anyTensor).toCPU()
-      $0.write(key, tensor: tensor)
-      continue
       if key.contains("__stage_c_fixed__") && (key.contains("key") || key.contains("value")) {
         continue
       }
@@ -92,7 +88,7 @@ graph.openStore(
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         continue
       }
-      if shape.count == 2 && n > 1 {
+      if (shape.count == 2 || shape.count == 3) && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
