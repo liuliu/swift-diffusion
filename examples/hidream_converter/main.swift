@@ -18,7 +18,7 @@ let transformers = Python.import("transformers")
 let hi_diffusers_schedulers_fm_solvers_unipc = Python.import(
   "hi_diffusers.schedulers.fm_solvers_unipc")
 
-let pretrained_model_name_or_path = "HiDream-ai/HiDream-I1-Fast"
+let pretrained_model_name_or_path = "HiDream-ai/HiDream-I1-Full"
 let scheduler = hi_diffusers_schedulers_fm_solvers_unipc.FlowUniPCMultistepScheduler(
   num_train_timesteps: 1000, shift: 3.0, use_dynamic_shifting: false)
 
@@ -35,7 +35,7 @@ let text_encoder_4 = transformers.LlamaForCausalLM.from_pretrained(
 ).to("cpu")  // torch.float16).to("cuda")
 
 let generator = torch.Generator("cuda").manual_seed(42)
-let prompt = "A cat holding a sign that says \"Hi-Dreams.ai\"."
+let prompt = "A cat holding a sign that says Hi-Dreams.ai"
 /*
 let text_inputs = tokenizer_4(
   prompt, padding: "max_length", max_length: 128, truncation: true, add_special_tokens: true,
@@ -64,20 +64,319 @@ let output = transformer(
   hidden_states: x, timesteps: t, encoder_hidden_states: [prompt_embed_3, prompt_embed_4],
   pooled_embeds: pooled_prompt_embed, return_dict: false)
 */
-/*
+
 let pipe = hi_diffusers.HiDreamImagePipeline.from_pretrained(
-    pretrained_model_name_or_path,
-    scheduler: scheduler,
-    tokenizer_4: tokenizer_4,
-    text_encoder_4: text_encoder_4,
-    torch_dtype: torch.bfloat16
+  pretrained_model_name_or_path,
+  scheduler: scheduler,
+  tokenizer_4: tokenizer_4,
+  text_encoder_4: text_encoder_4,
+  torch_dtype: torch.float16
 )
 
-pipe.enable_sequential_cpu_offload()
+// pipe.enable_sequential_cpu_offload()
 pipe.transformer = transformer
 
-print(transformer)
+print(pipe.text_encoder.text_model)
 
+func CLIPTextEmbedding(vocabularySize: Int, maxLength: Int, embeddingSize: Int) -> (
+  Model, Model, Model
+) {
+  let tokens = Input()
+  let positions = Input()
+  let tokenEmbed = Embedding(
+    Float.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize)
+  let positionEmbed = Embedding(Float.self, vocabularySize: maxLength, embeddingSize: embeddingSize)
+  let embedding = tokenEmbed(tokens) + positionEmbed(positions)
+  return (tokenEmbed, positionEmbed, Model([tokens, positions], [embedding]))
+}
+
+func CLIPAttention(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model, Model, Model) {
+  let x = Input()
+  let casualAttentionMask = Input()
+  let tokeys = Dense(count: k * h)
+  let toqueries = Dense(count: k * h)
+  let tovalues = Dense(count: k * h)
+  let keys = tokeys(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  let queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t, h, k])
+    .permuted(0, 2, 1, 3)
+  let values = tovalues(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys) + casualAttentionMask
+  dot = dot.reshaped([b * h * t, t])
+  dot = dot.softmax()
+  dot = dot.reshaped([b, h, t, t])
+  var out = dot * values
+  out = out.reshaped([b, h, t, k]).transposed(1, 2).reshaped([b * t, h * k])
+  let unifyheads = Dense(count: k * h)
+  out = unifyheads(out)
+  return (tokeys, toqueries, tovalues, unifyheads, Model([x, casualAttentionMask], [out]))
+}
+
+func QuickGELU() -> Model {
+  let x = Input()
+  let y = x .* Sigmoid()(1.702 * x)
+  return Model([x], [y])
+}
+
+func CLIPMLP(hiddenSize: Int, intermediateSize: Int) -> (Model, Model, Model) {
+  let x = Input()
+  let fc1 = Dense(count: intermediateSize)
+  var out = fc1(x)
+  out = GELU()(out)
+  let fc2 = Dense(count: hiddenSize)
+  out = fc2(out)
+  return (fc1, fc2, Model([x], [out]))
+}
+
+func CLIPEncoderLayer(prefix: String, k: Int, h: Int, b: Int, t: Int, intermediateSize: Int) -> (
+  Model, (PythonObject) -> Void
+) {
+  let x = Input()
+  let casualAttentionMask = Input()
+  let layerNorm1 = LayerNorm(epsilon: 1e-5, axis: [1])
+  var out = layerNorm1(x)
+  let (tokeys, toqueries, tovalues, unifyheads, attention) = CLIPAttention(k: k, h: h, b: b, t: t)
+  out = attention(out, casualAttentionMask) + x
+  let residual = out
+  let layerNorm2 = LayerNorm(epsilon: 1e-5, axis: [1])
+  out = layerNorm2(out)
+  let (fc1, fc2, mlp) = CLIPMLP(hiddenSize: k * h, intermediateSize: intermediateSize)
+  out = mlp(out) + residual
+  let reader: (PythonObject) -> Void = { state_dict in
+    let layer_norm_1_weight = state_dict["\(prefix).layer_norm1.weight"].type(torch.float).cpu()
+      .numpy()
+    let layer_norm_1_bias = state_dict["\(prefix).layer_norm1.bias"].type(torch.float).cpu().numpy()
+    layerNorm1.weight.copy(from: try! Tensor<Float>(numpy: layer_norm_1_weight))
+    layerNorm1.bias.copy(from: try! Tensor<Float>(numpy: layer_norm_1_bias))
+
+    let k_proj_weight = state_dict["\(prefix).self_attn.k_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    let k_proj_bias = state_dict["\(prefix).self_attn.k_proj.bias"].type(torch.float).cpu().numpy()
+    tokeys.weight.copy(from: try! Tensor<Float>(numpy: k_proj_weight))
+    tokeys.bias.copy(from: try! Tensor<Float>(numpy: k_proj_bias))
+
+    let v_proj_weight = state_dict["\(prefix).self_attn.v_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    let v_proj_bias = state_dict["\(prefix).self_attn.v_proj.bias"].type(torch.float).cpu().numpy()
+    tovalues.weight.copy(from: try! Tensor<Float>(numpy: v_proj_weight))
+    tovalues.bias.copy(from: try! Tensor<Float>(numpy: v_proj_bias))
+
+    let q_proj_weight = state_dict["\(prefix).self_attn.q_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    let q_proj_bias = state_dict["\(prefix).self_attn.q_proj.bias"].type(torch.float).cpu().numpy()
+    toqueries.weight.copy(from: try! Tensor<Float>(numpy: q_proj_weight))
+    toqueries.bias.copy(from: try! Tensor<Float>(numpy: q_proj_bias))
+
+    let out_proj_weight = state_dict["\(prefix).self_attn.out_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    let out_proj_bias = state_dict["\(prefix).self_attn.out_proj.bias"].type(torch.float).cpu()
+      .numpy()
+    unifyheads.weight.copy(from: try! Tensor<Float>(numpy: out_proj_weight))
+    unifyheads.bias.copy(from: try! Tensor<Float>(numpy: out_proj_bias))
+
+    let layer_norm_2_weight = state_dict["\(prefix).layer_norm2.weight"].type(torch.float).cpu()
+      .numpy()
+    let layer_norm_2_bias = state_dict["\(prefix).layer_norm2.bias"].type(torch.float).cpu().numpy()
+    layerNorm2.weight.copy(from: try! Tensor<Float>(numpy: layer_norm_2_weight))
+    layerNorm2.bias.copy(from: try! Tensor<Float>(numpy: layer_norm_2_bias))
+
+    let fc1_weight = state_dict["\(prefix).mlp.fc1.weight"].type(torch.float).cpu().numpy()
+    let fc1_bias = state_dict["\(prefix).mlp.fc1.bias"].type(torch.float).cpu().numpy()
+    fc1.weight.copy(from: try! Tensor<Float>(numpy: fc1_weight))
+    fc1.bias.copy(from: try! Tensor<Float>(numpy: fc1_bias))
+
+    let fc2_weight = state_dict["\(prefix).mlp.fc2.weight"].type(torch.float).cpu().numpy()
+    let fc2_bias = state_dict["\(prefix).mlp.fc2.bias"].type(torch.float).cpu().numpy()
+    fc2.weight.copy(from: try! Tensor<Float>(numpy: fc2_weight))
+    fc2.bias.copy(from: try! Tensor<Float>(numpy: fc2_bias))
+  }
+  return (
+    Model([x, casualAttentionMask], [out]), reader
+  )
+}
+
+func CLIPTextModel(
+  vocabularySize: Int, maxLength: Int, embeddingSize: Int, numLayers: Int, numHeads: Int,
+  batchSize: Int, intermediateSize: Int
+) -> (
+  Model, (PythonObject) -> Void
+) {
+  let tokens = Input()
+  let positions = Input()
+  let casualAttentionMask = Input()
+  let (tokenEmbed, positionEmbed, embedding) = CLIPTextEmbedding(
+    vocabularySize: vocabularySize, maxLength: maxLength, embeddingSize: embeddingSize)
+  var out = embedding(tokens, positions)
+  var layerNorm1s = [Model]()
+  var tokeyss = [Model]()
+  var toqueriess = [Model]()
+  var tovaluess = [Model]()
+  var unifyheadss = [Model]()
+  var layerNorm2s = [Model]()
+  var fc1s = [Model]()
+  var fc2s = [Model]()
+  var readers = [(PythonObject) -> Void]()
+  let k = embeddingSize / numHeads
+  for i in 0..<numLayers {
+    let (encoderLayer, reader) =
+      CLIPEncoderLayer(
+        prefix: "encoder.layers.\(i)",
+        k: k, h: numHeads, b: batchSize, t: maxLength, intermediateSize: intermediateSize)
+    out = encoderLayer(out, casualAttentionMask)
+    readers.append(reader)
+  }
+  let finalLayerNorm = LayerNorm(epsilon: 1e-5, axis: [1])
+  out = finalLayerNorm(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let vocab = state_dict["embeddings.token_embedding.weight"].type(torch.float).cpu().numpy()
+    let pos = state_dict["embeddings.position_embedding.weight"].type(torch.float).cpu().numpy()
+    tokenEmbed.weight.copy(from: try! Tensor<Float>(numpy: vocab))
+    positionEmbed.weight.copy(from: try! Tensor<Float>(numpy: pos))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let final_layer_norm_weight = state_dict["final_layer_norm.weight"].type(torch.float).cpu()
+      .numpy()
+    let final_layer_norm_bias = state_dict["final_layer_norm.bias"].type(torch.float).cpu().numpy()
+    finalLayerNorm.weight.copy(from: try! Tensor<Float>(numpy: final_layer_norm_weight))
+    finalLayerNorm.bias.copy(from: try! Tensor<Float>(numpy: final_layer_norm_bias))
+  }
+  return (
+    Model([tokens, positions, casualAttentionMask], [out]), reader
+  )
+}
+
+/*
+let text_inputs_0 = pipe.tokenizer(prompt, padding: "max_length", max_length: 248, truncation: true, return_tensors: "pt")
+print(text_inputs_0.input_ids)
+let prompt_embed_0 = pipe.text_encoder(text_inputs_0.input_ids.to("cpu"), output_hidden_states: true)
+let text_encoder_text_model_state_dict = pipe.text_encoder.text_model.state_dict()
+print(prompt_embed_0[0])
+*/
+let text_inputs_1 = pipe.tokenizer_2(
+  prompt, padding: "max_length", max_length: 218, truncation: true, return_tensors: "pt")
+print(text_inputs_1.input_ids)
+let prompt_embed_1 = pipe.text_encoder_2(
+  text_inputs_1.input_ids.to("cpu"), output_hidden_states: true)
+let text_encoder_text_model_state_dict = pipe.text_encoder_2.text_model.state_dict()
+print(prompt_embed_1[0])
+
+let tokenizer0 = CLIPTokenizer(
+  vocabulary: "/home/liu/workspace/swift-diffusion/examples/clip/vocab.json",
+  merges: "/home/liu/workspace/swift-diffusion/examples/clip/merges.txt")
+
+let tokenizer1 = CLIPTokenizer(
+  vocabulary: "/home/liu/workspace/swift-diffusion/examples/open_clip/vocab_16e6.json",
+  merges: "/home/liu/workspace/swift-diffusion/examples/open_clip/bpe_simple_vocab_16e6.txt")
+
+graph.withNoGrad {
+  /*
+  let tokens0 = tokenizer0.tokenize(text: prompt, truncation: true, maxLength: 248)
+  print(tokens0)
+  let tokensTensor0 = graph.variable(.CPU, .C(248), of: Int32.self)
+  let positionTensor = graph.variable(.CPU, .C(248), of: Int32.self)
+  for i in 0..<248 {
+    tokensTensor0[i] = tokens0[i]
+    positionTensor[i] = Int32(i)
+  }
+
+  let casualAttentionMask = graph.variable(Tensor<Float>(.CPU, .NHWC(1, 1, 248, 248)))
+  casualAttentionMask.full(0)
+  for i in 0..<247 {
+    for j in (i + 1)..<248 {
+      casualAttentionMask[0, 0, i, j] = -Float.greatestFiniteMagnitude
+    }
+  }
+  let tokensTensorGPU = tokensTensor0.toGPU(0)
+  let positionTensorGPU = positionTensor.toGPU(0)
+  let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
+  let (textModel0, reader) = CLIPTextModel(
+    vocabularySize: 49408, maxLength: 248, embeddingSize: 768, numLayers: 12, numHeads: 12,
+    batchSize: 1, intermediateSize: 3072)
+  textModel0.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
+  reader(text_encoder_text_model_state_dict)
+  let c = textModel0(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU).map {
+    $0.as(of: Float.self)
+  }
+  debugPrint(c)
+  var pooled = graph.variable(.GPU(0), .NC(1, 768), of: Float.self)
+  for (i, token) in tokens0.enumerated() {
+    if token == tokenizer0.endToken {
+      pooled[0..<1, 0..<768] = c[0][i..<(i + 1), 0..<768]
+      break
+    }
+  }
+  let text_proj = pipe.text_encoder.text_projection.weight.type(torch.float).cpu()
+  var textProj = Tensor<Float>(.CPU, .NC(768, 768))
+  for i in 0..<768 {
+    for j in 0..<768 {
+      textProj[i, j] = Float(text_proj[j, i])!
+    }
+  }
+  let textProjection = graph.variable(textProj.toGPU(0))
+  debugPrint(pooled * textProjection)
+  */
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/long_clip_vit_l14_f32.ckpt") {
+    $0.write("text_model", model: textModel0)
+    $0.write("text_projection", variable: textProjection)
+  }
+  */
+}
+
+graph.withNoGrad {
+  let tokens0 = tokenizer1.tokenize(text: prompt, truncation: true, maxLength: 218, paddingToken: 0)
+  print(tokens0)
+  let tokensTensor0 = graph.variable(.CPU, .C(218), of: Int32.self)
+  let positionTensor = graph.variable(.CPU, .C(218), of: Int32.self)
+  for i in 0..<218 {
+    tokensTensor0[i] = tokens0[i]
+    positionTensor[i] = Int32(i)
+  }
+
+  let casualAttentionMask = graph.variable(Tensor<Float>(.CPU, .NHWC(1, 1, 218, 218)))
+  casualAttentionMask.full(0)
+  for i in 0..<217 {
+    for j in (i + 1)..<218 {
+      casualAttentionMask[0, 0, i, j] = -Float.greatestFiniteMagnitude
+    }
+  }
+  let tokensTensorGPU = tokensTensor0.toGPU(0)
+  let positionTensorGPU = positionTensor.toGPU(0)
+  let casualAttentionMaskGPU = casualAttentionMask.toGPU(0)
+  let (textModel0, reader) = CLIPTextModel(
+    vocabularySize: 49408, maxLength: 218, embeddingSize: 1280, numLayers: 32, numHeads: 20,
+    batchSize: 1, intermediateSize: 5120)
+  textModel0.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
+  reader(text_encoder_text_model_state_dict)
+  let c = textModel0(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU).map {
+    $0.as(of: Float.self)
+  }
+  var pooled = graph.variable(.GPU(0), .NC(1, 1280), of: Float.self)
+  for (i, token) in tokens0.enumerated() {
+    if token == tokenizer0.endToken {
+      pooled[0..<1, 0..<1280] = c[0][i..<(i + 1), 0..<1280]
+      break
+    }
+  }
+  let text_proj = pipe.text_encoder_2.text_projection.weight.type(torch.float).cpu()
+  var textProj = Tensor<Float>(.CPU, .NC(1280, 1280))
+  for i in 0..<1280 {
+    for j in 0..<1280 {
+      textProj[i, j] = Float(text_proj[j, i])!
+    }
+  }
+  let textProjection = graph.variable(textProj.toGPU(0))
+  debugPrint(pooled * textProjection)
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/long_open_clip_vit_bigg14_f32.ckpt") {
+    $0.write("text_model", model: textModel0)
+    $0.write("text_projection", variable: textProjection)
+  }
+  */
+}
+
+exit(0)
+/*
 let image = pipe(
     prompt,
     height: 1024,
@@ -1198,7 +1497,9 @@ graph.withNoGrad {
     hiDream(
       inputs: xTensor,
       [rotTensorGPU, timestep, pooledPromptEmbedTensor, promptEmbed3Tensor] + promptEmbed4Tensors))
+  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/hidream_i1_fast_f16.ckpt") {
     $0.write("dit", model: hiDream)
   }
+  */
 }

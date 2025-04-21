@@ -11,7 +11,7 @@ let graph = DynamicGraph()
 
 DynamicGraph.setSeed(42)
 
-let prompt = "A cat holding a sign that says \"Hi-Dreams.ai\"."
+let prompt = "A cat holding a sign that says Hi-Dreams.ai"
 
 let filename = "hidream_i1_dev"
 
@@ -251,12 +251,14 @@ func T5Block(
 func T5ForConditionalGeneration(b: Int, t: Int) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let relativePositionBuckets = Input()
+  let attentionMask = Input()
   let textEmbed = T5TextEmbedding(vocabularySize: 32_128, embeddingSize: 4_096, name: "shared")
   var out = textEmbed(x).to(.Float32)
   let relativePositionEmbedding = Embedding(
     FloatType.self, vocabularySize: 32, embeddingSize: 64, name: "relative_position_embedding")
-  let positionBias = relativePositionEmbedding(relativePositionBuckets).reshaped([1, t, t, 64])
-    .permuted(0, 3, 1, 2).contiguous()
+  let positionBias =
+    relativePositionEmbedding(relativePositionBuckets).reshaped([1, t, t, 64])
+    .permuted(0, 3, 1, 2).contiguous() + attentionMask
   var readers = [(PythonObject) -> Void]()
   for i in 0..<24 {
     let (reader, block) = T5Block(
@@ -269,7 +271,7 @@ func T5ForConditionalGeneration(b: Int, t: Int) -> ((PythonObject) -> Void, Mode
   out = finalNorm(out).to(FloatType.dataType)
   let reader: (PythonObject) -> Void = { state_dict in
   }
-  return (reader, Model([x, relativePositionBuckets], [out]))
+  return (reader, Model([x, relativePositionBuckets, attentionMask], [out]))
 }
 
 let tokenizer0 = CLIPTokenizer(
@@ -358,9 +360,11 @@ let (c0, c0Pooled) = graph.withNoGrad {
   let textModel0 = CLIPTextModel(
     vocabularySize: 49408, maxLength: 77, embeddingSize: 768, numLayers: 12, numHeads: 12,
     batchSize: 1, intermediateSize: 3072)
+  let textProjection = graph.variable(.GPU(0), .NC(768, 768), of: FloatType.self)
   textModel0.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore("/fast/Data/SD/clip_vit_l14_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/long_clip_vit_l14_f32.ckpt") {
     try! $0.read("text_model", model: textModel0, strict: true)
+    $0.read("text_projection", variable: textProjection)
   }
   let c = textModel0(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU).map {
     $0.as(of: FloatType.self)
@@ -369,7 +373,7 @@ let (c0, c0Pooled) = graph.withNoGrad {
   let c1 = c[0].reshaped(.CHW(1, 77, 768))
   for (i, token) in tokens0.enumerated() {
     if token == tokenizer0.endToken {
-      pooled[0..<1, 0..<768] = c[1][i..<(i + 1), 0..<768]
+      pooled[0..<1, 0..<768] = c[1][i..<(i + 1), 0..<768] * textProjection
       break
     }
   }
@@ -385,7 +389,7 @@ let (c1, c1Pooled) = graph.withNoGrad {
     batchSize: 1, intermediateSize: 5120)
   let textProjection = graph.variable(.GPU(0), .NC(1280, 1280), of: FloatType.self)
   textModel1.compile(inputs: tokensTensorGPU, positionTensorGPU, casualAttentionMaskGPU)
-  graph.openStore("/fast/Data/SD/open_clip_vit_bigg14_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/long_open_clip_vit_bigg14_f32.ckpt") {
     try! $0.read("text_model", model: textModel1, strict: true)
     $0.read("text_projection", variable: textProjection)
   }
@@ -405,9 +409,8 @@ let (c1, c1Pooled) = graph.withNoGrad {
 
 let pooledPromptEmbedTensor = graph.withNoGrad {
   var pooled = graph.variable(.GPU(0), .NC(1, 2048), of: FloatType.self)
-  pooled.full(0)
-  // pooled[0..<1, 0..<768] = c0Pooled
-  // pooled[0..<1, 768..<2048] = c1Pooled
+  pooled[0..<1, 0..<768] = c0Pooled
+  pooled[0..<1, 768..<2048] = c1Pooled
   return pooled
 }
 
@@ -417,12 +420,19 @@ let promptEmbed3Tensor = graph.withNoGrad {
     sequenceLength: 128, numBuckets: 32, maxDistance: 128)
   let tokensTensorGPU = tokensTensor2.toGPU(0)
   let relativePositionBucketsGPU = graph.variable(relativePositionBuckets.toGPU(0))
-  textModel.compile(inputs: tokensTensorGPU, relativePositionBucketsGPU)
-  graph.openStore("/fast/Data/SD/t5_xxl_encoder_q6p.ckpt") {
+  let attentionMask = graph.variable(Tensor<FloatType>(.CPU, .NHWC(1, 1, 1, 128)))
+  attentionMask.full(0)
+  for i in tokens2.count..<128 {
+    attentionMask[0, 0, 0, i] = -FloatType.greatestFiniteMagnitude
+  }
+  let attentionMaskGPU = attentionMask.toGPU(0)
+  textModel.compile(inputs: tokensTensorGPU, relativePositionBucketsGPU, attentionMaskGPU)
+  graph.openStore("/fast/Data/SD/t5_xxl_encoder_f16.ckpt") {
     try! $0.read("text_model", model: textModel, strict: true, codec: [.q8p, .q6p, .q4p, .ezm7])
   }
-  let output = textModel(inputs: tokensTensorGPU, relativePositionBucketsGPU)[0].as(
-    of: FloatType.self)
+  let output = textModel(inputs: tokensTensorGPU, relativePositionBucketsGPU, attentionMaskGPU)[0]
+    .as(
+      of: FloatType.self)
   return output.reshaped(.HWC(1, 128, 4096))
 }
 
