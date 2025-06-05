@@ -9,24 +9,20 @@ let torch = Python.import("torch")
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/wan_v2.1_14b_i2v_720p_f16.ckpt",
-  // "/fast/Data/SD/flux_1_dev_f16.ckpt",
+  "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_f16.ckpt",
   flags: .readOnly
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/fast/Data/wan_v2.1_14b_i2v_720p_q5p.ckpt",
-    // "/fast/Data/SD/flux_1_dev_q5p.ckpt",
+    "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_q5p.ckpt",
     flags: .readOnly
   ) { bench in
     graph.openStore(
-      "/fast/Data/wan_v2.1_14b_i2v_720p_q5p_svd.ckpt",
-      // "/home/liu/workspace/swift-diffusion/flux_1_dev_q5p_svd.ckpt",
+      "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_q5p_svd.ckpt",
       flags: .truncateWhenClose
     ) { writer in
       graph.openStore(
-        "/fast/Data/wan_v2.1_14b_i2v_720p_q5p.ckpt",
-        // "/fast/Data/SD/flux_1_dev_q5p.ckpt",
+        "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_q5p.ckpt",
         flags: .readOnly
       ) {
         for key in keys {
@@ -45,16 +41,19 @@ graph.openStore(
           }
           print("key \(key)")
           let f32 = torch.from_numpy(tensor)
-          /*
           let benchTensor =
             (bench.read(key, codec: [.q5p, .q8p]).map { Tensor<Float32>(from: $0).toCPU() })
           let b32 = torch.from_numpy(benchTensor)
           let qTensor =
-            (writer.read(key, codec: [.q4p, .q5p, .q8p]).map { Tensor<Float32>(from: $0).toCPU() })!
+            (writer.read(key, codec: [.q4p, .q5p, .q6p, .q8p]).map {
+              Tensor<Float32>(from: $0).toCPU()
+            })!
           let q32 = torch.from_numpy(qTensor)
           var qr = q32
           if let upTensor = (writer.read("\(key)__up__").map { Tensor<Float32>(from: $0).toCPU() }),
-             let downTensor = (writer.read("\(key)__down__").map { Tensor<Float32>(from: $0).toCPU() }) {
+            let downTensor =
+              (writer.read("\(key)__down__").map { Tensor<Float32>(from: $0).toCPU() })
+          {
             let tup = torch.from_numpy(upTensor)
             let tdown = torch.from_numpy(downTensor)
             qr = q32 + torch.matmul(tup, tdown)
@@ -72,7 +71,6 @@ graph.openStore(
               codec: [.q5p, .ezm7])
           }
           continue
-          */
           let (du, ds, dv) = torch.linalg.svd(f32.double()).tuple3
           let up = torch.matmul(du[..., 0..<32], torch.diag(ds[0..<32])).half().float()  // truncate to half then float.
           let down = dv[0..<32, ...].half().float()

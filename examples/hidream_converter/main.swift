@@ -13,12 +13,12 @@ torch.set_grad_enabled(false)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-let hi_diffusers = Python.import("hi_diffusers")
+let hi_diffusers = Python.import("diffusers")
 let transformers = Python.import("transformers")
 let hi_diffusers_schedulers_fm_solvers_unipc = Python.import(
   "hi_diffusers.schedulers.fm_solvers_unipc")
 
-let pretrained_model_name_or_path = "HiDream-ai/HiDream-I1-Full"
+let pretrained_model_name_or_path = "HiDream-ai/HiDream-E1-Full"
 let scheduler = hi_diffusers_schedulers_fm_solvers_unipc.FlowUniPCMultistepScheduler(
   num_train_timesteps: 1000, shift: 3.0, use_dynamic_shifting: false)
 
@@ -64,7 +64,7 @@ let output = transformer(
   hidden_states: x, timesteps: t, encoder_hidden_states: [prompt_embed_3, prompt_embed_4],
   pooled_embeds: pooled_prompt_embed, return_dict: false)
 */
-
+/*
 let pipe = hi_diffusers.HiDreamImagePipeline.from_pretrained(
   pretrained_model_name_or_path,
   scheduler: scheduler,
@@ -77,6 +77,7 @@ let pipe = hi_diffusers.HiDreamImagePipeline.from_pretrained(
 pipe.transformer = transformer
 
 print(pipe.text_encoder.text_model)
+*/
 
 func CLIPTextEmbedding(vocabularySize: Int, maxLength: Int, embeddingSize: Int) -> (
   Model, Model, Model
@@ -251,7 +252,7 @@ print(text_inputs_0.input_ids)
 let prompt_embed_0 = pipe.text_encoder(text_inputs_0.input_ids.to("cpu"), output_hidden_states: true)
 let text_encoder_text_model_state_dict = pipe.text_encoder.text_model.state_dict()
 print(prompt_embed_0[0])
-*/
+
 let text_inputs_1 = pipe.tokenizer_2(
   prompt, padding: "max_length", max_length: 218, truncation: true, return_tensors: "pt")
 print(text_inputs_1.input_ids)
@@ -267,6 +268,7 @@ let tokenizer0 = CLIPTokenizer(
 let tokenizer1 = CLIPTokenizer(
   vocabulary: "/home/liu/workspace/swift-diffusion/examples/open_clip/vocab_16e6.json",
   merges: "/home/liu/workspace/swift-diffusion/examples/open_clip/bpe_simple_vocab_16e6.txt")
+*/
 
 graph.withNoGrad {
   /*
@@ -324,6 +326,7 @@ graph.withNoGrad {
 }
 
 graph.withNoGrad {
+  /*
   let tokens0 = tokenizer1.tokenize(text: prompt, truncation: true, maxLength: 218, paddingToken: 0)
   print(tokens0)
   let tokensTensor0 = graph.variable(.CPU, .C(218), of: Int32.self)
@@ -367,6 +370,7 @@ graph.withNoGrad {
   }
   let textProjection = graph.variable(textProj.toGPU(0))
   debugPrint(pooled * textProjection)
+  */
   /*
   graph.openStore("/home/liu/workspace/swift-diffusion/long_open_clip_vit_bigg14_f32.ckpt") {
     $0.write("text_model", model: textModel0)
@@ -375,7 +379,6 @@ graph.withNoGrad {
   */
 }
 
-exit(0)
 /*
 let image = pipe(
     prompt,
@@ -1497,9 +1500,7 @@ graph.withNoGrad {
     hiDream(
       inputs: xTensor,
       [rotTensorGPU, timestep, pooledPromptEmbedTensor, promptEmbed3Tensor] + promptEmbed4Tensors))
-  /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/hidream_i1_fast_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/hidream_e1_full_f16.ckpt") {
     $0.write("dit", model: hiDream)
   }
-  */
 }

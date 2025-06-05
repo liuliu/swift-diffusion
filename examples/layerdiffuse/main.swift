@@ -6,14 +6,25 @@ import PythonKit
 
 let torch = Python.import("torch")
 let numpy = Python.import("numpy")
+/*
 let models = Python.import("extensions.sd-forge-layerdiffuse.lib_layerdiffusion.models")
 let ldm_patched_modules_utils = Python.import("ldm_patched.modules.utils")
 
 let sd = ldm_patched_modules_utils.load_torch_file(
-  "/home/liu/workspace/stable-diffusion-webui-forge/models/layer_model/vae_transparent_decoder.safetensors"
+  "/home/liu/workspace/Flux-version-LayerDiffuse/models/TransparentVAE.pth"
 )
 
 let vae_transparent_decoder = models.TransparentVAEDecoder(sd)
+*/
+let diffusers = Python.import("diffusers")
+let lib_layerdiffuse_vae = Python.import("lib_layerdiffuse.vae")
+let pipe = diffusers.FluxPipeline.from_pretrained(
+  "black-forest-labs/FLUX.1-dev", torch_dtype: torch.bfloat16)
+let trans_vae = lib_layerdiffuse_vae.TransparentVAE(pipe.vae, pipe.vae.dtype)
+trans_vae.load_state_dict(
+  torch.load("/home/liu/workspace/Flux-version-LayerDiffuse/models/TransparentVAE.pth"),
+  strict: false)
+print(trans_vae.decoder)
 
 let random = Python.import("random")
 random.seed(42)
@@ -22,13 +33,13 @@ torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
 let pixel = torch.randn([1, 3, 1024, 1024])
-let latent = torch.randn([1, 4, 128, 128])
+let latent = torch.randn([1, 16, 128, 128])
 
-let model = vae_transparent_decoder.model.model.float().cuda()
+// let model = vae_transparent_decoder.model.model.float().cuda()
+let model = trans_vae.decoder.float().cuda()
 let out = model(pixel.cuda(), latent.cuda())
 let state_dict = model.state_dict()
-print(model)
-print(state_dict.keys())
+print(out)
 
 func ResBlock(b: Int, groups: Int, outChannels: Int, skipConnection: Bool) -> (
   Model, Model, Model, Model, Model?, Model
@@ -628,8 +639,14 @@ func TransparentVAEDecoder(startHeight: Int, startWidth: Int) -> ((PythonObject)
     let conv_norm_out_bias = state_dict["conv_norm_out.bias"].type(torch.float).cpu().numpy()
     normOut.weight.copy(from: try! Tensor<Float>(numpy: conv_norm_out_weight))
     normOut.bias.copy(from: try! Tensor<Float>(numpy: conv_norm_out_bias))
-    let conv_out_weight = state_dict["conv_out.weight"].type(torch.float).cpu().numpy()
-    let conv_out_bias = state_dict["conv_out.bias"].type(torch.float).cpu().numpy()
+    var conv_out_weight = state_dict["conv_out.weight"].type(torch.float).cpu()
+    var conv_out_bias = state_dict["conv_out.bias"].type(torch.float).cpu()
+    // For RedAIGC trained FLUX TransparentVAE, they moved alpha to the last (RGBA) rather than original SDXL's ARGB format.
+    // Standardize to ARGB here.
+    conv_out_weight = torch.cat([conv_out_weight[3..<4], conv_out_weight[0..<3]], dim: 0)
+    conv_out_weight = conv_out_weight.numpy()
+    conv_out_bias = torch.cat([conv_out_bias[3..<4], conv_out_bias[0..<3]], dim: 0)
+    conv_out_bias = conv_out_bias.numpy()
     convOut.weight.copy(from: try! Tensor<Float>(numpy: conv_out_weight))
     convOut.bias.copy(from: try! Tensor<Float>(numpy: conv_out_bias))
     for reader in readers {
@@ -649,7 +666,7 @@ graph.withNoGrad {
   reader(state_dict)
   let out = decoder(inputs: pixelTensor, latentTensor)[0].as(of: Float.self)
   debugPrint(out)
-  graph.openStore("/home/liu/workspace/swift-diffusion/transparent_vae_decoder_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/flux_1_transparent_vae_decoder_f32.ckpt") {
     $0.write("decoder", model: decoder)
   }
 }
