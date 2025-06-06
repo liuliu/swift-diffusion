@@ -20,10 +20,10 @@ let Image = Python.import("PIL.Image")
 let torch_nn_functional = Python.import("torch.nn.functional")
 let torchvision_transforms_functional = Python.import("torchvision.transforms.functional")
 
-let cfg = wan.configs.WAN_CONFIGS["t2v-14B"]
+let cfg = wan.configs.WAN_CONFIGS["t2v-1.3B"]
 let wan_vace = wan.WanVace(
   config: cfg,
-  checkpoint_dir: "/home/liu/workspace/Wan2.1/Wan2.1-VACE-14B",
+  checkpoint_dir: "/home/liu/workspace/Wan2.1/Wan2.1-VACE-1.3B",
   device_id: 0,
   rank: 0,
   t5_fsdp: false,
@@ -224,8 +224,8 @@ let vace_c = torch.randn([96, 21, 60, 104]).to(torch.float).cuda()
 let t = torch.tensor([900], dtype: torch.float, device: torch.device("cuda:0"))
 let context = torch.randn([28, 4096]).to(torch.float).cuda()
 print(wan_vace.model)
-wan_vace.model.half().to(torch.device("cuda:0"))
-let out = wan_vace.model([x], t, [vace_c], [context], 21 * 30 * 52)
+// wan_vace.model.half().to(torch.device("cuda:0"))
+// let out = wan_vace.model([x], t, [vace_c], [context], 21 * 30 * 52)
 // print(out)
 
 let wan_state_dict = wan_vace.model.state_dict()
@@ -545,7 +545,7 @@ func WanVace(
   let (timeInMlp0, timeInMlp2, timeIn) = TimeEmbedder(channels: channels, name: "t")
   let vector = timeIn(t).reshaped([1, 1, channels])
   let vectorIn = vector.swish()
-  let timeProjections = (0..<6).map { Dense(count: channels, name: "vace_ada_ln_\($0)") }
+  let timeProjections = (0..<6).map { Dense(count: channels, name: "ada_ln_\($0)") }
   let tOut = timeProjections.map { $0(vectorIn) }
   let h = height / 2
   let w = width / 2
@@ -734,10 +734,9 @@ graph.withNoGrad {
     }
   }
   let (vace, vaceReader) = WanVace(
-    // channels: 1536, layers: 30, vaceLayers: (0..<15).map { $0 * 2 }, intermediateSize: 8960, time: 21, height: 60, width: 104,
-    channels: 5120, layers: 40, vaceLayers: (0..<8).map { $0 * 5 }, intermediateSize: 13824,
-    time: 21, height: 60, width: 104,
-    textLength: 512)
+    channels: 1536, layers: 30, vaceLayers: (0..<15).map { $0 * 2 }, intermediateSize: 8960,
+    // channels: 5120, layers: 40, vaceLayers: (0..<8).map { $0 * 5 }, intermediateSize: 13824,
+    time: 21, height: 60, width: 104, textLength: 512)
   let vaceTensor = graph.variable(
     Tensor<Float16>(
       from: try! Tensor<Float>(numpy: vace_c.to(torch.float).cpu().numpy())
@@ -763,7 +762,7 @@ graph.withNoGrad {
   vace.compile(inputs: xTensor, vaceTensor, txtIn, tGPU, rotNdTensorGPU)
   vaceReader(wan_state_dict)
   debugPrint(vace(inputs: xTensor, vaceTensor, txtIn, tGPU, rotNdTensorGPU))
-  graph.openStore("/home/liu/workspace/swift-diffusion/wan_v2.1_14b_vace_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/wan_v2.1_1.3b_vace_f16.ckpt") {
     $0.write("dit", model: vace)
   }
 }
