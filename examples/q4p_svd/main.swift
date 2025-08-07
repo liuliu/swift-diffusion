@@ -9,25 +9,25 @@ let torch = Python.import("torch")
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_f16.ckpt",
+  "/home/liu/workspace/draw-things-community/wan_v2.2_a14b_hne_i2v_f16.ckpt",
   flags: .readOnly
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_q5p.ckpt",
+    "/home/liu/workspace/draw-things-community/wan_v2.2_a14b_hne_i2v_q6p.ckpt",
     flags: .readOnly
   ) { bench in
     graph.openStore(
-      "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_q5p_svd.ckpt",
+      "/home/liu/workspace/draw-things-community/wan_v2.2_a14b_hne_i2v_q6p_svd.ckpt",
       flags: .truncateWhenClose
     ) { writer in
       graph.openStore(
-        "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_q5p.ckpt",
+        "/home/liu/workspace/draw-things-community/wan_v2.2_a14b_hne_i2v_q6p.ckpt",
         flags: .readOnly
       ) {
         for key in keys {
           guard var codec = $0.codec(for: key) else { continue }
-          guard codec == .q5p else {
+          guard codec == .q6p else {
             codec.subtract([.externalData, .jit, .externalOnDemand])
             guard let tensor = $0.read(key, codec: codec.union([.jit, .externalData])) else {
               continue
@@ -68,7 +68,7 @@ graph.openStore(
             writer.remove("\(key)__down__")
             writer.write(
               key, tensor: Tensor<Float16>(from: tensor),
-              codec: [.q5p, .ezm7])
+              codec: [.q6p, .ezm7])
           }
           continue
           let (du, ds, dv) = torch.linalg.svd(f32.double()).tuple3
@@ -83,7 +83,7 @@ graph.openStore(
           )
           writer.write(
             key, tensor: Tensor<Float16>(from: try! Tensor<Float>(numpy: rdiff.numpy())),
-            codec: [.q5p, .ezm7])
+            codec: [.q6p, .ezm7])
         }
       }
     }

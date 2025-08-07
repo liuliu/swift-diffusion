@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_f16.ckpt"
+  "/home/liu/workspace/draw-things-community/flux_1_krea_dev_f16.ckpt"
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/draw-things-community/pixelwave_flux_1_schnell_04_q8p.ckpt",
+    "/home/liu/workspace/draw-things-community/flux_1_krea_dev_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
