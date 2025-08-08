@@ -1118,6 +1118,23 @@ swift_binary(
 )
 
 swift_binary(
+    name = "qwen_converter",
+    srcs = ["qwen_converter/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+        "@s4nnc//tensorboard",
+        "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
+
+swift_binary(
     name = "qwen",
     srcs = ["qwen/main.swift"],
     data = [

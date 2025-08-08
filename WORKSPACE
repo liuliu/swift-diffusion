@@ -1,11 +1,6 @@
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository", "new_git_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
-local_repository(
-    name = "ccv",
-    path = "/home/liu/workspace/ccv",
-)
-
 git_repository(
     name = "s4nnc",
     commit = "52d97ca5cddb26a097ed179b401b263a446e297a",
