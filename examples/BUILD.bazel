@@ -1129,6 +1129,7 @@ swift_binary(
         "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
         "@s4nnc//nnc:nnc_python",
+        "@s4nnc//tensorboard",
         "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )

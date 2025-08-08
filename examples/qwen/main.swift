@@ -4,6 +4,7 @@ import NNC
 import NNCPythonConversion
 import PNG
 import PythonKit
+import TensorBoard
 
 let graph = DynamicGraph()
 
@@ -302,10 +303,11 @@ func JointTransformerBlock(
   queries = Functional.cmul(left: queries, right: rot)
   keys = Functional.cmul(left: keys, right: rot)
   // Now run attention.
+  /*
   let out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot(), flags: [.Float16])(
     queries, keys, values
   ).reshaped([b, t + hw, h * k])
-  /*
+  */
   keys = keys.transposed(1, 2)
   queries = ((1.0 / Float(k).squareRoot()) * queries)
     .transposed(1, 2)
@@ -316,7 +318,6 @@ func JointTransformerBlock(
   dot = dot.reshaped([b, h, (t + hw), t + hw])
   var out = dot * values
   out = out.reshaped([b, h, (t + hw), k]).transposed(1, 2).reshaped([b, (t + hw), h * k])
-  */
   let contextUnifyheads: Model?
   if !contextBlockPreOnly {
     contextOut = out.reshaped(
@@ -353,12 +354,12 @@ func JointTransformerBlock(
       epsilon: noScale ? 1e-6 : 1e-6 / 4096, axis: [2], elementwiseAffine: false)
     contextOut =
       contextOut
-      + ((upcast ? contextChunks[5].to(of: contextOut) : contextChunks[5])
+      + ((upcast ? contextChunks[5].to(of: contextOut) : contextChunks[5].to(of: contextOut))
       .* contextFF(
         (contextNorm2(contextOut) .* (1 + contextChunks[4].to(of: contextOut))
           + contextChunks[3].to(of: contextOut)).to(.Float16))).to(
         of: contextOut)
-    // contextOut = contextOut.clamped(-65504...65504)
+    // contextOut = contextOut.clamped(-16...16)
   } else {
     contextLinear1 = nil
     contextOutProjection = nil
@@ -368,10 +369,10 @@ func JointTransformerBlock(
   let xNorm2 = LayerNorm(epsilon: noScale ? 1e-6 : 1e-6 / 4096, axis: [2], elementwiseAffine: false)
   xOut =
     xOut
-    + ((upcast ? xChunks[5].to(of: xOut) : xChunks[5])
+    + ((upcast ? xChunks[5].to(of: xOut) : xChunks[5].to(of: xOut))
     .* xFF((xNorm2(xOut) .* (1 + xChunks[4].to(of: xOut)) + xChunks[3].to(of: xOut)).to(.Float16)))
     .to(of: xOut)
-  // xOut = xOut.clamped(-65504...65504)
+  // xOut = xOut.clamped(-16...16)
   let reader: (PythonObject) -> Void = { state_dict in
     let txt_attn_q_weight = state_dict["\(prefix).attn.add_q_proj.weight"].to(
       torch.float
@@ -391,11 +392,9 @@ func JointTransformerBlock(
       torch.float
     ).cpu().numpy()
     contextToKeys.weight.copy(
-      from: Tensor<Float16>(
-        from: try! Tensor<Float>(numpy: txt_attn_k_weight)))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_attn_k_weight)))
     contextToKeys.bias.copy(
-      from: Tensor<Float16>(
-        from: try! Tensor<Float>(numpy: txt_attn_k_bias)))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_attn_k_bias)))
     let txt_attn_v_weight = state_dict["\(prefix).attn.add_v_proj.weight"].to(
       torch.float
     ).cpu().numpy()
@@ -403,12 +402,9 @@ func JointTransformerBlock(
       torch.float
     ).cpu().numpy()
     contextToValues.weight.copy(
-      from: Tensor<Float16>(
-        from: try! Tensor<Float>(numpy: txt_attn_v_weight))
-    )
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_attn_v_weight)))
     contextToValues.bias.copy(
-      from: Tensor<Float16>(
-        from: try! Tensor<Float>(numpy: txt_attn_v_bias)))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_attn_v_bias)))
     let txt_attn_key_norm_scale = state_dict["\(prefix).attn.norm_added_k.weight"].to(
       torch.float
     ).cpu().numpy()
@@ -437,11 +433,9 @@ func JointTransformerBlock(
       torch.float
     ).cpu().numpy()
     xToKeys.weight.copy(
-      from: Tensor<Float16>(
-        from: try! Tensor<Float>(numpy: img_attn_k_weight)))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_attn_k_weight)))
     xToKeys.bias.copy(
-      from: Tensor<Float16>(
-        from: try! Tensor<Float>(numpy: img_attn_k_bias)))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_attn_k_bias)))
     let img_attn_v_weight = state_dict["\(prefix).attn.to_v.weight"].to(
       torch.float
     ).cpu().numpy()
@@ -449,11 +443,9 @@ func JointTransformerBlock(
       torch.float
     ).cpu().numpy()
     xToValues.weight.copy(
-      from: Tensor<Float16>(
-        from: try! Tensor<Float>(numpy: img_attn_v_weight)))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_attn_v_weight)))
     xToValues.bias.copy(
-      from: Tensor<Float16>(
-        from: try! Tensor<Float>(numpy: img_attn_v_bias)))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_attn_v_bias)))
     let img_attn_key_norm_scale = state_dict["\(prefix).attn.norm_k.weight"].to(
       torch.float
     ).cpu().numpy()
@@ -589,7 +581,27 @@ func JointTransformerBlock(
   }
 }
 
-func QwenImage(height: Int, width: Int, textLength: Int) -> (Model, (PythonObject) -> Void) {
+/*
+func QwenImageFixed(layers: Int) -> (Model, (PythonObject) -> Void) {
+  let t = Input()
+  let (timeInMlp0, timeInMlp2, timeIn) = MLPEmbedder(channels: 3_072, name: "t")
+  var vec = timeIn(t)
+  vec = vec.reshaped([1, 1, 3072]).swish()
+  var outputs = [Model.IO]()
+  for i in 0..<layers {
+    let (reader, block) = JointTransformerBlockFixed(
+      prefix: "transformer_blocks.\(i)", contextBlockPreOnly: i == layers - 1)
+    outputs.append(block(vec))
+  }
+  let scale = Dense(count: 3072, name: "ada_ln_0")
+  let shift = Dense(count: 3072, name: "ada_ln_1")
+  out = (1 + scale(vec)) .* out.to(.Float16) + shift(vec)
+}
+*/
+
+func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
+  Model, (PythonObject) -> Void
+) {
   let x = Input()
   let rot = Input()
   let txt = Input()
@@ -597,33 +609,35 @@ func QwenImage(height: Int, width: Int, textLength: Int) -> (Model, (PythonObjec
   let imgIn = Dense(count: 3072, name: "x_embedder")
   let txtNorm = RMSNorm(epsilon: 1e-6, axis: [2], name: "context_norm")
   let txtIn = Dense(count: 3_072, name: "context_embedder")
+  let (timeInMlp0, timeInMlp2, timeIn) = MLPEmbedder(channels: 3_072, name: "t")
+  var vec = timeIn(t)
+  vec = vec.reshaped([1, 1, 3072]).swish().to(.Float16)
   var context = txtIn(txtNorm(txt))
   var readers = [(PythonObject) -> Void]()
   context = context.to(.Float32)
   var out = imgIn(x).to(.Float32)
-  let (timeInMlp0, timeInMlp2, timeIn) = MLPEmbedder(channels: 3_072, name: "t")
-  var vec = timeIn(t)
-  vec = vec.reshaped([1, 1, 3072]).swish().to(.Float16)
   let h = height / 2
   let w = width / 2
-  for i in 0..<1 {
+  for i in 0..<layers {
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: h * w,
-      contextBlockPreOnly: i == 0, upcast: true, noScale: i < 30)
+      contextBlockPreOnly: i == layers - 1, upcast: true, noScale: true)  // i < 30)
     let blockOut = block(out, context, vec, rot)
-    if i == 0 {
+    if i == layers - 1 {
       out = blockOut
     } else {
       out = blockOut[0]
       context = blockOut[1]
     }
+    /*
     if i == 29 {
       out = (1.0 / 64) * out  // Scale down input / output.
       context = (1.0 / 64) * context
     }
+    */
     readers.append(reader)
   }
-  let normFinal = LayerNorm(epsilon: 1e-6 / (4096), axis: [2], elementwiseAffine: false)
+  let normFinal = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   out = normFinal(out).debug { tensors, _ in
     let q = Tensor<Float32>(from: tensors[0]!).toCPU()
     let savedTensor = savedTensor!
@@ -635,13 +649,11 @@ func QwenImage(height: Int, width: Int, textLength: Int) -> (Model, (PythonObjec
       debugPrint(diff.reduced(.mean, axis: [0, 1, 2]))
     }
   }
-  /*
   let scale = Dense(count: 3072, name: "ada_ln_0")
   let shift = Dense(count: 3072, name: "ada_ln_1")
   out = (1 + scale(vec)) .* out.to(.Float16) + shift(vec)
   let projOut = Dense(count: 2 * 2 * 16, name: "linear")
   out = projOut(out)
-  */
   let reader: (PythonObject) -> Void = { state_dict in
     let img_in_weight = state_dict["img_in.weight"].to(
       torch.float
@@ -656,16 +668,16 @@ func QwenImage(height: Int, width: Int, textLength: Int) -> (Model, (PythonObjec
       torch.float
     ).cpu().numpy()
     txtNorm.weight.copy(
-      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_norm_scale)))
+      from: try! Tensor<Float>(numpy: txt_norm_scale))
     let txt_in_weight = state_dict["txt_in.weight"].to(
       torch.float
     ).cpu().numpy()
     let txt_in_bias = state_dict["txt_in.bias"].to(torch.float)
       .cpu().numpy()
     txtIn.weight.copy(
-      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_in_weight)))
+      from: try! Tensor<Float>(numpy: txt_in_weight))
     txtIn.bias.copy(
-      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_in_bias)))
+      from: try! Tensor<Float>(numpy: txt_in_bias))
     let timestep_embedder_linear_1_weight = state_dict[
       "time_text_embed.timestep_embedder.linear_1.weight"
     ].to(
@@ -693,7 +705,6 @@ func QwenImage(height: Int, width: Int, textLength: Int) -> (Model, (PythonObjec
     for reader in readers {
       reader(state_dict)
     }
-    /*
     let norm_out_linear_weight = state_dict["norm_out.linear.weight"].to(torch.float)
       .cpu().numpy()
     let norm_out_linear_bias = state_dict["norm_out.linear.bias"].to(torch.float)
@@ -716,7 +727,6 @@ func QwenImage(height: Int, width: Int, textLength: Int) -> (Model, (PythonObjec
       torch.float
     ).cpu().numpy()
     projOut.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: proj_out_bias)))
-    */
   }
   return (Model([x, rot, t, txt], [out]), reader)
 }
@@ -740,12 +750,12 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
 }
 
 let x = torch.randn([1, 4096, 64]).to(torch.bfloat16).cuda()
-let txt = torch.randn([1, 1, 3584]).to(torch.bfloat16).cuda() * 0.01
-let txt_mask = torch.full([1, 1], 1).to(torch.bfloat16).cuda()
+let txt = torch.randn([1, 18, 3584]).to(torch.bfloat16).cuda()
+let txt_mask = torch.full([1, 18], 1).to(torch.bfloat16).cuda()
 let t = torch.full([1], 1).to(torch.bfloat16).cuda()
 
 let output = pipe.transformer(
-  x, txt, txt_mask, t, img_shapes: [PythonObject(tupleOf: 1, 64, 64)], txt_seq_lens: [1],
+  x, txt, txt_mask, t, img_shapes: [PythonObject(tupleOf: 1, 64, 64)], txt_seq_lens: [18],
   attention_kwargs: [PythonObject: PythonObject](), return_dict: false)
 
 print(output)
@@ -755,15 +765,29 @@ savedTensor = try! Tensor<Float>(numpy: pipe.transformer.saved_val.to(torch.floa
 
 graph.withNoGrad {
   let state_dict = pipe.transformer.state_dict()
+  let keys = state_dict.keys()
+  /*
+  let summaryWriter = SummaryWriter(logDirectory: "/tmp/qwen/")
+  for key in keys {
+      let numpyTensor = state_dict[key].to(torch.float).cpu().numpy()
+      let tensor = try! Tensor<Float>(numpy: numpyTensor)
+      summaryWriter.addHistogram(String(key)!, tensor, step: 0)
+  }
+  */
   let xTensor = graph.variable(
     Tensor<Float16>(from: try! Tensor<Float>(numpy: x.to(torch.float).cpu().numpy())).toGPU(1))
   let tTensor = graph.variable(
     timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000).toGPU(1))
   let cTensor = graph.variable(
-    Tensor<Float16>(from: try! Tensor<Float>(numpy: txt.to(torch.float).cpu().numpy())).toGPU(1))
-  let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + 1, 1, 128), of: Float.self)
+    try! Tensor<Float>(numpy: txt.to(torch.float).cpu().numpy()).toGPU(1))
+  let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + 18, 1, 128), of: Float.self)
+  for i in 0..<(4096 + 18) {
+    for j in 0..<128 {
+      rotTensor[0, i, 0, j] = -100000
+    }
+  }
   let maxImgIdx = max(64 / 2, 64 / 2)
-  for i in 0..<1 {
+  for i in 0..<18 {
     for k in 0..<8 {
       let theta = Double(i + maxImgIdx) * 1.0 / pow(10_000, Double(k) / 8)
       let sintheta = sin(theta)
@@ -788,7 +812,7 @@ graph.withNoGrad {
   }
   for y in 0..<64 {
     for x in 0..<64 {
-      let i = y * 64 + x + 1
+      let i = y * 64 + x + 18
       for k in 0..<8 {
         let theta = 0 * 1.0 / pow(10_000, Double(k) / 8)
         let sintheta = sin(theta)
@@ -814,11 +838,11 @@ graph.withNoGrad {
   }
   debugPrint(rotTensor)
   let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(1)
-  let (dit, reader) = QwenImage(height: 128, width: 128, textLength: 1)
+  let (dit, reader) = QwenImage(height: 128, width: 128, textLength: 18, layers: 2)
   dit.maxConcurrency = .limit(4)
   dit.compile(inputs: xTensor, rotTensorGPU, tTensor, cTensor)
   reader(state_dict)
-  DynamicGraph.logLevel = .verbose
+  // DynamicGraph.logLevel = .verbose
   debugPrint(dit(inputs: xTensor, rotTensorGPU, tTensor, cTensor))
   /*
   graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_1.0_f32.ckpt") {
