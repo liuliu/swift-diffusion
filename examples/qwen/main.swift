@@ -228,7 +228,7 @@ func MLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
   return (fc0, fc2, Model([x], [out]))
 }
 
-func FeedForward(hiddenSize: Int, intermediateSize: Int, upcast: Bool, noScale: Bool, name: String)
+func FeedForward(hiddenSize: Int, intermediateSize: Int, scaleFactor: Float?, name: String)
   -> (
     Model, Model, Model
   )
@@ -237,27 +237,20 @@ func FeedForward(hiddenSize: Int, intermediateSize: Int, upcast: Bool, noScale: 
   let linear1 = Dense(count: intermediateSize, name: "\(name)_linear1")
   var out = linear1(x).GELU(approximate: .tanh)
   // The scale down is integrated into out proj bias.
-  if upcast {
-    let scaleFactor: Float = 8
+  if let scaleFactor = scaleFactor {
     out = (1 / scaleFactor) * out
   }
   let outProjection = Dense(count: hiddenSize, name: "\(name)_out_proj")
-  out = outProjection(out)
-  if upcast {
-    out = out.to(.Float32)
-    if noScale {
-      let scaleFactor: Float = 8
-      out = out * scaleFactor
-    } else {
-      out = (1.0 / 8) * out
-    }
+  out = outProjection(out).to(.Float32)
+  if let scaleFactor = scaleFactor {
+    out = out * scaleFactor
   }
   return (linear1, outProjection, Model([x], [out]))
 }
 
 func JointTransformerBlock(
-  prefix: String, k: Int, h: Int, b: Int, t: Int, hw: Int, contextBlockPreOnly: Bool, upcast: Bool,
-  noScale: Bool
+  prefix: String, k: Int, h: Int, b: Int, t: Int, hw: Int, contextBlockPreOnly: Bool,
+  scaleFactor: (Float, Float)
 ) -> ((PythonObject) -> Void, Model) {
   let context = Input()
   let x = Input()
@@ -268,7 +261,7 @@ func JointTransformerBlock(
   }
   let contextChunks = contextAdaLNs.map { $0(c) }
   let contextNorm1 = LayerNorm(
-    epsilon: noScale ? 1e-6 : 1e-6 / 4096, axis: [2], elementwiseAffine: false)
+    epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   var contextOut =
     ((1 + contextChunks[1].to(of: context)) .* contextNorm1(context)
     + contextChunks[0].to(of: context)).to(.Float16)
@@ -284,7 +277,7 @@ func JointTransformerBlock(
   let contextV = contextToValues(contextOut).reshaped([b, t, h, k])
   let xAdaLNs = (0..<6).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
   var xChunks = xAdaLNs.map { $0(c) }
-  let xNorm1 = LayerNorm(epsilon: noScale ? 1e-6 : 1e-6 / 4096, axis: [2], elementwiseAffine: false)
+  let xNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   var xOut = xNorm1(x)
   xOut = ((1 + xChunks[1].to(of: x)) .* xOut + xChunks[0].to(of: x)).to(.Float16)
   let xToKeys = Dense(count: k * h, name: "x_k")
@@ -303,11 +296,10 @@ func JointTransformerBlock(
   queries = Functional.cmul(left: queries, right: rot)
   keys = Functional.cmul(left: keys, right: rot)
   // Now run attention.
-  /*
   let out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot(), flags: [.Float16])(
     queries, keys, values
   ).reshaped([b, t + hw, h * k])
-  */
+  /*
   keys = keys.transposed(1, 2)
   queries = ((1.0 / Float(k).squareRoot()) * queries)
     .transposed(1, 2)
@@ -318,13 +310,14 @@ func JointTransformerBlock(
   dot = dot.reshaped([b, h, (t + hw), t + hw])
   var out = dot * values
   out = out.reshaped([b, h, (t + hw), k]).transposed(1, 2).reshaped([b, (t + hw), h * k])
+  */
   let contextUnifyheads: Model?
   if !contextBlockPreOnly {
     contextOut = out.reshaped(
       [b, t, h * k], strides: [(t + hw) * h * k, h * k, 1]
     ).contiguous()
     let unifyheads = Dense(count: k * h, name: "c_o")
-    contextOut = unifyheads(contextOut.to(of: context))
+    contextOut = scaleFactor.0 * unifyheads((1.0 / scaleFactor.0) * contextOut).to(of: context)
     contextUnifyheads = unifyheads
   } else {
     contextUnifyheads = nil
@@ -332,15 +325,9 @@ func JointTransformerBlock(
   xOut = out.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
     .contiguous()
   let xUnifyheads = Dense(count: k * h, name: "x_o")
-  xOut = xUnifyheads(xOut.to(of: x))
+  xOut = scaleFactor.0 * xUnifyheads((1.0 / scaleFactor.0) * xOut).to(of: x)
   if !contextBlockPreOnly {
-    if !noScale {
-      contextOut = (1.0 / 64) * contextOut
-    }
     contextOut = context + (contextChunks[2]).to(of: context) .* contextOut
-  }
-  if !noScale {
-    xOut = (1.0 / 64) * xOut
   }
   xOut = x + (xChunks[2]).to(of: x) .* xOut
   // Attentions are now. Now run MLP.
@@ -349,30 +336,29 @@ func JointTransformerBlock(
   if !contextBlockPreOnly {
     let contextFF: Model
     (contextLinear1, contextOutProjection, contextFF) = FeedForward(
-      hiddenSize: k * h, intermediateSize: k * h * 4, upcast: upcast, noScale: noScale, name: "c")
+      hiddenSize: k * h, intermediateSize: k * h * 4, scaleFactor: scaleFactor.1, name: "c")
     let contextNorm2 = LayerNorm(
-      epsilon: noScale ? 1e-6 : 1e-6 / 4096, axis: [2], elementwiseAffine: false)
+      epsilon: 1e-6, axis: [2], elementwiseAffine: false)
     contextOut =
       contextOut
-      + ((upcast ? contextChunks[5].to(of: contextOut) : contextChunks[5].to(of: contextOut))
+      + contextChunks[5].to(of: contextOut)
       .* contextFF(
         (contextNorm2(contextOut) .* (1 + contextChunks[4].to(of: contextOut))
-          + contextChunks[3].to(of: contextOut)).to(.Float16))).to(
+          + contextChunks[3].to(of: contextOut)).to(.Float16)
+      ).to(
         of: contextOut)
-    // contextOut = contextOut.clamped(-16...16)
   } else {
     contextLinear1 = nil
     contextOutProjection = nil
   }
   let (xLinear1, xOutProjection, xFF) = FeedForward(
-    hiddenSize: k * h, intermediateSize: k * h * 4, upcast: upcast, noScale: noScale, name: "x")
-  let xNorm2 = LayerNorm(epsilon: noScale ? 1e-6 : 1e-6 / 4096, axis: [2], elementwiseAffine: false)
+    hiddenSize: k * h, intermediateSize: k * h * 4, scaleFactor: scaleFactor.1, name: "x")
+  let xNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   xOut =
     xOut
-    + ((upcast ? xChunks[5].to(of: xOut) : xChunks[5].to(of: xOut))
-    .* xFF((xNorm2(xOut) .* (1 + xChunks[4].to(of: xOut)) + xChunks[3].to(of: xOut)).to(.Float16)))
+    + xChunks[5].to(of: xOut)
+    .* xFF((xNorm2(xOut) .* (1 + xChunks[4].to(of: xOut)) + xChunks[3].to(of: xOut)).to(.Float16))
     .to(of: xOut)
-  // xOut = xOut.clamped(-16...16)
   let reader: (PythonObject) -> Void = { state_dict in
     let txt_attn_q_weight = state_dict["\(prefix).attn.add_q_proj.weight"].to(
       torch.float
@@ -456,31 +442,34 @@ func JointTransformerBlock(
     ).cpu().numpy()
     normQ.weight.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_attn_query_norm_scale)))
-    let scaleFactor: Float = upcast ? 8 : 1
     if let contextUnifyheads = contextUnifyheads {
       let attn_to_add_out_weight = state_dict["\(prefix).attn.to_add_out.weight"]
         .to(
           torch.float
         ).cpu().numpy()
       contextUnifyheads.weight.copy(
-        from: try! Tensor<Float>(numpy: attn_to_add_out_weight))
-      let attn_to_add_out_bias = state_dict["\(prefix).attn.to_add_out.bias"]
+        from: Tensor<Float16>(from: try! Tensor<Float>(numpy: attn_to_add_out_weight)))
+      let attn_to_add_out_bias =
+        ((1 / scaleFactor.0).pythonObject
+        * state_dict["\(prefix).attn.to_add_out.bias"]
         .to(
           torch.float
-        ).cpu().numpy()
+        ).cpu()).numpy()
       contextUnifyheads.bias.copy(
-        from: try! Tensor<Float>(numpy: attn_to_add_out_bias))
+        from: Tensor<Float16>(from: try! Tensor<Float>(numpy: attn_to_add_out_bias)))
     }
     let attn_to_out_0_weight = state_dict["\(prefix).attn.to_out.0.weight"].to(
       torch.float
     ).cpu().numpy()
     xUnifyheads.weight.copy(
-      from: try! Tensor<Float>(numpy: attn_to_out_0_weight))
-    let attn_to_out_0_bias = state_dict["\(prefix).attn.to_out.0.bias"].to(
-      torch.float
-    ).cpu().numpy()
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: attn_to_out_0_weight)))
+    let attn_to_out_0_bias =
+      ((1 / scaleFactor.0).pythonObject
+      * state_dict["\(prefix).attn.to_out.0.bias"].to(
+        torch.float
+      ).cpu()).numpy()
     xUnifyheads.bias.copy(
-      from: try! Tensor<Float>(numpy: attn_to_out_0_bias))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: attn_to_out_0_bias)))
     if let contextLinear1 = contextLinear1,
       let contextOutProjection = contextOutProjection
     {
@@ -503,7 +492,7 @@ func JointTransformerBlock(
       contextOutProjection.weight.copy(
         from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_context_out_projection_weight)))
       let ff_context_out_projection_bias =
-        ((1 / scaleFactor).pythonObject
+        ((1 / scaleFactor.1).pythonObject
         * state_dict[
           "\(prefix).txt_mlp.net.2.bias"
         ].to(
@@ -529,7 +518,7 @@ func JointTransformerBlock(
     xOutProjection.weight.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_out_projection_weight)))
     let ff_out_projection_bias =
-      ((1 / scaleFactor).pythonObject
+      ((1 / scaleFactor.1).pythonObject
       * state_dict["\(prefix).img_mlp.net.2.bias"].to(
         torch.float
       ).cpu()).numpy()
@@ -581,23 +570,7 @@ func JointTransformerBlock(
   }
 }
 
-/*
-func QwenImageFixed(layers: Int) -> (Model, (PythonObject) -> Void) {
-  let t = Input()
-  let (timeInMlp0, timeInMlp2, timeIn) = MLPEmbedder(channels: 3_072, name: "t")
-  var vec = timeIn(t)
-  vec = vec.reshaped([1, 1, 3072]).swish()
-  var outputs = [Model.IO]()
-  for i in 0..<layers {
-    let (reader, block) = JointTransformerBlockFixed(
-      prefix: "transformer_blocks.\(i)", contextBlockPreOnly: i == layers - 1)
-    outputs.append(block(vec))
-  }
-  let scale = Dense(count: 3072, name: "ada_ln_0")
-  let shift = Dense(count: 3072, name: "ada_ln_1")
-  out = (1 + scale(vec)) .* out.to(.Float16) + shift(vec)
-}
-*/
+// let summaryWriter = SummaryWriter(logDirectory: "/tmp/qwen/")
 
 func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
   Model, (PythonObject) -> Void
@@ -611,7 +584,7 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
   let txtIn = Dense(count: 3_072, name: "context_embedder")
   let (timeInMlp0, timeInMlp2, timeIn) = MLPEmbedder(channels: 3_072, name: "t")
   var vec = timeIn(t)
-  vec = vec.reshaped([1, 1, 3072]).swish().to(.Float16)
+  vec = vec.reshaped([1, 1, 3072]).swish()
   var context = txtIn(txtNorm(txt))
   var readers = [(PythonObject) -> Void]()
   context = context.to(.Float32)
@@ -621,7 +594,7 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
   for i in 0..<layers {
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: h * w,
-      contextBlockPreOnly: i == layers - 1, upcast: true, noScale: true)  // i < 30)
+      contextBlockPreOnly: i == layers - 1, scaleFactor: (4, i >= layers - 1 ? 64 : 2))
     let blockOut = block(out, context, vec, rot)
     if i == layers - 1 {
       out = blockOut
@@ -630,28 +603,25 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
       context = blockOut[1]
     }
     /*
-    if i == 29 {
-      out = (1.0 / 64) * out  // Scale down input / output.
-      context = (1.0 / 64) * context
+    out = out.debug { tensors, _ in
+      let q = Tensor<Float32>(from: tensors[0]!).toCPU()
+      summaryWriter.addHistogram("layer_\(i)", q, step: 0)
+      let savedTensor = savedTensor!
+      let graph = DynamicGraph()
+      graph.withNoGrad {
+        let val0 = graph.variable(q)
+        let val1 = graph.variable(savedTensor)
+        let diff = Functional.abs(val0 - val1)
+        debugPrint(diff.reduced(.mean, axis: [0, 1, 2]))
+      }
     }
     */
     readers.append(reader)
   }
   let normFinal = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  out = normFinal(out).debug { tensors, _ in
-    let q = Tensor<Float32>(from: tensors[0]!).toCPU()
-    let savedTensor = savedTensor!
-    let graph = DynamicGraph()
-    graph.withNoGrad {
-      let val0 = graph.variable(q)
-      let val1 = graph.variable(savedTensor)
-      let diff = Functional.abs(val0 - val1)
-      debugPrint(diff.reduced(.mean, axis: [0, 1, 2]))
-    }
-  }
   let scale = Dense(count: 3072, name: "ada_ln_0")
   let shift = Dense(count: 3072, name: "ada_ln_1")
-  out = (1 + scale(vec)) .* out.to(.Float16) + shift(vec)
+  out = (1 + scale(vec)) .* normFinal(out).to(.Float16) + shift(vec)
   let projOut = Dense(count: 2 * 2 * 16, name: "linear")
   out = projOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
@@ -668,16 +638,16 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
       torch.float
     ).cpu().numpy()
     txtNorm.weight.copy(
-      from: try! Tensor<Float>(numpy: txt_norm_scale))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_norm_scale)))
     let txt_in_weight = state_dict["txt_in.weight"].to(
       torch.float
     ).cpu().numpy()
     let txt_in_bias = state_dict["txt_in.bias"].to(torch.float)
       .cpu().numpy()
     txtIn.weight.copy(
-      from: try! Tensor<Float>(numpy: txt_in_weight))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_in_weight)))
     txtIn.bias.copy(
-      from: try! Tensor<Float>(numpy: txt_in_bias))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: txt_in_bias)))
     let timestep_embedder_linear_1_weight = state_dict[
       "time_text_embed.timestep_embedder.linear_1.weight"
     ].to(
@@ -688,8 +658,9 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
     ].to(torch.float)
       .cpu().numpy()
     timeInMlp0.weight.copy(
-      from: try! Tensor<Float>(numpy: timestep_embedder_linear_1_weight))
-    timeInMlp0.bias.copy(from: try! Tensor<Float>(numpy: timestep_embedder_linear_1_bias))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: timestep_embedder_linear_1_weight)))
+    timeInMlp0.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: timestep_embedder_linear_1_bias)))
     let timestep_embedder_linear_2_weight = state_dict[
       "time_text_embed.timestep_embedder.linear_2.weight"
     ].to(
@@ -700,8 +671,9 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
     ].to(torch.float)
       .cpu().numpy()
     timeInMlp2.weight.copy(
-      from: try! Tensor<Float>(numpy: timestep_embedder_linear_2_weight))
-    timeInMlp2.bias.copy(from: try! Tensor<Float>(numpy: timestep_embedder_linear_2_bias))
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: timestep_embedder_linear_2_weight)))
+    timeInMlp2.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: timestep_embedder_linear_2_bias)))
     for reader in readers {
       reader(state_dict)
     }
@@ -761,25 +733,26 @@ let output = pipe.transformer(
 print(output)
 print(pipe.transformer)
 
-savedTensor = try! Tensor<Float>(numpy: pipe.transformer.saved_val.to(torch.float).cpu().numpy())
+// savedTensor = try! Tensor<Float>(numpy: pipe.transformer.saved_val.to(torch.float).cpu().numpy())
 
 graph.withNoGrad {
   let state_dict = pipe.transformer.state_dict()
   let keys = state_dict.keys()
   /*
-  let summaryWriter = SummaryWriter(logDirectory: "/tmp/qwen/")
   for key in keys {
-      let numpyTensor = state_dict[key].to(torch.float).cpu().numpy()
-      let tensor = try! Tensor<Float>(numpy: numpyTensor)
-      summaryWriter.addHistogram(String(key)!, tensor, step: 0)
+    let numpyTensor = state_dict[key].to(torch.float).cpu().numpy()
+    let tensor = try! Tensor<Float>(numpy: numpyTensor)
+    summaryWriter.addHistogram(String(key)!, tensor, step: 0)
   }
   */
   let xTensor = graph.variable(
     Tensor<Float16>(from: try! Tensor<Float>(numpy: x.to(torch.float).cpu().numpy())).toGPU(1))
   let tTensor = graph.variable(
-    timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000).toGPU(1))
+    Tensor<Float16>(
+      from: timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
+    ).toGPU(1))
   let cTensor = graph.variable(
-    try! Tensor<Float>(numpy: txt.to(torch.float).cpu().numpy()).toGPU(1))
+    Tensor<Float16>(from: try! Tensor<Float>(numpy: txt.to(torch.float).cpu().numpy())).toGPU(1))
   let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + 18, 1, 128), of: Float.self)
   for i in 0..<(4096 + 18) {
     for j in 0..<128 {
@@ -838,14 +811,14 @@ graph.withNoGrad {
   }
   debugPrint(rotTensor)
   let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(1)
-  let (dit, reader) = QwenImage(height: 128, width: 128, textLength: 18, layers: 2)
+  let (dit, reader) = QwenImage(height: 128, width: 128, textLength: 18, layers: 60)
   dit.maxConcurrency = .limit(4)
   dit.compile(inputs: xTensor, rotTensorGPU, tTensor, cTensor)
   reader(state_dict)
   // DynamicGraph.logLevel = .verbose
   debugPrint(dit(inputs: xTensor, rotTensorGPU, tTensor, cTensor))
   /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_1.0_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_1.0_f16.ckpt") {
     $0.write("dit", model: dit)
   }
   */
