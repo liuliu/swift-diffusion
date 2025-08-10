@@ -22,14 +22,15 @@ let pipe = diffusers.DiffusionPipeline.from_pretrained(
   "Qwen/Qwen-Image", torch_dtype: torch.bfloat16)
 pipe.enable_model_cpu_offload()
 
-let prompt = "A coffee shop entrance features a chalkboard sign reading Qwen Coffee"  // \"Qwen Coffee 😊 $2 per cup,\" with a neon light beside it displaying \"通义千问\". Next to it hangs a poster showing a beautiful Chinese woman, and beneath the poster is written \"π≈3.1415926-53589793-23846264-33832795-02384197\"."
+let prompt =
+  "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}A coffee shop entrance features a chalkboard sign reading \"Qwen Coffee 😊 $2 per cup,\" with a neon light beside it displaying \"通义千问\". Next to it hangs a poster showing a beautiful Chinese woman, and beneath the poster is written \"π≈3.1415926-53589793-23846264-33832795-02384197\".<|im_end|>\n<|im_start|>assistant\n"
 
-let tokenizer = GPT2Tokenizer(
+let tokenizer = TiktokenTokenizer(
   vocabulary: "/home/liu/workspace/swift-diffusion/examples/qwen/vocab.json",
   merges: "/home/liu/workspace/swift-diffusion/examples/qwen/merges.txt",
   specialTokens: [
-    "<|start_header_id|>": 128006, "<|end_header_id|>": 128007, "<|eot_id|>": 128009,
-    "<|begin_of_text|>": 128000, "<|end_of_text|>": 128001,
+    "<|im_end|>": 151645, "<|im_start|>": 151644, "<|endoftext|>": 151643,
+    "<|file_sep|>": 151664, "</tool_call>": 151658,
   ])
 
 let result = pipe.tokenizer(prompt, padding: true, truncation: true, return_tensors: "pt")
