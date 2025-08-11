@@ -22,7 +22,7 @@ let prompt =
   // "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
   "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
 let promptWithTemplate =
-  "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n<|im_end|>\n\(prompt)<|im_start|>assistant\n"
+  "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n"
 let negativePrompt =
   "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n <|im_end|>\n<|im_start|>assistant\n"
 
@@ -182,8 +182,7 @@ let txt = graph.withNoGrad {
   let positiveRotTensorGPU = DynamicGraph.Tensor<Float16>(from: positiveRotTensor).toGPU(0)
   let negativeRotTensorGPU = DynamicGraph.Tensor<Float16>(from: negativeRotTensor).toGPU(0)
   transformer.compile(inputs: positiveTokensTensorGPU, positiveRotTensorGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_2.5_vl_7b_q8p.ckpt", flags: [.readOnly])
-  {
+  graph.openStore("/slow/Data/qwen_2.5_vl_7b_f16.ckpt", flags: [.readOnly]) {
     $0.read("text_model", model: transformer, codec: [.q8p, .ezm7])
   }
   let positiveLastHiddenStates = transformer(inputs: positiveTokensTensorGPU, positiveRotTensorGPU)[
@@ -476,7 +475,7 @@ let z = graph.withNoGrad {
   graph.openStore(
     "/home/liu/workspace/swift-diffusion/qwen_image_1.0_f16.ckpt", flags: [.readOnly]
   ) {
-    $0.read("dit", model: dit)
+    $0.read("dit", model: dit, codec: [.q5p, .q6p, .q8p, .ezm7])
   }
   let samplingSteps = 50
   for i in (1...samplingSteps).reversed() {
