@@ -4,7 +4,7 @@ import NNC
 import PNG
 import TensorBoard
 
-let filename = "qwen_image_f16"
+let filename = "qwen_image_f16_5"
 
 DynamicGraph.setSeed(42)
 
@@ -15,7 +15,14 @@ let graph = DynamicGraph()
 graph.maxConcurrency = .limit(4)
 
 let prompt =
-  "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\nA coffee shop entrance features a chalkboard sign reading \"Qwen Coffee 😊 $2 per cup,\" with a neon light beside it displaying \"通义千问\". Next to it hangs a poster showing a beautiful Chinese woman, and beneath the poster is written \"π≈3.1415926-53589793-23846264-33832795-02384197\".<|im_end|>\n<|im_start|>assistant\n"
+  // "A coffee shop entrance features a chalkboard sign reading \"Qwen Coffee 😊 $2 per cup,\" with a neon light beside it displaying \"通义千问\". Next to it hangs a poster showing a beautiful Chinese woman, and beneath the poster is written \"π≈3.1415926-53589793-23846264-33832795-02384197\"."
+  // "Professional photograph of an astronaut riding a horse on the moon with view of Earth in the background."
+  // "a smiling indian man with a google t-shirt next to a frowning asian man with a shirt saying nexus at a meeting table facing each other, photograph, detailed, 8k"
+  // "photo of a young woman with long, wavy brown hair sleeping in grassfield, top down shot, summer, warm, laughing, joy, fun"
+  // "35mm analogue full-body portrait of a beautiful woman wearing black sheer dress, catwalking in a busy market, soft colour grading, infinity cove, shadows, kodak, contax t2"
+  "A miniature tooth fairy woman is holding a pick axe and mining diamonds in a bedroom at night. The fairy has an angry expression."
+let promptWithTemplate =
+  "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n<|im_end|>\n\(prompt)<|im_start|>assistant\n"
 let negativePrompt =
   "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n <|im_end|>\n<|im_start|>assistant\n"
 
@@ -27,7 +34,7 @@ let tokenizer = TiktokenTokenizer(
     "<|file_sep|>": 151664, "</tool_call>": 151658,
   ])
 
-let positiveTokens = tokenizer.tokenize(text: prompt, addSpecialTokens: false)
+let positiveTokens = tokenizer.tokenize(text: promptWithTemplate, addSpecialTokens: false)
 let negativeTokens = tokenizer.tokenize(text: negativePrompt, addSpecialTokens: false)
 
 func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
@@ -131,36 +138,65 @@ func Transformer<T: TensorNumeric>(
 }
 
 let txt = graph.withNoGrad {
-  let rotTensor = graph.variable(.CPU, .NHWC(1, positiveTokens.0.count, 1, 128), of: Float.self)
+  let positiveRotTensor = graph.variable(
+    .CPU, .NHWC(1, positiveTokens.0.count, 1, 128), of: Float.self)
   for i in 0..<positiveTokens.0.count {
     for k in 0..<64 {
       let theta = Double(i) * 1.0 / pow(1_000_000, Double(k) * 2 / 128)
       let sintheta = sin(theta)
       let costheta = cos(theta)
-      rotTensor[0, i, 0, k * 2] = Float(costheta)
-      rotTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
+      positiveRotTensor[0, i, 0, k * 2] = Float(costheta)
+      positiveRotTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
     }
   }
-  let (transformer, reader) = Transformer(
-    Float16.self, vocabularySize: 152_064, maxLength: positiveTokens.0.count, width: 3_584,
-    tokenLength: positiveTokens.0.count,
-    layers: 28, MLP: 18_944, heads: 28, outputHiddenStates: 28, batchSize: 1)
-  let tokensTensor = graph.variable(
+  let negativeRotTensor = graph.variable(
+    .CPU, .NHWC(1, negativeTokens.0.count, 1, 128), of: Float.self)
+  for i in 0..<negativeTokens.0.count {
+    for k in 0..<64 {
+      let theta = Double(i) * 1.0 / pow(1_000_000, Double(k) * 2 / 128)
+      let sintheta = sin(theta)
+      let costheta = cos(theta)
+      negativeRotTensor[0, i, 0, k * 2] = Float(costheta)
+      negativeRotTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
+    }
+  }
+  let transformer = ModelBuilder {
+    Transformer(
+      Float16.self, vocabularySize: 152_064, maxLength: $0[0].shape[0], width: 3_584,
+      tokenLength: $0[0].shape[0],
+      layers: 28, MLP: 18_944, heads: 28, outputHiddenStates: 28, batchSize: 1
+    ).0
+  }
+  let positiveTokensTensor = graph.variable(
     .CPU, format: .NHWC, shape: [positiveTokens.0.count], of: Int32.self)
   for i in 0..<positiveTokens.0.count {
-    tokensTensor[i] = positiveTokens.0[i]
+    positiveTokensTensor[i] = positiveTokens.0[i]
   }
-  let tokensTensorGPU = tokensTensor.toGPU(0)
-  let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
-  transformer.compile(inputs: tokensTensorGPU, rotTensorGPU)
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_2.5_vl_7b_f16.ckpt", flags: [.readOnly])
+  let negativeTokensTensor = graph.variable(
+    .CPU, format: .NHWC, shape: [negativeTokens.0.count], of: Int32.self)
+  for i in 0..<negativeTokens.0.count {
+    negativeTokensTensor[i] = negativeTokens.0[i]
+  }
+  let positiveTokensTensorGPU = positiveTokensTensor.toGPU(0)
+  let negativeTokensTensorGPU = negativeTokensTensor.toGPU(0)
+  let positiveRotTensorGPU = DynamicGraph.Tensor<Float16>(from: positiveRotTensor).toGPU(0)
+  let negativeRotTensorGPU = DynamicGraph.Tensor<Float16>(from: negativeRotTensor).toGPU(0)
+  transformer.compile(inputs: positiveTokensTensorGPU, positiveRotTensorGPU)
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_2.5_vl_7b_q8p.ckpt", flags: [.readOnly])
   {
-    $0.read("text_model", model: transformer)
+    $0.read("text_model", model: transformer, codec: [.q8p, .ezm7])
   }
-  let lastHiddenStates = transformer(inputs: tokensTensorGPU, rotTensorGPU)[0].as(of: Float16.self)[
+  let positiveLastHiddenStates = transformer(inputs: positiveTokensTensorGPU, positiveRotTensorGPU)[
+    0
+  ].as(of: Float16.self)[
     34..<positiveTokens.0.count, 0..<3584
   ].copied()
-  return lastHiddenStates
+  let negativeLastHiddenStates = transformer(inputs: negativeTokensTensorGPU, negativeRotTensorGPU)[
+    0
+  ].as(of: Float16.self)[
+    34..<negativeTokens.0.count, 0..<3584
+  ].copied()
+  return (positiveLastHiddenStates, negativeLastHiddenStates)
 }
 
 func MLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
@@ -230,9 +266,9 @@ func JointTransformerBlock(
   let normQ = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
   let xV = xToValues(downcastXOut).reshaped([b, hw, h, k])
-  var keys = Functional.concat(axis: 1, contextK, xK)
-  var values = Functional.concat(axis: 1, contextV, xV)
-  var queries = Functional.concat(axis: 1, contextQ, xQ)
+  var keys = Functional.concat(axis: 1, xK, contextK)
+  var values = Functional.concat(axis: 1, xV, contextV)
+  var queries = Functional.concat(axis: 1, xQ, contextQ)
   queries = Functional.cmul(left: queries, right: rot)
   keys = Functional.cmul(left: keys, right: rot)
   // Now run attention.
@@ -242,7 +278,7 @@ func JointTransformerBlock(
   let contextUnifyheads: Model?
   if !contextBlockPreOnly {
     contextOut = out.reshaped(
-      [b, t, h * k], strides: [(t + hw) * h * k, h * k, 1]
+      [b, t, h * k], offset: [0, hw, 0], strides: [(t + hw) * h * k, h * k, 1]
     ).contiguous()
     let unifyheads = Dense(count: k * h, name: "c_o")
     contextOut =
@@ -251,7 +287,7 @@ func JointTransformerBlock(
   } else {
     contextUnifyheads = nil
   }
-  xOut = out.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
+  xOut = out.reshaped([b, hw, h * k], strides: [(t + hw) * h * k, h * k, 1])
     .contiguous()
   let xUnifyheads = Dense(count: k * h, name: "x_o")
   xOut = (8 * scaleFactor.0) * xUnifyheads((1.0 / scaleFactor.0) * xOut).to(of: x)
@@ -367,36 +403,39 @@ let z = graph.withNoGrad {
     Tensor<Float16>(
       from: timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
     ).toGPU(0))
-  let textLength = positiveTokens.0.count - 34
-  let cTensor = txt.reshaped(.HWC(1, textLength, 3584)).toGPU(0)
-  let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + textLength, 1, 128), of: Float.self)
+  let positiveTextLength = positiveTokens.0.count - 34
+  let negativeTextLength = negativeTokens.0.count - 34
+  let posTensor = txt.0.reshaped(.HWC(1, positiveTextLength, 3584)).toGPU(0)
+  let negTensor = txt.1.reshaped(.HWC(1, negativeTextLength, 3584)).toGPU(0)
+  let rotTensor = graph.variable(
+    .CPU, .NHWC(1, 4096 + max(positiveTextLength, negativeTextLength), 1, 128), of: Float.self)
   let maxImgIdx = max(64 / 2, 64 / 2)
-  for i in 0..<textLength {
+  for i in 0..<max(positiveTextLength, negativeTextLength) {
     for k in 0..<8 {
       let theta = Double(i + maxImgIdx) * 1.0 / pow(10_000, Double(k) / 8)
       let sintheta = sin(theta)
       let costheta = cos(theta)
-      rotTensor[0, i, 0, k * 2] = Float(costheta)
-      rotTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
+      rotTensor[0, 4096 + i, 0, k * 2] = Float(costheta)
+      rotTensor[0, 4096 + i, 0, k * 2 + 1] = Float(sintheta)
     }
     for k in 0..<28 {
       let theta = Double(i + maxImgIdx) * 1.0 / pow(10_000, Double(k) / 28)
       let sintheta = sin(theta)
       let costheta = cos(theta)
-      rotTensor[0, i, 0, (k + 8) * 2] = Float(costheta)
-      rotTensor[0, i, 0, (k + 8) * 2 + 1] = Float(sintheta)
+      rotTensor[0, 4096 + i, 0, (k + 8) * 2] = Float(costheta)
+      rotTensor[0, 4096 + i, 0, (k + 8) * 2 + 1] = Float(sintheta)
     }
     for k in 0..<28 {
       let theta = Double(i + maxImgIdx) * 1.0 / pow(10_000, Double(k) / 28)
       let sintheta = sin(theta)
       let costheta = cos(theta)
-      rotTensor[0, i, 0, (k + 8 + 28) * 2] = Float(costheta)
-      rotTensor[0, i, 0, (k + 8 + 28) * 2 + 1] = Float(sintheta)
+      rotTensor[0, 4096 + i, 0, (k + 8 + 28) * 2] = Float(costheta)
+      rotTensor[0, 4096 + i, 0, (k + 8 + 28) * 2 + 1] = Float(sintheta)
     }
   }
   for y in 0..<64 {
     for x in 0..<64 {
-      let i = y * 64 + x + textLength
+      let i = y * 64 + x
       for k in 0..<8 {
         let theta = 0 * 1.0 / pow(10_000, Double(k) / 8)
         let sintheta = sin(theta)
@@ -421,12 +460,19 @@ let z = graph.withNoGrad {
     }
   }
   debugPrint(rotTensor)
-  let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
-  let (dit, reader) = QwenImage(height: 128, width: 128, textLength: textLength, layers: 60)
+  let posRotTensorGPU = DynamicGraph.Tensor<Float16>(
+    from: rotTensor[0..<1, 0..<(4096 + positiveTextLength), 0..<1, 0..<128]
+  ).toGPU(0)
+  let negRotTensorGPU = DynamicGraph.Tensor<Float16>(
+    from: rotTensor[0..<1, 0..<(4096 + negativeTextLength), 0..<1, 0..<128]
+  ).toGPU(0)
+  let dit = ModelBuilder {
+    QwenImage(height: 128, width: 128, textLength: $0[3].shape[1], layers: 60).0
+  }
   dit.maxConcurrency = .limit(4)
   var z = graph.variable(.GPU(0), .HWC(1, 4096, 64), of: Float16.self)
   z.randn()
-  dit.compile(inputs: z, rotTensorGPU, tTensor, cTensor)
+  dit.compile(inputs: z, posRotTensorGPU, tTensor, posTensor)
   graph.openStore(
     "/home/liu/workspace/swift-diffusion/qwen_image_1.0_f16.ckpt", flags: [.readOnly]
   ) {
@@ -440,7 +486,9 @@ let z = graph.withNoGrad {
       Tensor<Float16>(
         from: timeEmbedding(timesteps: t, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
           .toGPU(0)))
-    let v = dit(inputs: z, rotTensorGPU, tTensor, cTensor)[0].as(of: Float16.self)
+    let vp = dit(inputs: z, posRotTensorGPU, tTensor, posTensor)[0].as(of: Float16.self)
+    let vn = dit(inputs: z, negRotTensorGPU, tTensor, negTensor)[0].as(of: Float16.self)
+    let v = vn + 3.5 * (vp - vn)
     z = z - (1 / Float(samplingSteps)) * v
     debugPrint(z)
   }
