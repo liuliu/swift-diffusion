@@ -4,7 +4,7 @@ import NNC
 import PNG
 import TensorBoard
 
-let filename = "qwen_image_bf16"
+let filename = "qwen_image_f16"
 
 DynamicGraph.setSeed(42)
 
@@ -172,21 +172,23 @@ func MLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
   return (fc0, fc2, Model([x], [out]))
 }
 
-func FeedForward(hiddenSize: Int, intermediateSize: Int, name: String)
+func FeedForward(hiddenSize: Int, intermediateSize: Int, scaleFactor: Float, name: String)
   -> (
     Model, Model, Model
   )
 {
   let x = Input()
   let linear1 = Dense(count: intermediateSize, name: "\(name)_linear1")
-  var out = linear1(x).GELU(approximate: .tanh).to(.BFloat16)
+  var out = linear1(x).GELU(approximate: .tanh)
+  out = (1.0 / scaleFactor) * out
   let outProjection = Dense(count: hiddenSize, name: "\(name)_out_proj")
-  out = outProjection(out).to(.Float32)
+  out = scaleFactor * outProjection(out).to(.Float32)
   return (linear1, outProjection, Model([x], [out]))
 }
 
 func JointTransformerBlock(
-  prefix: String, k: Int, h: Int, b: Int, t: Int, hw: Int, contextBlockPreOnly: Bool
+  prefix: String, k: Int, h: Int, b: Int, t: Int, hw: Int, contextBlockPreOnly: Bool,
+  scaleFactor: (Float, Float)
 ) -> ((PythonObject) -> Void, Model) {
   let context = Input()
   let x = Input()
@@ -211,7 +213,7 @@ func JointTransformerBlock(
   var contextQ = contextToQueries(downcastContextOut).reshaped([b, t, h, k])
   let normAddedQ = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "c_norm_q")
   contextQ = normAddedQ(contextQ)
-  let contextV = contextToValues(contextOut.to(.BFloat16)).reshaped([b, t, h, k])
+  let contextV = contextToValues(downcastContextOut).reshaped([b, t, h, k])
   let xAdaLNs = (0..<6).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
   var xChunks = xAdaLNs.map { $0(c) }
   let xNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
@@ -227,12 +229,12 @@ func JointTransformerBlock(
   var xQ = xToQueries(downcastXOut).reshaped([b, hw, h, k])
   let normQ = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
-  let xV = xToValues(xOut.to(.BFloat16)).reshaped([b, hw, h, k])
+  let xV = xToValues(downcastXOut).reshaped([b, hw, h, k])
   var keys = Functional.concat(axis: 1, contextK, xK)
   var values = Functional.concat(axis: 1, contextV, xV)
   var queries = Functional.concat(axis: 1, contextQ, xQ)
-  queries = Functional.cmul(left: queries, right: rot).to(.BFloat16)
-  keys = Functional.cmul(left: keys, right: rot).to(.BFloat16)
+  queries = Functional.cmul(left: queries, right: rot)
+  keys = Functional.cmul(left: keys, right: rot)
   // Now run attention.
   let out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot(), flags: [.Float16])(
     queries, keys, values
@@ -243,7 +245,8 @@ func JointTransformerBlock(
       [b, t, h * k], strides: [(t + hw) * h * k, h * k, 1]
     ).contiguous()
     let unifyheads = Dense(count: k * h, name: "c_o")
-    contextOut = unifyheads(contextOut).to(of: context)
+    contextOut =
+      (8 * scaleFactor.0) * unifyheads((1.0 / scaleFactor.0) * contextOut).to(of: context)
     contextUnifyheads = unifyheads
   } else {
     contextUnifyheads = nil
@@ -251,7 +254,7 @@ func JointTransformerBlock(
   xOut = out.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
     .contiguous()
   let xUnifyheads = Dense(count: k * h, name: "x_o")
-  xOut = xUnifyheads(xOut).to(of: x)
+  xOut = (8 * scaleFactor.0) * xUnifyheads((1.0 / scaleFactor.0) * xOut).to(of: x)
   if !contextBlockPreOnly {
     contextOut = context + (contextChunks[2]).to(of: context) .* contextOut
   }
@@ -262,7 +265,7 @@ func JointTransformerBlock(
   if !contextBlockPreOnly {
     let contextFF: Model
     (contextLinear1, contextOutProjection, contextFF) = FeedForward(
-      hiddenSize: k * h, intermediateSize: k * h * 4, name: "c")
+      hiddenSize: k * h, intermediateSize: k * h * 4, scaleFactor: scaleFactor.1, name: "c")
     let contextNorm2 = LayerNorm(
       epsilon: 1e-6, axis: [2], elementwiseAffine: false)
     contextOut =
@@ -278,7 +281,7 @@ func JointTransformerBlock(
     contextOutProjection = nil
   }
   let (xLinear1, xOutProjection, xFF) = FeedForward(
-    hiddenSize: k * h, intermediateSize: k * h * 4, name: "x")
+    hiddenSize: k * h, intermediateSize: k * h * 4, scaleFactor: scaleFactor.1, name: "x")
   let xNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   xOut =
     xOut
@@ -316,7 +319,8 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
   for i in 0..<layers {
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: h * w,
-      contextBlockPreOnly: i == layers - 1)
+      contextBlockPreOnly: i == layers - 1,
+      scaleFactor: (i >= layers - 16 ? 16 : 2, i >= layers - 1 ? 256 : 16))
     let blockOut = block(out, context, vec, rot)
     if i == layers - 1 {
       out = blockOut
@@ -424,7 +428,7 @@ let z = graph.withNoGrad {
   z.randn()
   dit.compile(inputs: z, rotTensorGPU, tTensor, cTensor)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/qwen_image_1.0_bf16.ckpt", flags: [.readOnly]
+    "/home/liu/workspace/swift-diffusion/qwen_image_1.0_f16.ckpt", flags: [.readOnly]
   ) {
     $0.read("dit", model: dit)
   }
