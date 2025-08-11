@@ -4,6 +4,8 @@ import NNC
 import PNG
 import TensorBoard
 
+let filename = "qwen_image"
+
 struct PythonObject {}
 
 let graph = DynamicGraph()
@@ -23,9 +25,8 @@ let tokenizer = TiktokenTokenizer(
     "<|file_sep|>": 151664, "</tool_call>": 151658,
   ])
 
-let result2 = tokenizer.tokenize(text: prompt, addSpecialTokens: false)
-
-let negative_prompt = " "
+let positiveTokens = tokenizer.tokenize(text: prompt, addSpecialTokens: false)
+let negativeTokens = tokenizer.tokenize(text: negativePrompt, addSpecialTokens: false)
 
 func SelfAttention(prefix: String, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
   Model, (PythonObject) -> Void
@@ -127,11 +128,9 @@ func Transformer<T: TensorNumeric>(
   return (Model([tokens, rot], (hiddenStates.map { [$0] } ?? []) + [out]), reader)
 }
 
-graph.withNoGrad {
-  /*
-  let text_encoder_state_dict = pipe.text_encoder.model.language_model.state_dict()
-  let rotTensor = graph.variable(.CPU, .NHWC(1, 13, 1, 128), of: Float.self)
-  for i in 0..<13 {
+let txt = graph.withNoGrad {
+  let rotTensor = graph.variable(.CPU, .NHWC(1, positiveTokens.0.count, 1, 128), of: Float.self)
+  for i in 0..<positiveTokens.0.count {
     for k in 0..<64 {
       let theta = Double(i) * 1.0 / pow(1_000_000, Double(k) * 2 / 128)
       let sintheta = sin(theta)
@@ -141,22 +140,25 @@ graph.withNoGrad {
     }
   }
   let (transformer, reader) = Transformer(
-    Float16.self, vocabularySize: 152_064, maxLength: 13, width: 3_584, tokenLength: 13,
+    Float16.self, vocabularySize: 152_064, maxLength: positiveTokens.0.count, width: 3_584,
+    tokenLength: positiveTokens.0.count,
     layers: 28, MLP: 18_944, heads: 28, outputHiddenStates: 28, batchSize: 1)
-  let tokensTensor = graph.variable(.CPU, format: .NHWC, shape: [13], of: Int32.self)
-  for i in 0..<result2.count {
-    tokensTensor[i] = result2[i]
+  let tokensTensor = graph.variable(
+    .CPU, format: .NHWC, shape: [positiveTokens.0.count], of: Int32.self)
+  for i in 0..<positiveTokens.0.count {
+    tokensTensor[i] = positiveTokens.0[i]
   }
-  let tokensTensorGPU = tokensTensor.toGPU(1)
-  let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(1)
+  let tokensTensorGPU = tokensTensor.toGPU(0)
+  let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
   transformer.compile(inputs: tokensTensorGPU, rotTensorGPU)
-  // reader(text_encoder_state_dict)
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_2.5_vl_7b_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_2.5_vl_7b_f16.ckpt", flags: [.readOnly])
+  {
     $0.read("text_model", model: transformer)
   }
-  let lastHiddenStates = transformer(inputs: tokensTensorGPU, rotTensorGPU)[0].as(of: Float16.self)
-  debugPrint(lastHiddenStates)
-  */
+  let lastHiddenStates = transformer(inputs: tokensTensorGPU, rotTensorGPU)[0].as(of: Float16.self)[
+    34..<positiveTokens.0.count, 0..<3584
+  ].copied()
+  return lastHiddenStates
 }
 
 func MLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
@@ -168,29 +170,21 @@ func MLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
   return (fc0, fc2, Model([x], [out]))
 }
 
-func FeedForward(hiddenSize: Int, intermediateSize: Int, scaleFactor: Float?, name: String)
+func FeedForward(hiddenSize: Int, intermediateSize: Int, name: String)
   -> (
     Model, Model, Model
   )
 {
   let x = Input()
   let linear1 = Dense(count: intermediateSize, name: "\(name)_linear1")
-  var out = linear1(x).GELU(approximate: .tanh)
-  // The scale down is integrated into out proj bias.
-  if let scaleFactor = scaleFactor {
-    out = (1 / scaleFactor) * out
-  }
+  var out = linear1(x).GELU(approximate: .tanh).to(.BFloat16)
   let outProjection = Dense(count: hiddenSize, name: "\(name)_out_proj")
   out = outProjection(out).to(.Float32)
-  if let scaleFactor = scaleFactor {
-    out = out * scaleFactor
-  }
   return (linear1, outProjection, Model([x], [out]))
 }
 
 func JointTransformerBlock(
-  prefix: String, k: Int, h: Int, b: Int, t: Int, hw: Int, contextBlockPreOnly: Bool,
-  scaleFactor: (Float, Float)
+  prefix: String, k: Int, h: Int, b: Int, t: Int, hw: Int, contextBlockPreOnly: Bool
 ) -> ((PythonObject) -> Void, Model) {
   let context = Input()
   let x = Input()
@@ -204,37 +198,39 @@ func JointTransformerBlock(
     epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   var contextOut =
     ((1 + contextChunks[1].to(of: context)) .* contextNorm1(context)
-    + contextChunks[0].to(of: context)).to(.Float16)
+      + contextChunks[0].to(of: context))
   let contextToKeys = Dense(count: k * h, name: "c_k")
   let contextToQueries = Dense(count: k * h, name: "c_q")
   let contextToValues = Dense(count: k * h, name: "c_v")
-  var contextK = contextToKeys(contextOut).reshaped([b, t, h, k])
-  let normAddedK = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_k")
+  let downcastContextOut = ((1.0 / 8) * contextOut).to(.Float16)
+  var contextK = contextToKeys(downcastContextOut).reshaped([b, t, h, k])
+  let normAddedK = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "c_norm_k")
   contextK = normAddedK(contextK)
-  var contextQ = contextToQueries(contextOut).reshaped([b, t, h, k])
-  let normAddedQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_q")
+  var contextQ = contextToQueries(downcastContextOut).reshaped([b, t, h, k])
+  let normAddedQ = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "c_norm_q")
   contextQ = normAddedQ(contextQ)
-  let contextV = contextToValues(contextOut).reshaped([b, t, h, k])
+  let contextV = contextToValues(contextOut.to(.BFloat16)).reshaped([b, t, h, k])
   let xAdaLNs = (0..<6).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
   var xChunks = xAdaLNs.map { $0(c) }
   let xNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   var xOut = xNorm1(x)
-  xOut = ((1 + xChunks[1].to(of: x)) .* xOut + xChunks[0].to(of: x)).to(.Float16)
+  xOut = ((1 + xChunks[1].to(of: x)) .* xOut + xChunks[0].to(of: x))
   let xToKeys = Dense(count: k * h, name: "x_k")
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
-  var xK = xToKeys(xOut).reshaped([b, hw, h, k])
-  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_k")
+  let downcastXOut = ((1.0 / 8) * xOut).to(.Float16)
+  var xK = xToKeys(downcastXOut).reshaped([b, hw, h, k])
+  let normK = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "x_norm_k")
   xK = normK(xK)
-  var xQ = xToQueries(xOut).reshaped([b, hw, h, k])
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "x_norm_q")
+  var xQ = xToQueries(downcastXOut).reshaped([b, hw, h, k])
+  let normQ = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
-  let xV = xToValues(xOut).reshaped([b, hw, h, k])
+  let xV = xToValues(xOut.to(.BFloat16)).reshaped([b, hw, h, k])
   var keys = Functional.concat(axis: 1, contextK, xK)
   var values = Functional.concat(axis: 1, contextV, xV)
   var queries = Functional.concat(axis: 1, contextQ, xQ)
-  queries = Functional.cmul(left: queries, right: rot)
-  keys = Functional.cmul(left: keys, right: rot)
+  queries = Functional.cmul(left: queries, right: rot).to(.BFloat16)
+  keys = Functional.cmul(left: keys, right: rot).to(.BFloat16)
   // Now run attention.
   let out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot(), flags: [.Float16])(
     queries, keys, values
@@ -245,7 +241,7 @@ func JointTransformerBlock(
       [b, t, h * k], strides: [(t + hw) * h * k, h * k, 1]
     ).contiguous()
     let unifyheads = Dense(count: k * h, name: "c_o")
-    contextOut = scaleFactor.0 * unifyheads((1.0 / scaleFactor.0) * contextOut).to(of: context)
+    contextOut = unifyheads(contextOut).to(of: context)
     contextUnifyheads = unifyheads
   } else {
     contextUnifyheads = nil
@@ -253,7 +249,7 @@ func JointTransformerBlock(
   xOut = out.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
     .contiguous()
   let xUnifyheads = Dense(count: k * h, name: "x_o")
-  xOut = scaleFactor.0 * xUnifyheads((1.0 / scaleFactor.0) * xOut).to(of: x)
+  xOut = xUnifyheads(xOut).to(of: x)
   if !contextBlockPreOnly {
     contextOut = context + (contextChunks[2]).to(of: context) .* contextOut
   }
@@ -264,7 +260,7 @@ func JointTransformerBlock(
   if !contextBlockPreOnly {
     let contextFF: Model
     (contextLinear1, contextOutProjection, contextFF) = FeedForward(
-      hiddenSize: k * h, intermediateSize: k * h * 4, scaleFactor: scaleFactor.1, name: "c")
+      hiddenSize: k * h, intermediateSize: k * h * 4, name: "c")
     let contextNorm2 = LayerNorm(
       epsilon: 1e-6, axis: [2], elementwiseAffine: false)
     contextOut =
@@ -280,7 +276,7 @@ func JointTransformerBlock(
     contextOutProjection = nil
   }
   let (xLinear1, xOutProjection, xFF) = FeedForward(
-    hiddenSize: k * h, intermediateSize: k * h * 4, scaleFactor: scaleFactor.1, name: "x")
+    hiddenSize: k * h, intermediateSize: k * h * 4, name: "x")
   let xNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   xOut =
     xOut
@@ -295,8 +291,6 @@ func JointTransformerBlock(
     return (reader, Model([x, context, c, rot], [xOut]))
   }
 }
-
-// let summaryWriter = SummaryWriter(logDirectory: "/tmp/qwen/")
 
 func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
   Model, (PythonObject) -> Void
@@ -320,7 +314,7 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
   for i in 0..<layers {
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: h * w,
-      contextBlockPreOnly: i == layers - 1, scaleFactor: (4, i >= layers - 1 ? 64 : 2))
+      contextBlockPreOnly: i == layers - 1)
     let blockOut = block(out, context, vec, rot)
     if i == layers - 1 {
       out = blockOut
@@ -362,32 +356,16 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
   return embedding
 }
 
-graph.withNoGrad {
-  /*
-  let keys = state_dict.keys()
-  for key in keys {
-    let numpyTensor = state_dict[key].to(torch.float).cpu().numpy()
-    let tensor = try! Tensor<Float>(numpy: numpyTensor)
-    summaryWriter.addHistogram(String(key)!, tensor, step: 0)
-  }
-  */
-  /*
-  let xTensor = graph.variable(
-    Tensor<Float16>(from: try! Tensor<Float>(numpy: x.to(torch.float).cpu().numpy())).toGPU(1))
+let z = graph.withNoGrad {
   let tTensor = graph.variable(
     Tensor<Float16>(
       from: timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
-    ).toGPU(1))
-  let cTensor = graph.variable(
-    Tensor<Float16>(from: try! Tensor<Float>(numpy: txt.to(torch.float).cpu().numpy())).toGPU(1))
-  let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + 18, 1, 128), of: Float.self)
-  for i in 0..<(4096 + 18) {
-    for j in 0..<128 {
-      rotTensor[0, i, 0, j] = -100000
-    }
-  }
+    ).toGPU(0))
+  let textLength = positiveTokens.0.count - 34
+  let cTensor = txt.reshaped(.HWC(1, textLength, 3584)).toGPU(0)
+  let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + textLength, 1, 128), of: Float.self)
   let maxImgIdx = max(64 / 2, 64 / 2)
-  for i in 0..<18 {
+  for i in 0..<textLength {
     for k in 0..<8 {
       let theta = Double(i + maxImgIdx) * 1.0 / pow(10_000, Double(k) / 8)
       let sintheta = sin(theta)
@@ -412,7 +390,7 @@ graph.withNoGrad {
   }
   for y in 0..<64 {
     for x in 0..<64 {
-      let i = y * 64 + x + 18
+      let i = y * 64 + x + textLength
       for k in 0..<8 {
         let theta = 0 * 1.0 / pow(10_000, Double(k) / 8)
         let sintheta = sin(theta)
@@ -437,18 +415,32 @@ graph.withNoGrad {
     }
   }
   debugPrint(rotTensor)
-  let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(1)
-  let (dit, reader) = QwenImage(height: 128, width: 128, textLength: 18, layers: 60)
+  let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(0)
+  let (dit, reader) = QwenImage(height: 128, width: 128, textLength: textLength, layers: 60)
   dit.maxConcurrency = .limit(4)
-  dit.compile(inputs: xTensor, rotTensorGPU, tTensor, cTensor)
-  reader(state_dict)
-  debugPrint(dit(inputs: xTensor, rotTensorGPU, tTensor, cTensor))
-  */
-  /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_1.0_f16.ckpt") {
+  var z = graph.variable(.GPU(0), .HWC(1, 4096, 64), of: Float16.self)
+  z.randn()
+  dit.compile(inputs: z, rotTensorGPU, tTensor, cTensor)
+  graph.openStore(
+    "/home/liu/workspace/swift-diffusion/qwen_image_1.0_bf16.ckpt", flags: [.readOnly]
+  ) {
     $0.read("dit", model: dit)
   }
-  */
+  let samplingSteps = 50
+  for i in (1...samplingSteps).reversed() {
+    print("\(i)")
+    let t = Float(i) / Float(samplingSteps) * 1_000
+    let tTensor = graph.variable(
+      Tensor<Float16>(
+        from: timeEmbedding(timesteps: t, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
+          .toGPU(0)))
+    let v = dit(inputs: z, rotTensorGPU, tTensor, cTensor)[0].as(of: Float16.self)
+    z = z - (1 / Float(samplingSteps)) * v
+    debugPrint(z)
+  }
+  return z.reshaped(format: .NCHW, shape: [1, 64, 64, 16, 2, 2]).permuted(
+    0, 3, 1, 4, 2, 5
+  ).contiguous().reshaped(format: .NCHW, shape: [1, 16, 1, 128, 128])
 }
 
 func ResnetBlockCausal3D(
@@ -750,33 +742,46 @@ func EncoderCausal3D(
 }
 
 graph.withNoGrad {
-  /*
-  let mean = graph.variable(Tensor<Float>([
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-    0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
-  ], format: .NCHW, shape: [1, 16, 1, 1, 1])).toGPU(1)
-  let std = graph.variable(Tensor<Float>([
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-    3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
-  ], format: .NCHW, shape: [1, 16, 1, 1, 1])).toGPU(1)
-  var zTensor = graph.variable(try! Tensor<Float>(numpy: z.to(torch.float).cpu().numpy())).reshaped(
-    format: .NCHW, shape: [1, 16, 3, 64, 64]
-  ).toGPU(1)
-  // zTensor = zTensor / std + mean
+  let mean = graph.variable(
+    Tensor<Float>(
+      [
+        -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+        0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921,
+      ], kind: .CPU, format: .NCHW, shape: [1, 16, 1, 1, 1])
+  ).toGPU(0)
+  let std = graph.variable(
+    Tensor<Float>(
+      [
+        2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+        3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160,
+      ], kind: .CPU, format: .NCHW, shape: [1, 16, 1, 1, 1])
+  ).toGPU(0)
+  var zTensor = DynamicGraph.Tensor<Float>(from: z)
+  zTensor = zTensor .* std + mean
   let (decoderReader, decoder) = DecoderCausal3D(
-    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 64, startHeight: 64, startDepth: 3)
+    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 128, startHeight: 128, startDepth: 1)
   decoder.compile(inputs: zTensor)
-  decoderReader(vae_state_dict)
-  let image = decoder(inputs: zTensor)[0].as(of: Float.self)
-  debugPrint(image)
-  let (encoderReader, encoder) = EncoderCausal3D(
-    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 64, startHeight: 64, startDepth: 3)
-  encoder.compile(inputs: image)
-  encoderReader(vae_state_dict)
-  debugPrint(encoder(inputs: image)[0].as(of: Float.self)[0..<1, 0..<16, 0..<3, 0..<64, 0..<64])
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_vae_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_vae_f32.ckpt", flags: [.readOnly])
+  {
     $0.read("decoder", model: decoder)
-    $0.read("encoder", model: encoder)
   }
-  */
+  let img = decoder(inputs: zTensor)[0].as(of: Float.self).toCPU()
+  let startHeight = 128
+  let startWidth = 128
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: startWidth * 8 * startHeight * 8)
+  for y in 0..<startHeight * 8 {
+    for x in 0..<startWidth * 8 {
+      let (r, g, b) = (img[0, 0, 0, y, x], img[0, 1, 0, y, x], img[0, 2, 0, y, x])
+      rgba[y * startWidth * 8 + x].r = UInt8(
+        min(max(Int(Float(r.isFinite ? (r + 1) / 2 : 0) * 255), 0), 255))
+      rgba[y * startWidth * 8 + x].g = UInt8(
+        min(max(Int(Float(g.isFinite ? (g + 1) / 2 : 0) * 255), 0), 255))
+      rgba[y * startWidth * 8 + x].b = UInt8(
+        min(max(Int(Float(b.isFinite ? (b + 1) / 2 : 0) * 255), 0), 255))
+    }
+  }
+  let image = PNG.Data.Rectangular(
+    packing: rgba, size: (startWidth * 8, startHeight * 8),
+    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+  try! image.compress(path: "/home/liu/workspace/swift-diffusion/\(filename).png", level: 4)
 }
