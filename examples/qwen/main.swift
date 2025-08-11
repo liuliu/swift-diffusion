@@ -4,7 +4,9 @@ import NNC
 import PNG
 import TensorBoard
 
-let filename = "qwen_image"
+let filename = "qwen_image_bf16"
+
+DynamicGraph.setSeed(42)
 
 struct PythonObject {}
 
