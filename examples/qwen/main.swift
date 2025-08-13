@@ -217,10 +217,9 @@ func FeedForward(hiddenSize: Int, intermediateSize: Int, scaleFactor: Float, nam
 {
   let x = Input()
   let linear1 = Dense(count: intermediateSize, name: "\(name)_linear1")
-  var out = linear1(x).GELU(approximate: .tanh)
-  out = (1.0 / scaleFactor) * out
+  var out = linear1(x).GELU(approximate: .tanh).to(.BFloat16)
   let outProjection = Dense(count: hiddenSize, name: "\(name)_out_proj")
-  out = scaleFactor * outProjection(out).to(.Float32)
+  out = outProjection(out).to(.Float32)
   return (linear1, outProjection, Model([x], [out]))
 }
 
@@ -251,7 +250,7 @@ func JointTransformerBlock(
   var contextQ = contextToQueries(downcastContextOut).reshaped([b, t, h, k])
   let normAddedQ = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "c_norm_q")
   contextQ = normAddedQ(contextQ)
-  let contextV = contextToValues(downcastContextOut).reshaped([b, t, h, k])
+  let contextV = contextToValues(contextOut.to(.BFloat16)).reshaped([b, t, h, k])
   let xAdaLNs = (0..<6).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
   var xChunks = xAdaLNs.map { $0(c) }
   let xNorm1 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
@@ -267,12 +266,12 @@ func JointTransformerBlock(
   var xQ = xToQueries(downcastXOut).reshaped([b, hw, h, k])
   let normQ = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
-  let xV = xToValues(downcastXOut).reshaped([b, hw, h, k])
+  let xV = xToValues(xOut.to(.BFloat16)).reshaped([b, hw, h, k])
   var keys = Functional.concat(axis: 1, xK, contextK)
   var values = Functional.concat(axis: 1, xV, contextV)
   var queries = Functional.concat(axis: 1, xQ, contextQ)
-  queries = Functional.cmul(left: queries, right: rot)
-  keys = Functional.cmul(left: keys, right: rot)
+  queries = Functional.cmul(left: queries, right: rot).to(.BFloat16)
+  keys = Functional.cmul(left: keys, right: rot).to(.BFloat16)
   // Now run attention.
   let out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot(), flags: [.Float16])(
     queries, keys, values
@@ -284,7 +283,7 @@ func JointTransformerBlock(
     ).contiguous()
     let unifyheads = Dense(count: k * h, name: "c_o")
     contextOut =
-      (8 * scaleFactor.0) * unifyheads((1.0 / scaleFactor.0) * contextOut).to(of: context)
+      unifyheads(contextOut).to(of: context)
     contextUnifyheads = unifyheads
   } else {
     contextUnifyheads = nil
@@ -292,7 +291,7 @@ func JointTransformerBlock(
   xOut = out.reshaped([b, hw, h * k], strides: [(t + hw) * h * k, h * k, 1])
     .contiguous()
   let xUnifyheads = Dense(count: k * h, name: "x_o")
-  xOut = (8 * scaleFactor.0) * xUnifyheads((1.0 / scaleFactor.0) * xOut).to(of: x)
+  xOut = xUnifyheads(xOut).to(of: x)
   if !contextBlockPreOnly {
     contextOut = context + (contextChunks[2]).to(of: context) .* contextOut
   }
