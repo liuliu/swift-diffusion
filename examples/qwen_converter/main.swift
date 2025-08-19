@@ -24,8 +24,8 @@ pipe.enable_model_cpu_offload()
 
 print(pipe.text_encoder.visual)
 
-let prompt_image = torch.randn([64, 1176]).to(torch.float16).cuda()
-let image_grid_thw = torch.tensor([[1, 8, 8]], dtype: torch.int64).cuda()
+let prompt_image = torch.randn([256, 1176]).to(torch.float16).cuda()
+let image_grid_thw = torch.tensor([[1, 16, 16]], dtype: torch.int64).cuda()
 print(image_grid_thw)
 
 pipe.text_encoder.visual.cuda()
@@ -66,15 +66,22 @@ func QwenVLFeedForward(hiddenSize: Int, intermediateSize: Int, name: String = ""
   return (w1, w2, w3, Model([x], [out], name: name))
 }
 
-func QwenVLResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int, MLP: Int) -> (
+func QwenVLResidualAttentionBlock(
+  prefix: String, k: Int, h: Int, b: Int, t: Int, MLP: Int, isFullAttention: Bool
+) -> (
   (PythonObject) -> Void, Model
 ) {
   let x = Input()
   let rot = Input()
   let norm1 = RMSNorm(epsilon: 1e-6, axis: [2])
   let (toqueries, tokeys, tovalues, unifyheads, attention) = QwenVLSelfAttention(
-    k: k, h: h, b: b, t: t)
-  var out = x.reshaped([b * t, h * k]) + attention(norm1(x), rot)
+    k: k, h: h, b: isFullAttention ? b : b * (t / 64), t: isFullAttention ? t : 64)
+  var out: Model.IO
+  if isFullAttention {
+    out = x.reshaped([b * t, h * k]) + attention(norm1(x), rot)
+  } else {
+    out = x.reshaped([b * t, h * k]) + attention(norm1(x), rot.reshaped([b * (t / 64), 64, 1, k]))
+  }
   let norm2 = RMSNorm(epsilon: 1e-6, axis: [1])
   let (gate, down, up, ffn) = QwenVLFeedForward(
     hiddenSize: k * h, intermediateSize: MLP, name: "mlp")
@@ -135,7 +142,8 @@ func QwenVLResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int
 }
 
 func QwenVLVisionTransformer(
-  gridX: Int, gridY: Int, width: Int, layers: Int, heads: Int, MLP: Int, batchSize: Int
+  gridX: Int, gridY: Int, width: Int, layers: Int, fullAttentionLayers: Set<Int>, heads: Int,
+  MLP: Int, batchSize: Int
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let rot = Input()
@@ -145,9 +153,10 @@ func QwenVLVisionTransformer(
   var out = conv1(x).reshaped([batchSize, gridX * gridY, width])
   var readers = [(PythonObject) -> Void]()
   for i in 0..<layers {
+    let isFullAttention = fullAttentionLayers.contains(i)
     let (reader, block) = QwenVLResidualAttentionBlock(
       prefix: "blocks.\(i)", k: width / heads, h: heads, b: batchSize,
-      t: gridX * gridY, MLP: MLP)
+      t: gridX * gridY, MLP: MLP, isFullAttention: isFullAttention)
     out = block(out.reshaped([batchSize, gridX * gridY, width]), rot)
     readers.append(reader)
   }
@@ -194,38 +203,60 @@ graph.withNoGrad {
   let promptImageTensor = graph.variable(
     Tensor<Float>(from: try! Tensor<Float>(numpy: prompt_image.to(torch.float).cpu().numpy()))
       .toGPU(1)
-  ).reshaped(format: .NCHW, shape: [8 * 8, 3, 2, 14, 14])
-  let rotTensor = graph.variable(.CPU, .NHWC(1, 64, 1, 80), of: Float.self)
+  ).reshaped(format: .NCHW, shape: [16 * 16 / 4, 4 * 3 * 2 * 14 * 14])
+  var rearrangedPromptImageTensor = graph.variable(
+    .GPU(1), .NC(16 * 16 / 4, 4 * 3 * 2 * 14 * 14), of: Float.self)
   var i = 0
-  for y in 0..<4 {
-    for x in 0..<4 {
-      for iy in 0..<2 {
-        for ix in 0..<2 {
-          for k in 0..<20 {
-            let theta = Double(y * 2 + iy) * 1.0 / pow(10_000, Double(k) * 2 / 40)
-            let sintheta = sin(theta)
-            let costheta = cos(theta)
-            rotTensor[0, i, 0, k * 2] = Float(costheta)
-            rotTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
-          }
-          for k in 0..<20 {
-            let theta = Double(x * 2 + ix) * 1.0 / pow(10_000, Double(k) * 2 / 40)
-            let sintheta = sin(theta)
-            let costheta = cos(theta)
-            rotTensor[0, i, 0, 40 + k * 2] = Float(costheta)
-            rotTensor[0, i, 0, 40 + k * 2 + 1] = Float(sintheta)
-          }
+  for y in 0..<2 {
+    for x in 0..<2 {
+      for iy in 0..<4 {
+        for ix in 0..<4 {
+          let j = (y * 4 + iy) * 8 + (x * 4 + ix)
+          rearrangedPromptImageTensor[i..<(i + 1), 0..<4704] =
+            promptImageTensor[j..<(j + 1), 0..<4704]
           i += 1
+        }
+      }
+    }
+  }
+  rearrangedPromptImageTensor = rearrangedPromptImageTensor.reshaped(
+    format: .NCHW, shape: [16 * 16, 3, 2, 14, 14])
+  i = 0
+  let rotTensor = graph.variable(.CPU, .NHWC(1, 256, 1, 80), of: Float.self)
+  for y in 0..<2 {
+    for x in 0..<2 {
+      for fy in 0..<4 {
+        for fx in 0..<4 {
+          for iy in 0..<2 {
+            for ix in 0..<2 {
+              for k in 0..<20 {
+                let theta = Double(y * 8 + fy * 2 + iy) * 1.0 / pow(10_000, Double(k) * 2 / 40)
+                let sintheta = sin(theta)
+                let costheta = cos(theta)
+                rotTensor[0, i, 0, k * 2] = Float(costheta)
+                rotTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
+              }
+              for k in 0..<20 {
+                let theta = Double(x * 8 + fx * 2 + ix) * 1.0 / pow(10_000, Double(k) * 2 / 40)
+                let sintheta = sin(theta)
+                let costheta = cos(theta)
+                rotTensor[0, i, 0, 40 + k * 2] = Float(costheta)
+                rotTensor[0, i, 0, 40 + k * 2 + 1] = Float(sintheta)
+              }
+              i += 1
+            }
+          }
         }
       }
     }
   }
   let rotTensorGPU = rotTensor.toGPU(1)
   let (reader, vit) = QwenVLVisionTransformer(
-    gridX: 8, gridY: 8, width: 1280, layers: 32, heads: 16, MLP: 3420, batchSize: 1)
-  vit.compile(inputs: promptImageTensor, rotTensorGPU)
+    gridX: 16, gridY: 16, width: 1280, layers: 32, fullAttentionLayers: [7, 15, 23, 31], heads: 16,
+    MLP: 3420, batchSize: 1)
+  vit.compile(inputs: rearrangedPromptImageTensor, rotTensorGPU)
   reader(visual_state_dict)
-  debugPrint(vit(inputs: promptImageTensor, rotTensorGPU))
+  debugPrint(vit(inputs: rearrangedPromptImageTensor, rotTensorGPU))
 }
 
 exit(0)
