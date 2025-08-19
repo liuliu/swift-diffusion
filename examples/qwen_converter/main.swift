@@ -19,8 +19,216 @@ torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
 let pipe = diffusers.DiffusionPipeline.from_pretrained(
-  "Qwen/Qwen-Image", torch_dtype: torch.bfloat16)
+  "Qwen/Qwen-Image-Edit", torch_dtype: torch.float16)
 pipe.enable_model_cpu_offload()
+
+print(pipe.text_encoder.visual)
+
+let prompt_image = torch.randn([64, 1176]).to(torch.float16).cuda()
+let image_grid_thw = torch.tensor([[1, 8, 8]], dtype: torch.int64).cuda()
+print(image_grid_thw)
+
+pipe.text_encoder.visual.cuda()
+
+print(pipe.text_encoder.visual(prompt_image, grid_thw: image_grid_thw))
+
+func QwenVLSelfAttention(k: Int, h: Int, b: Int, t: Int) -> (Model, Model, Model, Model, Model) {
+  let x = Input()
+  let rot = Input()
+  let tokeys = Dense(count: k * h, name: "k_proj")
+  let toqueries = Dense(count: k * h, name: "q_proj")
+  let tovalues = Dense(count: k * h, name: "v_proj")
+  var keys = tokeys(x).reshaped([b, t, h, k])
+  var queries = ((1.0 / Float(k).squareRoot()) * toqueries(x)).reshaped([b, t, h, k])
+  let values = tovalues(x).reshaped([b, t, h, k]).permuted(0, 2, 1, 3)
+  queries = Functional.cmul(left: queries, right: rot).permuted(0, 2, 1, 3)
+  keys = Functional.cmul(left: keys, right: rot).permuted(0, 2, 1, 3)
+  var dot = Matmul(transposeB: (2, 3))(queries, keys)
+  dot = dot.reshaped([b * h * t, t])
+  dot = dot.softmax()
+  dot = dot.reshaped([b, h, t, t])
+  var out = dot * values
+  out = out.reshaped([b, h, t, k]).transposed(1, 2).reshaped([b * t, h * k])
+  let unifyheads = Dense(count: k * h, name: "out_proj")
+  out = unifyheads(out)
+  return (toqueries, tokeys, tovalues, unifyheads, Model([x, rot], [out]))
+}
+
+func QwenVLFeedForward(hiddenSize: Int, intermediateSize: Int, name: String = "") -> (
+  Model, Model, Model, Model
+) {
+  let x = Input()
+  let w1 = Dense(count: intermediateSize, name: "\(name)_gate_proj")
+  let w3 = Dense(count: intermediateSize, name: "\(name)_up_proj")
+  var out = w3(x) .* w1(x).swish()
+  let w2 = Dense(count: hiddenSize, name: "\(name)_down_proj")
+  out = w2(out)
+  return (w1, w2, w3, Model([x], [out], name: name))
+}
+
+func QwenVLResidualAttentionBlock(prefix: String, k: Int, h: Int, b: Int, t: Int, MLP: Int) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let rot = Input()
+  let norm1 = RMSNorm(epsilon: 1e-6, axis: [2])
+  let (toqueries, tokeys, tovalues, unifyheads, attention) = QwenVLSelfAttention(
+    k: k, h: h, b: b, t: t)
+  var out = x.reshaped([b * t, h * k]) + attention(norm1(x), rot)
+  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1])
+  let (gate, down, up, ffn) = QwenVLFeedForward(
+    hiddenSize: k * h, intermediateSize: MLP, name: "mlp")
+  out = out + ffn(norm2(out))
+  let reader: (PythonObject) -> Void = { state_dict in
+    let norm1_weight = state_dict["\(prefix).norm1.weight"].type(torch.float).cpu().numpy()
+    norm1.weight.copy(from: try! Tensor<Float>(numpy: norm1_weight))
+    let qkv_weight = state_dict["\(prefix).attn.qkv.weight"].type(torch.float).cpu()
+    let qkv_bias = state_dict["\(prefix).attn.qkv.bias"].type(torch.float).cpu()
+    let q_weight = qkv_weight[..<(k * h), ...].view(
+      16, 2, 40, 1280
+    ).transpose(1, 2).cpu().numpy()
+    let q_bias = qkv_bias[..<(k * h)].view(
+      16, 2, 40
+    ).transpose(1, 2).cpu().numpy()
+    toqueries.weight.copy(
+      from: try! Tensor<Float>(numpy: q_weight))
+    toqueries.bias.copy(from: try! Tensor<Float>(numpy: q_bias))
+    let k_weight = qkv_weight[(k * h)..<(2 * k * h), ...].view(
+      16, 2, 40, 1280
+    ).transpose(1, 2).cpu().numpy()
+    let k_bias = qkv_bias[(k * h)..<(2 * k * h)].view(
+      16, 2, 40
+    ).transpose(1, 2).cpu().numpy()
+    tokeys.weight.copy(
+      from: try! Tensor<Float>(numpy: k_weight))
+    tokeys.bias.copy(
+      from: try! Tensor<Float>(numpy: k_bias))
+    let v_weight = qkv_weight[(2 * k * h)..<(3 * k * h), ...].cpu().numpy()
+    let v_bias = qkv_bias[(2 * k * h)..<(3 * k * h)].cpu().numpy()
+    tovalues.weight.copy(
+      from: try! Tensor<Float>(numpy: v_weight))
+    tovalues.bias.copy(
+      from: try! Tensor<Float>(numpy: v_bias))
+    let out_proj_weight = state_dict["\(prefix).attn.proj.weight"].type(torch.float).cpu()
+      .numpy()
+    let out_proj_bias = state_dict["\(prefix).attn.proj.bias"].type(torch.float).cpu()
+      .numpy()
+    unifyheads.weight.copy(from: try! Tensor<Float>(numpy: out_proj_weight))
+    unifyheads.bias.copy(from: try! Tensor<Float>(numpy: out_proj_bias))
+    let norm2_weight = state_dict["\(prefix).norm2.weight"].type(torch.float).cpu().numpy()
+    norm2.weight.copy(from: try! Tensor<Float>(numpy: norm2_weight))
+    let gate_weight = state_dict["\(prefix).mlp.gate_proj.weight"].type(torch.float).cpu().numpy()
+    let gate_bias = state_dict["\(prefix).mlp.gate_proj.bias"].type(torch.float).cpu().numpy()
+    gate.weight.copy(from: try! Tensor<Float>(numpy: gate_weight))
+    gate.bias.copy(from: try! Tensor<Float>(numpy: gate_bias))
+    let up_proj_weight = state_dict["\(prefix).mlp.up_proj.weight"].type(torch.float).cpu().numpy()
+    let up_proj_bias = state_dict["\(prefix).mlp.up_proj.bias"].type(torch.float).cpu().numpy()
+    up.weight.copy(from: try! Tensor<Float>(numpy: up_proj_weight))
+    up.bias.copy(from: try! Tensor<Float>(numpy: up_proj_bias))
+    let down_proj_weight = state_dict["\(prefix).mlp.down_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    let down_proj_bias = state_dict["\(prefix).mlp.down_proj.bias"].type(torch.float).cpu().numpy()
+    down.weight.copy(from: try! Tensor<Float>(numpy: down_proj_weight))
+    down.bias.copy(from: try! Tensor<Float>(numpy: down_proj_bias))
+  }
+  return (reader, Model([x, rot], [out]))
+}
+
+func QwenVLVisionTransformer(
+  gridX: Int, gridY: Int, width: Int, layers: Int, heads: Int, MLP: Int, batchSize: Int
+) -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  let rot = Input()
+  let conv1 = Convolution(
+    groups: 1, filters: width, filterSize: [2, 14, 14], noBias: true,
+    hint: Hint(stride: [2, 14, 14], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+  var out = conv1(x).reshaped([batchSize, gridX * gridY, width])
+  var readers = [(PythonObject) -> Void]()
+  for i in 0..<layers {
+    let (reader, block) = QwenVLResidualAttentionBlock(
+      prefix: "blocks.\(i)", k: width / heads, h: heads, b: batchSize,
+      t: gridX * gridY, MLP: MLP)
+    out = block(out.reshaped([batchSize, gridX * gridY, width]), rot)
+    readers.append(reader)
+  }
+  let normOut = RMSNorm(epsilon: 1e-6, axis: [1])
+  out = normOut(out).reshaped([gridX * gridY / 4, 4 * width])
+  let mlp0 = Dense(count: 5120, name: "merger_mlp_0")
+  let mlp1 = Dense(count: 3584, name: "merger_mlp_1")
+  out = mlp1(mlp0(out).GELU())
+  let reader: (PythonObject) -> Void = { state_dict in
+    let patch_embed_weight = state_dict["patch_embed.proj.weight"].type(
+      torch.float
+    ).cpu().numpy()
+    conv1.weight.copy(from: try! Tensor<Float>(numpy: patch_embed_weight))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let merger_ln_q_weight = state_dict["merger.ln_q.weight"].type(
+      torch.float
+    ).cpu().numpy()
+    normOut.weight.copy(from: try! Tensor<Float>(numpy: merger_ln_q_weight))
+    let merger_mlp_0_weight = state_dict["merger.mlp.0.weight"].type(
+      torch.float
+    ).cpu().numpy()
+    mlp0.weight.copy(from: try! Tensor<Float>(numpy: merger_mlp_0_weight))
+    let merger_mlp_0_bias = state_dict["merger.mlp.0.bias"].type(
+      torch.float
+    ).cpu().numpy()
+    mlp0.bias.copy(from: try! Tensor<Float>(numpy: merger_mlp_0_bias))
+    let merger_mlp_2_weight = state_dict["merger.mlp.2.weight"].type(
+      torch.float
+    ).cpu().numpy()
+    mlp1.weight.copy(from: try! Tensor<Float>(numpy: merger_mlp_2_weight))
+    let merger_mlp_2_bias = state_dict["merger.mlp.2.bias"].type(
+      torch.float
+    ).cpu().numpy()
+    mlp1.bias.copy(from: try! Tensor<Float>(numpy: merger_mlp_2_bias))
+  }
+  return (reader, Model([x, rot], [out]))
+}
+
+graph.withNoGrad {
+  let visual_state_dict = pipe.text_encoder.model.visual.state_dict()
+  print(visual_state_dict.keys())
+  let promptImageTensor = graph.variable(
+    Tensor<Float>(from: try! Tensor<Float>(numpy: prompt_image.to(torch.float).cpu().numpy()))
+      .toGPU(1)
+  ).reshaped(format: .NCHW, shape: [8 * 8, 3, 2, 14, 14])
+  let rotTensor = graph.variable(.CPU, .NHWC(1, 64, 1, 80), of: Float.self)
+  var i = 0
+  for y in 0..<4 {
+    for x in 0..<4 {
+      for iy in 0..<2 {
+        for ix in 0..<2 {
+          for k in 0..<20 {
+            let theta = Double(y * 2 + iy) * 1.0 / pow(10_000, Double(k) * 2 / 40)
+            let sintheta = sin(theta)
+            let costheta = cos(theta)
+            rotTensor[0, i, 0, k * 2] = Float(costheta)
+            rotTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
+          }
+          for k in 0..<20 {
+            let theta = Double(x * 2 + ix) * 1.0 / pow(10_000, Double(k) * 2 / 40)
+            let sintheta = sin(theta)
+            let costheta = cos(theta)
+            rotTensor[0, i, 0, 40 + k * 2] = Float(costheta)
+            rotTensor[0, i, 0, 40 + k * 2 + 1] = Float(sintheta)
+          }
+          i += 1
+        }
+      }
+    }
+  }
+  let rotTensorGPU = rotTensor.toGPU(1)
+  let (reader, vit) = QwenVLVisionTransformer(
+    gridX: 8, gridY: 8, width: 1280, layers: 32, heads: 16, MLP: 3420, batchSize: 1)
+  vit.compile(inputs: promptImageTensor, rotTensorGPU)
+  reader(visual_state_dict)
+  debugPrint(vit(inputs: promptImageTensor, rotTensorGPU))
+}
+
+exit(0)
 
 let prompt =
   "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}A coffee shop entrance features a chalkboard sign reading \"Qwen Coffee 😊 $2 per cup,\" with a neon light beside it displaying \"通义千问\". Next to it hangs a poster showing a beautiful Chinese woman, and beneath the poster is written \"π≈3.1415926-53589793-23846264-33832795-02384197\".<|im_end|>\n<|im_start|>assistant\n"
@@ -606,7 +814,7 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: h * w,
       contextBlockPreOnly: i == layers - 1,
-      scaleFactor: (i >= layers - 16 ? 16 : 2, i >= layers - 1 ? 256 : 16))
+      scaleFactor: (i >= layers - 16 ? 16 : 2, i >= layers - 1 ? 512 : 16))
     let blockOut = block(out, context, vec, rot)
     if i == layers - 1 {
       out = blockOut
@@ -828,7 +1036,7 @@ graph.withNoGrad {
   dit.compile(inputs: xTensor, rotTensorGPU, tTensor, cTensor)
   reader(state_dict)
   debugPrint(dit(inputs: xTensor, rotTensorGPU, tTensor, cTensor))
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_1.0_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_edit_1.0_f16.ckpt") {
     $0.write("dit", model: dit)
   }
   exit(0)

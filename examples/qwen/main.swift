@@ -4,7 +4,7 @@ import NNC
 import PNG
 import TensorBoard
 
-let filename = "qwen_image_f16_5"
+let filename = "qwen_image_edit_f16_5"
 
 DynamicGraph.setSeed(42)
 
@@ -182,8 +182,11 @@ let txt = graph.withNoGrad {
   let positiveRotTensorGPU = DynamicGraph.Tensor<Float16>(from: positiveRotTensor).toGPU(0)
   let negativeRotTensorGPU = DynamicGraph.Tensor<Float16>(from: negativeRotTensor).toGPU(0)
   transformer.compile(inputs: positiveTokensTensorGPU, positiveRotTensorGPU)
-  graph.openStore("/slow/Data/qwen_2.5_vl_7b_f16.ckpt", flags: [.readOnly]) {
-    $0.read("text_model", model: transformer, codec: [.q8p, .ezm7])
+  graph.openStore(
+    "/slow/Data/grpc-runtime/qwen_2.5_vl_7b_f16.ckpt", flags: [.readOnly],
+    externalStore: "/slow/Data/grpc-runtime/qwen_2.5_vl_7b_f16.ckpt-tensordata"
+  ) {
+    $0.read("text_model", model: transformer, codec: [.q8p, .ezm7, .externalData])
   }
   let positiveLastHiddenStates = transformer(inputs: positiveTokensTensorGPU, positiveRotTensorGPU)[
     0
@@ -355,7 +358,7 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: h * w,
       contextBlockPreOnly: i == layers - 1,
-      scaleFactor: (i >= layers - 16 ? 16 : 2, i >= layers - 1 ? 256 : 16))
+      scaleFactor: (i >= layers - 16 ? 16 : 2, i >= layers - 1 ? 512 : 16))
     let blockOut = block(out, context, vec, rot)
     if i == layers - 1 {
       out = blockOut
@@ -473,7 +476,7 @@ let z = graph.withNoGrad {
   z.randn()
   dit.compile(inputs: z, posRotTensorGPU, tTensor, posTensor)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/qwen_image_1.0_f16.ckpt", flags: [.readOnly]
+    "/home/liu/workspace/swift-diffusion/qwen_image_edit_1.0_f16.ckpt", flags: [.readOnly]
   ) {
     $0.read("dit", model: dit, codec: [.q5p, .q6p, .q8p, .ezm7])
   }
