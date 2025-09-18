@@ -19,7 +19,7 @@ torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
 let pipe = diffusers.DiffusionPipeline.from_pretrained(
-  "Qwen/Qwen-Image-Edit", torch_dtype: torch.float16)
+  "Qwen/Qwen-Image-Edit", torch_dtype: torch.bfloat16)
 pipe.enable_model_cpu_offload()
 
 print(pipe.text_encoder.visual)
@@ -73,7 +73,7 @@ func QwenVLResidualAttentionBlock(
 ) {
   let x = Input()
   let rot = Input()
-  let norm1 = RMSNorm(epsilon: 1e-6, axis: [2])
+  let norm1 = RMSNorm(epsilon: 1e-6, axis: [2], name: "norm1")
   let (toqueries, tokeys, tovalues, unifyheads, attention) = QwenVLSelfAttention(
     k: k, h: h, b: isFullAttention ? b : b * (t / 64), t: isFullAttention ? t : 64)
   var out: Model.IO
@@ -82,7 +82,7 @@ func QwenVLResidualAttentionBlock(
   } else {
     out = x.reshaped([b * t, h * k]) + attention(norm1(x), rot.reshaped([b * (t / 64), 64, 1, k]))
   }
-  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1])
+  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm2")
   let (gate, down, up, ffn) = QwenVLFeedForward(
     hiddenSize: k * h, intermediateSize: MLP, name: "mlp")
   out = out + ffn(norm2(out))
@@ -149,7 +149,8 @@ func QwenVLVisionTransformer(
   let rot = Input()
   let conv1 = Convolution(
     groups: 1, filters: width, filterSize: [2, 14, 14], noBias: true,
-    hint: Hint(stride: [2, 14, 14], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])))
+    hint: Hint(stride: [2, 14, 14], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "conv_in")
   var out = conv1(x).reshaped([batchSize, gridX * gridY, width])
   var readers = [(PythonObject) -> Void]()
   for i in 0..<layers {
@@ -160,7 +161,7 @@ func QwenVLVisionTransformer(
     out = block(out.reshaped([batchSize, gridX * gridY, width]), rot)
     readers.append(reader)
   }
-  let normOut = RMSNorm(epsilon: 1e-6, axis: [1])
+  let normOut = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm_out")
   out = normOut(out).reshaped([gridX * gridY / 4, 4 * width])
   let mlp0 = Dense(count: 5120, name: "merger_mlp_0")
   let mlp1 = Dense(count: 3584, name: "merger_mlp_1")
@@ -197,6 +198,7 @@ func QwenVLVisionTransformer(
   return (reader, Model([x, rot], [out]))
 }
 
+/*
 graph.withNoGrad {
   let visual_state_dict = pipe.text_encoder.model.visual.state_dict()
   print(visual_state_dict.keys())
@@ -257,9 +259,13 @@ graph.withNoGrad {
   vit.compile(inputs: rearrangedPromptImageTensor, rotTensorGPU)
   reader(visual_state_dict)
   debugPrint(vit(inputs: rearrangedPromptImageTensor, rotTensorGPU))
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_2.5_vl_7b_vit_f32.ckpt") {
+    $0.write("vit", model: vit)
+  }
 }
 
 exit(0)
+*/
 
 let prompt =
   "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}A coffee shop entrance features a chalkboard sign reading \"Qwen Coffee 😊 $2 per cup,\" with a neon light beside it displaying \"通义千问\". Next to it hangs a poster showing a beautiful Chinese woman, and beneath the poster is written \"π≈3.1415926-53589793-23846264-33832795-02384197\".<|im_end|>\n<|im_start|>assistant\n"
@@ -845,7 +851,7 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: h * w,
       contextBlockPreOnly: i == layers - 1,
-      scaleFactor: (i >= layers - 16 ? 16 : 2, i >= layers - 1 ? 512 : 16))
+      scaleFactor: (i >= layers - 16 ? 16 : 2, i >= layers - 1 ? 512 : 32))
     let blockOut = block(out, context, vec, rot)
     if i == layers - 1 {
       out = blockOut

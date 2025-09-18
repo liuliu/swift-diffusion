@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/qwen_image_edit_1.0_f16.ckpt"
+  "/home/liu/workspace/draw-things-community/anisora_v3.1_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/qwen_image_edit_1.0_q6p.ckpt",
+    "/home/liu/workspace/draw-things-community/anisora_v3.1_q6p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
