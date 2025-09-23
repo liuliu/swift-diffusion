@@ -20,23 +20,25 @@ let Image = Python.import("PIL.Image")
 let torch_nn_functional = Python.import("torch.nn.functional")
 let torchvision_transforms_functional = Python.import("torchvision.transforms.functional")
 
-let cfg = wan.configs.WAN_CONFIGS["i2v-14B"]
-let wan_i2v = wan.WanI2V(
+let cfg = wan.configs.WAN_CONFIGS["ti2v-5B"]
+let wan_ti2v = wan.WanTI2V(
   config: cfg,
-  checkpoint_dir: "/home/liu/workspace/Wan2.1/Wan2.1-I2V-14B-720P",
+  checkpoint_dir: "/home/liu/workspace/Wan2.2/Wan2.2-TI2V-5B",
   device_id: 0,
   rank: 0,
   t5_fsdp: false,
   dit_fsdp: false,
-  use_usp: false,
+  use_sp: false,
   t5_cpu: false
 )
+print(wan_ti2v)
 
+/*
 var img = Image.open("/home/liu/workspace/Wan2.1/examples/i2v_input.JPG").convert("RGB")
 img = torchvision_transforms_functional.to_tensor(img).sub_(0.5).div_(0.5).to(wan_i2v.device)
 
 let visual_state_dict = wan_i2v.clip.model.visual.state_dict()
-/*
+
 img = img[Python.slice(Python.None, Python.None, Python.None), Python.None, Python.slice(Python.None, Python.None, Python.None), Python.slice(Python.None, Python.None, Python.None)]
 let clip_context = wan_i2v.clip.visual([img])
 let resized = torch_nn_functional.interpolate(img.transpose(0, 1), size: [224, 224], mode: "bicubic", align_corners: false)
@@ -181,9 +183,9 @@ graph.withNoGrad {
   */
 }
 
-wan_i2v.text_encoder.model.cpu()
-
-let text_encoder_state_dict = wan_i2v.text_encoder.model.state_dict()
+wan_ti2v.text_encoder.model.cpu()
+/*
+let text_encoder_state_dict = wan_ti2v.text_encoder.model.state_dict()
 
 let prompt =
   "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a spotlighted stage."
@@ -193,6 +195,7 @@ let sentencePiece = SentencePiece(
 var tokens2 = sentencePiece.encode(prompt).map { return $0.id }
 tokens2.append(1)
 print(tokens2)
+*/
 
 func UMT5TextEmbedding(vocabularySize: Int, embeddingSize: Int, name: String) -> Model {
   let tokenEmbed = Embedding(
@@ -394,22 +397,18 @@ graph.withNoGrad {
 
 torch.set_autocast_enabled("cuda", true)
 torch.set_autocast_dtype("cuda", torch.bfloat16)
-
-let x = torch.randn([16, 21, 60, 104]).to(torch.float).cuda()
-let y = torch.randn([20, 21, 60, 104]).to(torch.float).cuda()
-let t = torch.tensor([900], dtype: torch.float, device: torch.device("cuda:0"))
-let context = torch.randn([28, 4096]).to(torch.float).cuda()
-let clip_fea = torch.randn([1, 257, 1280]).to(torch.float).cuda()
-print(wan_i2v.model)
 /*
-wan_i2v.model.half().to(torch.device("cuda:0"))
-let out = wan_i2v.model([x], t, [context], 21 * 30 * 52, clip_fea, [y])
-*/
-// print(out)
+let x = torch.randn([48, 31, 44, 80]).to(torch.float).cuda()
+let t = torch.tensor([900], dtype: torch.float, device: torch.device("cuda:0"))
+let context = torch.randn([126, 4096]).to(torch.float).cuda()
+print(wan_ti2v.model)
 
-let wan_state_dict = wan_i2v.model.state_dict()
+wan_ti2v.model.half().to(torch.device("cuda:0"))
+let out = wan_ti2v.model([x], t, [context], 31 * 22 * 40)
+
+let wan_state_dict = wan_ti2v.model.state_dict()
 print(wan_state_dict.keys())
-
+*/
 func FeedForward(hiddenSize: Int, intermediateSize: Int, upcast: Bool, name: String) -> (
   Model, Model, Model
 ) {
@@ -435,7 +434,7 @@ func WanAttentionBlock(
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let context = Input()
-  let contextImg = Input()
+  // let contextImg = Input()
   let c = (0..<6).map { _ in Input() }
   let rot = Input()
   let modulations = (0..<6).map {
@@ -480,6 +479,7 @@ func WanAttentionBlock(
   let crossOut = crossAttention(cQ, cK, cV).reshaped([b, hw, k * h])
   let contextImgToKeys = Dense(count: k * h, name: "c_img_k")
   let contextImgToValues = Dense(count: k * h, name: "c_img_v")
+  /*
   var cImgK = contextImgToKeys(contextImg)
   let contextImgNormK = RMSNorm(epsilon: 1e-6, axis: [2], name: "c_img_norm_k")
   cImgK = contextImgNormK(cImgK).reshaped([b, 257, h, k])
@@ -488,8 +488,9 @@ func WanAttentionBlock(
     scale: 1 / Float(k).squareRoot(), flags: [.Float16])
   let crossOutImg = crossAttentionImg(cQ, cImgK, cImgV).reshaped([b, hw, k * h])
   crossOutImg.add(dependencies: [crossOut])
+  */
   let contextUnifyheads = Dense(count: k * h, name: "c_o")
-  out = out + contextUnifyheads(crossOut + crossOutImg).to(of: out)
+  out = out + contextUnifyheads(crossOut /* + crossOutImg */).to(of: out)
   let xNorm2 = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   let (xLinear1, xOutProjection, xFF) = FeedForward(
     hiddenSize: k * h, intermediateSize: intermediateSize, upcast: false, name: "x")
@@ -614,6 +615,7 @@ func WanAttentionBlock(
       ).cpu().numpy()
     contextNormQ.weight.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: cross_attn_norm_q_weight)))
+    /*
     let cross_attn_k_img_weight = state_dict["\(prefix).cross_attn.k_img.weight"]
       .to(
         torch.float
@@ -644,6 +646,7 @@ func WanAttentionBlock(
       ).cpu().numpy()
     contextImgNormK.weight.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: cross_attn_norm_k_img_weight)))
+    */
     let cross_attn_o_weight = state_dict["\(prefix).cross_attn.o.weight"]
       .to(
         torch.float
@@ -693,7 +696,7 @@ func WanAttentionBlock(
     xOutProjection.bias.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ffn_2_bias)))
   }
-  return (reader, Model([x, context, contextImg, rot] + c, [out]))
+  return (reader, Model([x, context /*, contextImg*/, rot] + c, [out]))
 }
 
 func TimeEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
@@ -732,7 +735,7 @@ func Wan(
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let imgIn = Dense(count: channels, name: "x_embedder")
-  let clip = Input()
+  // let clip = Input()
   var out = imgIn(x)
   let txt = Input()
   let (cLinear1, cLinear2, contextEmbedder) = MLPEmbedder(channels: channels, name: "c")
@@ -740,9 +743,11 @@ func Wan(
   let t = Input()
   let rot = Input()
   let (timeInMlp0, timeInMlp2, timeIn) = TimeEmbedder(channels: channels, name: "t")
+  /*
   let (clipLn1, clipLn2, clipMlp0, clipMlp2, clipIn) = MLPProj(
     inChannels: 1280, outChannels: channels, name: "clip")
   let clipContext = clipIn(clip)
+  */
   let vector = timeIn(t).reshaped([1, 1, channels])
   let vectorIn = vector.swish()
   let timeProjections = (0..<6).map { Dense(count: channels, name: "ada_ln_\($0)") }
@@ -755,14 +760,14 @@ func Wan(
     let (reader, block) = WanAttentionBlock(
       prefix: "blocks.\(i)", k: 128, h: channels / 128, b: 1, t: textLength, hw: time * h * w,
       intermediateSize: intermediateSize)
-    out = block([out, context, clipContext, rot] + tOut)
+    out = block([out, context, rot] + tOut)
     readers.append(reader)
   }
   let scale = Parameter<Float>(.GPU(2), .HWC(1, 1, channels), name: "ada_ln_0")
   let shift = Parameter<Float>(.GPU(2), .HWC(1, 1, channels), name: "ada_ln_1")
   let normFinal = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   out = ((1 + scale + vector) .* normFinal(out) + (vector + shift)).to(.Float16)
-  let projOut = Dense(count: 2 * 2 * 16, name: "linear")
+  let projOut = Dense(count: 2 * 2 * 48, name: "linear")
   out = projOut(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let patch_embedding_weight = state_dict["patch_embedding.weight"].to(
@@ -810,6 +815,7 @@ func Wan(
       from: Tensor<Float>(from: try! Tensor<Float>(numpy: time_embedding_2_weight)))
     timeInMlp2.bias.copy(
       from: Tensor<Float>(from: try! Tensor<Float>(numpy: time_embedding_2_bias)))
+    /*
     let img_emb_proj_0_weight = state_dict["img_emb.proj.0.weight"].to(
       torch.float
     ).cpu().numpy()
@@ -846,6 +852,7 @@ func Wan(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_4_weight)))
     clipLn2.bias.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: img_emb_proj_4_bias)))
+    */
     let time_projection_1_weight = state_dict["time_projection.1.weight"].to(
       torch.float
     ).cpu().numpy()
@@ -883,7 +890,7 @@ func Wan(
     projOut.bias.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: head_head_bias)))
   }
-  return (Model([x, txt, clip, t, rot], [out]), reader)
+  return (Model([x, txt, t, rot], [out]), reader)
 }
 
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
@@ -905,11 +912,12 @@ func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeri
 }
 
 graph.withNoGrad {
-  var rotNdTensor = graph.variable(.CPU, .NHWC(1, 21 * 30 * 52, 1, 128), of: Float.self)
-  for t in 0..<21 {
-    for y in 0..<30 {
-      for x in 0..<52 {
-        let i = t * 30 * 52 + y * 52 + x
+  /*
+  var rotNdTensor = graph.variable(.CPU, .NHWC(1, 31 * 22 * 40, 1, 128), of: Float.self)
+  for t in 0..<31 {
+    for y in 0..<22 {
+      for x in 0..<40 {
+        let i = t * 22 * 40 + y * 40 + x
         for k in 0..<22 {
           let theta = Double(t) * 1.0 / pow(10_000, Double(k) / 22)
           let sintheta = sin(theta)
@@ -936,47 +944,44 @@ graph.withNoGrad {
   }
   let (wan, reader) = Wan(
     // channels: 1536, layers: 30, intermediateSize: 8960, time: 21, height: 60, width: 104,
-    channels: 5120, layers: 40, intermediateSize: 13824, time: 21, height: 60, width: 104,
+    channels: 3072, layers: 30, intermediateSize: 14336, time: 31, height: 44, width: 80,
+    // channels: 5120, layers: 40, intermediateSize: 13824, time: 21, height: 60, width: 104,
     textLength: 512)
   let xTensor = graph.variable(
     Tensor<Float16>(
-      from: try! Tensor<Float>(numpy: torch.concat([x, y], dim: 0).to(torch.float).cpu().numpy())
+      from: try! Tensor<Float>(numpy: x.to(torch.float).cpu().numpy())
     ).toGPU(2)
-  ).reshaped(format: .NHWC, shape: [1, 36, 21 * 30, 2, 52, 2]).permuted(0, 2, 4, 1, 3, 5).copied()
-    .reshaped(format: .NHWC, shape: [1, 21 * 30 * 52, 36 * 2 * 2])
+  ).reshaped(format: .NHWC, shape: [1, 48, 31 * 22, 2, 40, 2]).permuted(0, 2, 4, 1, 3, 5).copied()
+    .reshaped(format: .NHWC, shape: [1, 31 * 22 * 40, 48 * 2 * 2])
   let txt = graph.variable(
     Tensor<Float16>(from: try! Tensor<Float>(numpy: context.to(torch.float).cpu().numpy()))
-      .reshaped(.WC(28, 4096)).toGPU(2))
+      .reshaped(.WC(126, 4096)).toGPU(2))
   var txtIn = graph.variable(.GPU(2), .WC(512, 4096), of: Float16.self)
   txtIn.full(0)
-  txtIn[0..<28, 0..<4096] = txt
+  txtIn[0..<126, 0..<4096] = txt
   txtIn = txtIn.reshaped(.HWC(1, 512, 4096))
-  let clip = graph.variable(
-    Tensor<Float16>(from: try! Tensor<Float>(numpy: clip_fea.to(torch.float).cpu().numpy()))
-      .reshaped(.HWC(1, 257, 1280)).toGPU(2))
   let timestep = timeEmbedding(timesteps: 900, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
   let tGPU = graph.variable(Tensor<Float>(from: timestep)).toGPU(2)
   let rotNdTensorGPU = DynamicGraph.Tensor<Float16>(from: rotNdTensor).toGPU(2)
-  wan.compile(inputs: xTensor, txtIn, clip, tGPU, rotNdTensorGPU)
-  graph.openStore("/slow/Data/wan_v2.1_14b_i2v_720p_f16.ckpt") {
+  wan.compile(inputs: xTensor, txtIn, tGPU, rotNdTensorGPU)
+  graph.openStore("/slow/Data/wan_v2.2_5b_ti2v_f16.ckpt", flags: [.readOnly]) {
     $0.read("dit", model: wan)
   }
-  // reader(wan_state_dict)
-  debugPrint(wan(inputs: xTensor, txtIn, clip, tGPU, rotNdTensorGPU))
-  /*
-  graph.openStore("/slow/Data/wan_v2.1_14b_i2v_720p_f16.ckpt") {
+  reader(wan_state_dict)
+  debugPrint(wan(inputs: xTensor, txtIn, tGPU, rotNdTensorGPU))
+  graph.openStore("/slow/Data/wan_v2.2_5b_ti2v_f16.ckpt") {
     $0.write("dit", model: wan)
   }
   */
 }
 
-exit(0)
+print(wan_ti2v.vae.model)
 
-let z = torch.randn([16, 3, 60, 104]).to(torch.float).cuda()
-let zOut = wan_i2v.vae.decode([z])[0]
-wan_i2v.vae.encode([zOut])
-print(wan_i2v.vae.model.encoder)
-let vae_state_dict = wan_i2v.vae.model.state_dict()
+let z = torch.randn([48, 3, 44, 80]).to(torch.float).cuda()
+let zOut = wan_ti2v.vae.decode([z])[0]
+wan_ti2v.vae.encode([zOut])
+let vae_state_dict = wan_ti2v.vae.model.state_dict()
+print(vae_state_dict.keys())
 
 func ResnetBlockCausal3D(
   prefix: String, inChannels: Int, outChannels: Int, shortcut: Bool, depth: Int, height: Int,
@@ -1111,7 +1116,7 @@ func DecoderCausal3D(
   let x = Input()
   var previousChannel = channels[channels.count - 1]
   let postQuantConv = Convolution(
-    groups: 1, filters: 16, filterSize: [1, 1, 1], name: "post_quant_conv")
+    groups: 1, filters: 48, filterSize: [1, 1, 1], name: "post_quant_conv")
   var out = postQuantConv(x)
   let convIn = Convolution(
     groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
@@ -1136,17 +1141,52 @@ func DecoderCausal3D(
   var height = startHeight
   var depth = startDepth
   var readers = [(PythonObject) -> Void]()
-  var k = 0
+  var upShortcut: Model.IO? = nil
   for (i, channel) in channels.enumerated().reversed() {
-    for _ in 0..<numRepeat + 1 {
+    if i > 0 {
+      var shortcut = out
+      if i > 1 {
+        // Need to do temporal upscaling.
+        shortcut = shortcut.reshaped([previousChannel, depth, height, width])
+        if previousChannel != channel {
+          shortcut = Functional.concat(
+            axis: 1, shortcut, shortcut, shortcut, shortcut, flags: [.disableOpt])
+        } else {
+          shortcut = Functional.concat(
+            axis: 1, shortcut, shortcut, shortcut, shortcut, shortcut, shortcut, shortcut, shortcut,
+            flags: [.disableOpt])
+        }
+        shortcut = shortcut.reshaped([channel, 2, 2, 2, depth, height, width]).permuted(
+          0, 4, 1, 5, 2, 6, 3
+        ).copied().reshaped([channel, depth * 2, height * 2, width * 2]).copied()
+        shortcut = shortcut.reshaped(
+          [channel, (depth - 1) * 2 + 1, height * 2, width * 2], offset: [0, 1, 0, 0],
+          strides: [depth * 2 * height * 2 * width * 2, height * 2 * width * 2, width * 2, 1]
+        ).contiguous().reshaped([1, channel, (depth - 1) * 2 + 1, height * 2, width * 2])
+      } else {
+        shortcut = shortcut.reshaped([previousChannel, depth, height, width])
+        if previousChannel != channel {
+          shortcut = Functional.concat(axis: 1, shortcut, shortcut, flags: [.disableOpt])
+        } else {
+          shortcut = Functional.concat(
+            axis: 1, shortcut, shortcut, shortcut, shortcut, flags: [.disableOpt])
+        }
+        shortcut = shortcut.reshaped([channel, 2, 2, depth, height, width]).permuted(
+          0, 3, 4, 1, 5, 2
+        ).copied().reshaped([1, channel, depth, height * 2, width * 2])
+      }
+      upShortcut = shortcut
+    } else {
+      upShortcut = nil
+    }
+    for j in 0..<numRepeat + 1 {
       let (reader, block) = ResnetBlockCausal3D(
-        prefix: "decoder.upsamples.\(k)",
+        prefix: "decoder.upsamples.\(channels.count - 1 - i).upsamples.\(j)",
         inChannels: previousChannel, outChannels: channel,
         shortcut: previousChannel != channel, depth: depth, height: height, width: width)
       readers.append(reader)
       out = block(out)
       previousChannel = channel
-      k += 1
     }
     if i > 0 {
       if i > 1 && startDepth > 1 {  // Need to bump up on the depth axis.
@@ -1162,12 +1202,17 @@ func DecoderCausal3D(
           hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
           name: "time_conv")
         var expanded = timeConv(more.padded(.zero, begin: [0, 0, 2, 0, 0], end: [0, 0, 0, 0, 0]))
-        let upLayer = k
+        let upsampleLayer = channels.count - 1 - i
+        let upLayer = numRepeat + 1
         let reader: (PythonObject) -> Void = { state_dict in
-          let time_conv_weight = state_dict["decoder.upsamples.\(upLayer).time_conv.weight"]
-            .to(torch.float)
-            .cpu().numpy()
-          let time_conv_bias = state_dict["decoder.upsamples.\(upLayer).time_conv.bias"].to(
+          let time_conv_weight = state_dict[
+            "decoder.upsamples.\(upsampleLayer).upsamples.\(upLayer).time_conv.weight"
+          ]
+          .to(torch.float)
+          .cpu().numpy()
+          let time_conv_bias = state_dict[
+            "decoder.upsamples.\(upsampleLayer).upsamples.\(upLayer).time_conv.bias"
+          ].to(
             torch.float
           ).cpu()
             .numpy()
@@ -1187,17 +1232,25 @@ func DecoderCausal3D(
       width *= 2
       height *= 2
       let conv2d = Convolution(
-        groups: 1, filters: channel / 2, filterSize: [1, 3, 3],
+        groups: 1, filters: channel, filterSize: [1, 3, 3],
         hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 1, 1], end: [0, 1, 1])),
         name: "upsample")
       out = conv2d(out)
-      previousChannel = channel / 2
-      let upLayer = k
+      if let upShortcut = upShortcut {
+        out = upShortcut + out
+      }
+      previousChannel = channel
+      let upsampleLayer = channels.count - 1 - i
+      let upLayer = numRepeat + 1
       let reader: (PythonObject) -> Void = { state_dict in
-        let conv_weight = state_dict["decoder.upsamples.\(upLayer).resample.1.weight"]
-          .to(torch.float)
-          .cpu().numpy()
-        let conv_bias = state_dict["decoder.upsamples.\(upLayer).resample.1.bias"].to(
+        let conv_weight = state_dict[
+          "decoder.upsamples.\(upsampleLayer).upsamples.\(upLayer).resample.1.weight"
+        ]
+        .to(torch.float)
+        .cpu().numpy()
+        let conv_bias = state_dict[
+          "decoder.upsamples.\(upsampleLayer).upsamples.\(upLayer).resample.1.bias"
+        ].to(
           torch.float
         ).cpu()
           .numpy()
@@ -1205,7 +1258,6 @@ func DecoderCausal3D(
         conv2d.bias.copy(from: try! Tensor<Float>(numpy: conv_bias))
       }
       readers.append(reader)
-      k += 1
     }
   }
   let normOut = RMSNorm(epsilon: 1e-6, axis: [0], name: "norm_out")
@@ -1214,7 +1266,7 @@ func DecoderCausal3D(
   ])
   out = out.swish()
   let convOut = Convolution(
-    groups: 1, filters: 3, filterSize: [3, 3, 3],
+    groups: 1, filters: 12, filterSize: [3, 3, 3],
     hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
     name: "conv_out")
   out = convOut(out.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
@@ -1266,17 +1318,36 @@ func EncoderCausal3D(
       depth = (depth - 1) * 2 + 1
     }
   }
-  var k = 0
+  var downShortcut = out
   for (i, channel) in channels.enumerated() {
-    for _ in 0..<numRepeat {
+    downShortcut = out
+    if i < channels.count - 1 {
+      if i > 0 && depth > 1 {
+        let pad = (2 - depth % 2) % 2
+        downShortcut = downShortcut.padded(.zero, begin: [0, 0, pad, 0, 0], end: [0, 0, 0, 0, 0])
+        let paddedDepth = depth + pad
+        downShortcut = downShortcut.reshaped([
+          previousChannel, paddedDepth / 2, 2, height / 2, 2, width / 2, 2,
+        ]).permuted(0, 2, 4, 6, 1, 3, 5).copied()
+        downShortcut = downShortcut.reshaped([
+          channel, 8 * previousChannel / channel, paddedDepth / 2, height / 2, width / 2,
+        ]).reduced(.mean, axis: [1]).reshaped([1, channel, paddedDepth / 2, height / 2, width / 2])
+      } else {
+        downShortcut = downShortcut.reshaped([previousChannel, depth, height / 2, 2, width / 2, 2])
+          .permuted(0, 3, 5, 1, 2, 4).copied()
+        downShortcut = downShortcut.reshaped([
+          channel, 4 * previousChannel / channel, depth, height / 2, width / 2,
+        ]).reduced(.mean, axis: [1]).reshaped([1, channel, depth, height / 2, width / 2])
+      }
+    }
+    for j in 0..<numRepeat {
       let (reader, block) = ResnetBlockCausal3D(
-        prefix: "encoder.downsamples.\(k)", inChannels: previousChannel,
+        prefix: "encoder.downsamples.\(i).downsamples.\(j)", inChannels: previousChannel,
         outChannels: channel,
         shortcut: previousChannel != channel, depth: depth, height: height, width: width)
       readers.append(reader)
       out = block(out)
       previousChannel = channel
-      k += 1
     }
     if i < channels.count - 1 {
       height /= 2
@@ -1287,17 +1358,20 @@ func EncoderCausal3D(
           stride: [1, 2, 2], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
         name: "downsample")
       out = conv2d(out.padded(.zero, begin: [0, 0, 0, 0, 0], end: [0, 0, 0, 1, 1]))
-      let downLayer = k
+      let downsampleLayer = i
+      let downLayer = numRepeat
       let reader: (PythonObject) -> Void = { state_dict in
         let conv_weight = state_dict[
-          "encoder.downsamples.\(downLayer).resample.1.weight"
+          "encoder.downsamples.\(downsampleLayer).downsamples.\(downLayer).resample.1.weight"
         ].to(
           torch.float
         ).cpu()
           .numpy()
-        let conv_bias = state_dict["encoder.downsamples.\(downLayer).resample.1.bias"]
-          .to(torch.float)
-          .cpu().numpy()
+        let conv_bias = state_dict[
+          "encoder.downsamples.\(downsampleLayer).downsamples.\(downLayer).resample.1.bias"
+        ]
+        .to(torch.float)
+        .cpu().numpy()
         conv2d.weight.copy(from: try! Tensor<Float>(numpy: conv_weight))
         conv2d.bias.copy(from: try! Tensor<Float>(numpy: conv_bias))
       }
@@ -1313,12 +1387,17 @@ func EncoderCausal3D(
             stride: [2, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
           name: "time_conv")
         let shrunk = timeConv(out)
-        let upLayer = k
+        let downsampleLayer = i
+        let downLayer = numRepeat
         let reader: (PythonObject) -> Void = { state_dict in
-          let time_conv_weight = state_dict["encoder.downsamples.\(upLayer).time_conv.weight"]
-            .to(torch.float)
-            .cpu().numpy()
-          let time_conv_bias = state_dict["encoder.downsamples.\(upLayer).time_conv.bias"].to(
+          let time_conv_weight = state_dict[
+            "encoder.downsamples.\(downsampleLayer).downsamples.\(downLayer).time_conv.weight"
+          ]
+          .to(torch.float)
+          .cpu().numpy()
+          let time_conv_bias = state_dict[
+            "encoder.downsamples.\(downsampleLayer).downsamples.\(downLayer).time_conv.bias"
+          ].to(
             torch.float
           ).cpu()
             .numpy()
@@ -1329,8 +1408,8 @@ func EncoderCausal3D(
         depth = (depth - 1) / 2 + 1
         out = Functional.concat(axis: 2, first, shrunk)
       }
-      k += 1
     }
+    out = downShortcut + out
   }
   let (midBlockReader1, midBlock1) = ResnetBlockCausal3D(
     prefix: "encoder.middle.0", inChannels: previousChannel,
@@ -1352,11 +1431,11 @@ func EncoderCausal3D(
   ])
   out = out.swish()
   let convOut = Convolution(
-    groups: 1, filters: 32, filterSize: [3, 3, 3],
+    groups: 1, filters: 96, filterSize: [3, 3, 3],
     hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
     name: "conv_out")
   out = convOut(out.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
-  let quantConv = Convolution(groups: 1, filters: 32, filterSize: [1, 1, 1], name: "quant_conv")
+  let quantConv = Convolution(groups: 1, filters: 96, filterSize: [1, 1, 1], name: "quant_conv")
   out = quantConv(out)
   let reader: (PythonObject) -> Void = { state_dict in
     let conv_in_weight = state_dict["encoder.conv1.weight"].to(torch.float).cpu().numpy()
@@ -1384,34 +1463,132 @@ func EncoderCausal3D(
 }
 
 graph.withNoGrad {
-  /*
-  let mean = graph.variable(Tensor<Float>([
-    -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
-    0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
-  ], format: .NCHW, shape: [1, 16, 1, 1, 1])).toGPU(1)
-  let std = graph.variable(Tensor<Float>([
-    2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
-    3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
-  ], format: .NCHW, shape: [1, 16, 1, 1, 1])).toGPU(1)
-  var zTensor = graph.variable(try! Tensor<Float>(numpy: z.to(torch.float).cpu().numpy())).reshaped(
-    format: .NCHW, shape: [1, 16, 3, 60, 104]
+  let mean = graph.variable(
+    Tensor<Float>(
+      [
+        -0.2289,
+        -0.0052,
+        -0.1323,
+        -0.2339,
+        -0.2799,
+        0.0174,
+        0.1838,
+        0.1557,
+        -0.1382,
+        0.0542,
+        0.2813,
+        0.0891,
+        0.1570,
+        -0.0098,
+        0.0375,
+        -0.1825,
+        -0.2246,
+        -0.1207,
+        -0.0698,
+        0.5109,
+        0.2665,
+        -0.2108,
+        -0.2158,
+        0.2502,
+        -0.2055,
+        -0.0322,
+        0.1109,
+        0.1567,
+        -0.0729,
+        0.0899,
+        -0.2799,
+        -0.1230,
+        -0.0313,
+        -0.1649,
+        0.0117,
+        0.0723,
+        -0.2839,
+        -0.2083,
+        -0.0520,
+        0.3748,
+        0.0152,
+        0.1957,
+        0.1433,
+        -0.2944,
+        0.3573,
+        -0.0548,
+        -0.1681,
+        -0.0667,
+      ], kind: .CPU, format: .NCHW, shape: [1, 48, 1, 1, 1])
   ).toGPU(1)
-  // zTensor = zTensor / std + mean
+  let std = graph.variable(
+    Tensor<Float>(
+      [
+        0.4765,
+        1.0364,
+        0.4514,
+        1.1677,
+        0.5313,
+        0.4990,
+        0.4818,
+        0.5013,
+        0.8158,
+        1.0344,
+        0.5894,
+        1.0901,
+        0.6885,
+        0.6165,
+        0.8454,
+        0.4978,
+        0.5759,
+        0.3523,
+        0.7135,
+        0.6804,
+        0.5833,
+        1.4146,
+        0.8986,
+        0.5659,
+        0.7069,
+        0.5338,
+        0.4889,
+        0.4917,
+        0.4069,
+        0.4999,
+        0.6866,
+        0.4093,
+        0.5709,
+        0.6065,
+        0.6415,
+        0.4944,
+        0.5726,
+        1.2042,
+        0.5458,
+        1.6887,
+        0.3971,
+        1.0600,
+        0.3943,
+        0.5537,
+        0.5444,
+        0.4089,
+        0.7468,
+        0.7744,
+      ], kind: .CPU, format: .NCHW, shape: [1, 48, 1, 1, 1])
+  ).toGPU(1)
+  var zTensor = graph.variable(try! Tensor<Float>(numpy: z.to(torch.float).cpu().numpy())).reshaped(
+    format: .NCHW, shape: [1, 48, 3, 44, 80]
+  ).toGPU(1)
+  zTensor = zTensor .* std + mean
   let (decoderReader, decoder) = DecoderCausal3D(
-    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 104, startHeight: 60, startDepth: 3)
+    channels: [256, 512, 1024, 1024], numRepeat: 2, startWidth: 80, startHeight: 44, startDepth: 3)
   decoder.compile(inputs: zTensor)
   decoderReader(vae_state_dict)
   let image = decoder(inputs: zTensor)[0].as(of: Float.self)
+  // debugPrint(image)
   let (encoderReader, encoder) = EncoderCausal3D(
-    channels: [96, 192, 384, 384], numRepeat: 2, startWidth: 104, startHeight: 60, startDepth: 3)
+    channels: [160, 320, 640, 640], numRepeat: 2, startWidth: 80, startHeight: 44, startDepth: 3)
   encoder.compile(inputs: image)
   encoderReader(vae_state_dict)
-  debugPrint(encoder(inputs: image)[0].as(of: Float.self))
-  graph.openStore("/home/liu/workspace/swift-diffusion/wan_v2.1_video_vae_f32.ckpt") {
+  let encoded = encoder(inputs: image)[0].as(of: Float.self)
+  debugPrint(encoded[0..<1, 0..<48, 0..<3, 0..<44, 0..<80])
+  graph.openStore("/home/liu/workspace/swift-diffusion/wan_v2.2_video_vae_f32.ckpt") {
     $0.write("decoder", model: decoder)
     $0.write("encoder", model: encoder)
   }
-  */
 }
 
 /*
