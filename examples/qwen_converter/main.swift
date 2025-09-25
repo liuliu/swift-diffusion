@@ -18,8 +18,8 @@ torch.set_grad_enabled(false)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-let pipe = diffusers.DiffusionPipeline.from_pretrained(
-  "Qwen/Qwen-Image-Edit", torch_dtype: torch.bfloat16)
+let pipe = diffusers.QwenImageEditPipeline.from_pretrained(
+  "Qwen/Qwen-Image-Edit-2509", torch_dtype: torch.bfloat16)
 pipe.enable_model_cpu_offload()
 
 print(pipe.text_encoder.visual)
@@ -1073,7 +1073,7 @@ graph.withNoGrad {
   dit.compile(inputs: xTensor, rotTensorGPU, tTensor, cTensor)
   reader(state_dict)
   debugPrint(dit(inputs: xTensor, rotTensorGPU, tTensor, cTensor))
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_edit_1.0_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_edit_2509_f16.ckpt") {
     $0.write("dit", model: dit)
   }
   exit(0)
