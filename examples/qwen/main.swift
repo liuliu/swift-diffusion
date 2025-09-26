@@ -358,7 +358,7 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: h * w,
       contextBlockPreOnly: i == layers - 1,
-      scaleFactor: (i >= layers - 16 ? 16 : 2, i >= layers - 1 ? 512 : 16))
+      scaleFactor: (i >= layers - 16 ? 16 : 4, i >= layers - 1 ? 512 : 32))
     let blockOut = block(out, context, vec, rot)
     if i == layers - 1 {
       out = blockOut
@@ -476,7 +476,7 @@ let z = graph.withNoGrad {
   z.randn()
   dit.compile(inputs: z, posRotTensorGPU, tTensor, posTensor)
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/qwen_image_edit_1.0_f16.ckpt", flags: [.readOnly]
+    "/home/liu/workspace/swift-diffusion/qwen_image_edit_2509_f16.ckpt", flags: [.readOnly]
   ) {
     $0.read("dit", model: dit, codec: [.q5p, .q6p, .q8p, .ezm7])
   }
