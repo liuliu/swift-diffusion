@@ -851,7 +851,7 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
     let (reader, block) = JointTransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 24, b: 1, t: textLength, hw: h * w,
       contextBlockPreOnly: i == layers - 1,
-      scaleFactor: (i >= layers - 16 ? 16 : 4, i >= layers - 1 ? 512 : 32))
+      scaleFactor: (i >= layers - 16 ? 32 : 4, i >= layers - 1 ? 512 : 32))
     let blockOut = block(out, context, vec, rot)
     if i == layers - 1 {
       out = blockOut
