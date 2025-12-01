@@ -9,20 +9,20 @@ let torch = Python.import("torch")
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/draw-things-community/anisora_v3.1_f16.ckpt",
+  "/home/liu/workspace/draw-things-community/v3.2_hne_14b_f16.ckpt",
   flags: .readOnly
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/draw-things-community/anisora_v3.1_q6p.ckpt",
+    "/home/liu/workspace/draw-things-community/v3.2_hne_14b_q6p.ckpt",
     flags: .readOnly
   ) { bench in
     graph.openStore(
-      "/home/liu/workspace/draw-things-community/anisora_v3.1_q6p_svd.ckpt",
+      "/home/liu/workspace/draw-things-community/v3.2_hne_14b_q6p_svd.ckpt",
       flags: .truncateWhenClose
     ) { writer in
       graph.openStore(
-        "/home/liu/workspace/draw-things-community/anisora_v3.1_q6p.ckpt",
+        "/home/liu/workspace/draw-things-community/v3.2_hne_14b_q6p.ckpt",
         flags: .readOnly
       ) {
         for key in keys {

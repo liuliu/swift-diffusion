@@ -1150,3 +1150,50 @@ swift_binary(
         "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )
+
+swift_binary(
+    name = "hyvideo",
+    srcs = ["hyvideo/main.swift"],
+    data = [
+        "hunyuan/merges.txt",
+        "hunyuan/vocab.json",
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
+    name = "flux2",
+    srcs = ["flux2/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
+    name = "zimage",
+    srcs = ["zimage/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)

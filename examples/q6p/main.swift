@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/slow/Data/grpc-runtime/qwen_image_1.0_bf16.ckpt", flags: [.readOnly]
+  "/home/liu/workspace/draw-things-community/v3.2_lne_14b_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/qwen_image_1.0_bf16_q8p.ckpt",
+    "/home/liu/workspace/draw-things-community/v3.2_lne_14b_q6p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -18,12 +18,7 @@ graph.openStore(
         $0.write(key, tensor: tensor)
         continue
       }
-      let tensor: AnyTensor
-      if anyTensor.dataType == .BFloat16 {
-        tensor = Tensor<BFloat16>(anyTensor).toCPU()
-      } else {
-        tensor = Tensor<Float16>(from: anyTensor).toCPU()
-      }
+      let tensor = Tensor<Float16>(from: anyTensor).toCPU()
       if key.contains("__stage_c_fixed__") && (key.contains("key") || key.contains("value")) {
         continue
       }
@@ -95,9 +90,9 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
         } else {
-          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
         }
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
