@@ -232,6 +232,9 @@ let _ = graph.withNoGrad {
   let positiveLastHiddenStates = transformer(inputs: positiveTokensTensorGPU, positiveRotTensorGPU)[
     0
   ].as(of: Float16.self)
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_3_vl_4b_instruct_f16.ckpt") {
+    $0.write("text_model", model: transformer)
+  }
   return positiveLastHiddenStates
   */
 }
@@ -634,5 +637,14 @@ graph.withNoGrad {
   dit.compile(inputs: xTensor, xRotTensorGPU, txtTensor, txtRotTensorGPU, tTensor)
   print(state_dict.keys())
   reader(state_dict)
+  let x_pad_token = state_dict["x_pad_token"].to(torch.float).cpu().numpy()
+  let cap_pad_token = state_dict["cap_pad_token"].to(torch.float).cpu().numpy()
+  let xPadToken = Tensor<Float16>(from: try! Tensor<Float>(numpy: x_pad_token))
+  let capPadToken = Tensor<Float16>(from: try! Tensor<Float>(numpy: cap_pad_token))
   debugPrint(dit(inputs: xTensor, xRotTensorGPU, txtTensor, txtRotTensorGPU, tTensor))
+  graph.openStore("/home/liu/workspace/swift-diffusion/z_image_turbo_f16.ckpt") {
+    $0.write("dit", model: dit)
+    $0.write("x_pad_token", tensor: xPadToken)
+    $0.write("cap_pad_token", tensor: capPadToken)
+  }
 }

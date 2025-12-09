@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/draw-things-community/v3.2_lne_14b_f16.ckpt", flags: [.readOnly]
+  "/home/liu/workspace/swift-diffusion/qwen_3_vl_4b_instruct_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/draw-things-community/v3.2_lne_14b_q6p.ckpt",
+    "/home/liu/workspace/swift-diffusion/qwen_3_vl_4b_instruct_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -28,10 +28,12 @@ graph.openStore(
       }
       let shape = tensor.shape
       print("write \(key) \(tensor)")
-      if key.contains("embedder") || key.contains("pos_embed") || key.contains("-linear-")  // || key.contains("ada_ln")
+      if key.contains("embedder") || key.contains("pos_embed") || key.contains("-linear-")
+        || key.contains("-linear_final-")
         || key.contains("_embeddings") || key.contains("register_tokens")
-        || key.contains("refiner_") || key.contains("position_embedding")
-        || key.contains("-shared-")
+        || (key.contains("refiner_") && !key.contains("noise_refiner_")
+          && !key.contains("context_refiner_"))
+        || key.contains("position_embedding") || key.contains("-shared-")
       {
         $0.write(key, tensor: tensor)
         continue
@@ -90,9 +92,9 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         } else {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         }
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
