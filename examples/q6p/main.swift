@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/qwen_3_vl_4b_instruct_f16.ckpt", flags: [.readOnly]
+  "/fast/Data/mistral_small_3.2_24b_instruct_2506_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/qwen_3_vl_4b_instruct_q8p.ckpt",
+    "/fast/Data/mistral_small_3.2_24b_instruct_2506_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -18,7 +18,12 @@ graph.openStore(
         $0.write(key, tensor: tensor)
         continue
       }
-      let tensor = Tensor<Float16>(from: anyTensor).toCPU()
+      let tensor: AnyTensor
+      if anyTensor.dataType == .BFloat16 {
+        tensor = Tensor<BFloat16>(from: anyTensor).toCPU()
+      } else {
+        tensor = Tensor<Float16>(from: anyTensor).toCPU()
+      }
       if key.contains("__stage_c_fixed__") && (key.contains("key") || key.contains("value")) {
         continue
       }
