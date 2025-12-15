@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/fast/Data/mistral_small_3.2_24b_instruct_2506_f16.ckpt", flags: [.readOnly]
+  "/fast/Data/flux_2_dev_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/fast/Data/mistral_small_3.2_24b_instruct_2506_q8p.ckpt",
+    "/fast/Data/flux_2_dev_q6p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -97,9 +97,9 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
         } else {
-          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
         }
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
