@@ -19,7 +19,7 @@ torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
 let pipe = diffusers.QwenImageEditPipeline.from_pretrained(
-  "Qwen/Qwen-Image-Edit-2509", torch_dtype: torch.bfloat16)
+  "/slow/Data/Qwen/Qwen-Image-Edit-2511", torch_dtype: torch.bfloat16)
 pipe.enable_model_cpu_offload()
 
 print(pipe.text_encoder.visual)
@@ -821,19 +821,30 @@ func JointTransformerBlock(
 
 // let summaryWriter = SummaryWriter(logDirectory: "/tmp/qwen/")
 
-func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
+func QwenImage(height: Int, width: Int, textLength: Int, layers: Int, useAdditionalTCond: Bool) -> (
   Model, (PythonObject) -> Void
 ) {
   let x = Input()
   let rot = Input()
   let txt = Input()
   let t = Input()
+  let additionT: Input? = useAdditionalTCond ? Input() : nil
   let imgIn = Dense(count: 3072, name: "x_embedder")
   let txtNorm = RMSNorm(epsilon: 1e-6, axis: [2], name: "context_norm")
   let txtIn = Dense(count: 3_072, name: "context_embedder")
   let (timeInMlp0, timeInMlp2, timeIn) = MLPEmbedder(channels: 3_072, name: "t")
   var vec = timeIn(t)
-  vec = vec.reshaped([1, 1, 3072]).swish()
+  let additionTEmbed: Model?
+  vec = vec.reshaped([1, 1, 3072])
+  if let additionT = additionT {
+    let embed = Embedding(
+      Float16.self, vocabularySize: 2, embeddingSize: 3_072, name: "additional_t_embeddings")
+    vec = vec + embed(additionT).reshaped([1, 1, 3072])
+    additionTEmbed = embed
+  } else {
+    additionTEmbed = nil
+  }
+  vec = vec.swish()
   var context = txtIn(txtNorm(txt))
   var readers = [(PythonObject) -> Void]()
   context = context.to(.Float32)
@@ -924,6 +935,14 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: timestep_embedder_linear_2_weight)))
     timeInMlp2.bias.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: timestep_embedder_linear_2_bias)))
+    if let additionTEmbed = additionTEmbed {
+      let addition_t_embedding_weight = state_dict["time_text_embed.addition_t_embedding.weight"]
+        .to(
+          torch.float
+        ).cpu().numpy()
+      additionTEmbed.weight.copy(
+        from: Tensor<Float16>(from: try! Tensor<Float>(numpy: addition_t_embedding_weight)))
+    }
     for reader in readers {
       reader(state_dict)
     }
@@ -950,7 +969,7 @@ func QwenImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
     ).cpu().numpy()
     projOut.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: proj_out_bias)))
   }
-  return (Model([x, rot, t, txt], [out]), reader)
+  return (Model([x, rot, t] + (additionT.map { [$0] } ?? []) + [txt], [out]), reader)
 }
 
 func timeEmbedding(timesteps: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int) -> Tensor<
@@ -975,10 +994,14 @@ let x = torch.randn([1, 4096, 64]).to(torch.bfloat16).cuda()
 let txt = torch.randn([1, 18, 3584]).to(torch.bfloat16).cuda()
 let txt_mask = torch.full([1, 18], 1).to(torch.bfloat16).cuda()
 let t = torch.full([1], 1).to(torch.bfloat16).cuda()
+let is_rgb = torch.full([1], 0).to(torch.long).cuda()
 
 let output = pipe.transformer(
-  x, txt, txt_mask, t, img_shapes: [PythonObject(tupleOf: 1, 64, 64)], txt_seq_lens: [18],
-  attention_kwargs: [PythonObject: PythonObject](), return_dict: false)
+  x, txt, txt_mask, t,
+  img_shapes: [[PythonObject(tupleOf: 1, 64, 64), PythonObject(tupleOf: 1, 64, 64)]],
+  txt_seq_lens: [18],
+  attention_kwargs: [PythonObject: PythonObject](), /*additional_t_cond: is_rgb, */
+  return_dict: false)
 
 print(output)
 print(pipe.transformer)
@@ -1001,6 +1024,7 @@ graph.withNoGrad {
     Tensor<Float16>(
       from: timeEmbedding(timesteps: 1000, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)
     ).toGPU(1))
+  let rgbTensor = graph.variable(Tensor<Int32>([0], .CPU, .C(1)).toGPU(1))
   let cTensor = graph.variable(
     Tensor<Float16>(from: try! Tensor<Float>(numpy: txt.to(torch.float).cpu().numpy())).toGPU(1))
   let rotTensor = graph.variable(.CPU, .NHWC(1, 4096 + 18, 1, 128), of: Float.self)
@@ -1061,12 +1085,13 @@ graph.withNoGrad {
   }
   debugPrint(rotTensor)
   let rotTensorGPU = DynamicGraph.Tensor<Float16>(from: rotTensor).toGPU(1)
-  let (dit, reader) = QwenImage(height: 128, width: 128, textLength: 18, layers: 60)
+  let (dit, reader) = QwenImage(
+    height: 128, width: 128, textLength: 18, layers: 60, useAdditionalTCond: false)
   dit.maxConcurrency = .limit(4)
-  dit.compile(inputs: xTensor, rotTensorGPU, tTensor, cTensor)
+  dit.compile(inputs: xTensor, rotTensorGPU, tTensor, /*rgbTensor, */ cTensor)
   reader(state_dict)
-  debugPrint(dit(inputs: xTensor, rotTensorGPU, tTensor, cTensor))
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_edit_2509_bf16.ckpt") {
+  debugPrint(dit(inputs: xTensor, rotTensorGPU, tTensor, /*rgbTensor, */ cTensor))
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_edit_2511_bf16.ckpt") {
     $0.write("dit", model: dit)
   }
   exit(0)
@@ -1312,7 +1337,7 @@ func DecoderCausal3D(
   ])
   out = out.swish()
   let convOut = Convolution(
-    groups: 1, filters: 3, filterSize: [3, 3, 3],
+    groups: 1, filters: 4, filterSize: [3, 3, 3],
     hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
     name: "conv_out")
   out = convOut(out.padded(.zero, begin: [0, 0, 2, 1, 1], end: [0, 0, 0, 1, 1]))
@@ -1481,6 +1506,8 @@ func EncoderCausal3D(
   return (reader, Model([x], [out]))
 }
 
+print(pipe.vae)
+
 let z = torch.randn([1, 16, 3, 64, 64]).to(torch.bfloat16).cuda()
 let vae_out = pipe.vae.decode(z, return_dict: false)[0]
 print(pipe.vae.encode(vae_out, return_dict: false)[0].mode())
@@ -1512,7 +1539,7 @@ graph.withNoGrad {
   encoder.compile(inputs: image)
   encoderReader(vae_state_dict)
   debugPrint(encoder(inputs: image)[0].as(of: Float.self)[0..<1, 0..<16, 0..<3, 0..<64, 0..<64])
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_vae_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_layered_vae_f32.ckpt") {
     $0.write("decoder", model: decoder)
     $0.write("encoder", model: encoder)
   }
