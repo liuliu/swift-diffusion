@@ -537,6 +537,14 @@ print(ae.encoder(image))
 let vae_state_dict = ae.state_dict()
 
 graph.withNoGrad {
+  let bn_running_mean = vae_state_dict["bn.running_mean"].to(torch.float).cpu().numpy()
+  let bn_running_var = vae_state_dict["bn.running_var"].to(torch.float).cpu().numpy()
+  let bn_running_std = torch.sqrt(vae_state_dict["bn.running_var"].to(torch.float).cpu() + 1e-4)
+    .numpy()
+  print(bn_running_mean)
+  print(bn_running_var)
+  print(bn_running_std)
+  exit(0)
   var zTensor = graph.variable(try! Tensor<Float>(numpy: z.to(torch.float).cpu().numpy())).toGPU(2)
   // Already processed out.
   let (decoderReader, decoder) = Decoder(
@@ -553,10 +561,12 @@ graph.withNoGrad {
   encoderReader(vae_state_dict)
   let ae = encoder(inputs: imageTensor)[0].as(of: Float.self)
   debugPrint(ae)
+  /*
   graph.openStore("/home/liu/workspace/swift-diffusion/flux_2_vae_f32.ckpt") {
     $0.write("decoder", model: decoder)
     $0.write("encoder", model: encoder)
   }
+  */
 }
 
 exit(0)
