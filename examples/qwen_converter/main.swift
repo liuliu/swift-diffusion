@@ -18,8 +18,8 @@ torch.set_grad_enabled(false)
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 
-let pipe = diffusers.QwenImageEditPipeline.from_pretrained(
-  "/slow/Data/Qwen/Qwen-Image-Edit-2511", torch_dtype: torch.bfloat16)
+let pipe = diffusers.QwenImagePipeline.from_pretrained(
+  "/slow/Data/Qwen/Qwen-Image-2512", torch_dtype: torch.bfloat16)
 pipe.enable_model_cpu_offload()
 
 print(pipe.text_encoder.visual)
@@ -509,12 +509,12 @@ func JointTransformerBlock(
   let contextToKeys = Dense(count: k * h, name: "c_k")
   let contextToQueries = Dense(count: k * h, name: "c_q")
   let contextToValues = Dense(count: k * h, name: "c_v")
-  let downcastContextOut = ((1.0 / 8) * contextOut).to(.Float16)
+  let downcastContextOut = ((1.0 / 16) * contextOut).to(.Float16)
   var contextK = contextToKeys(downcastContextOut).reshaped([b, t, h, k])
-  let normAddedK = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "c_norm_k")
+  let normAddedK = RMSNorm(epsilon: 1e-6 / 256, axis: [3], name: "c_norm_k")
   contextK = normAddedK(contextK)
   var contextQ = contextToQueries(downcastContextOut).reshaped([b, t, h, k])
-  let normAddedQ = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "c_norm_q")
+  let normAddedQ = RMSNorm(epsilon: 1e-6 / 256, axis: [3], name: "c_norm_q")
   contextQ = normAddedQ(contextQ)
   let contextV = contextToValues(downcastContextOut).reshaped([b, t, h, k])
   let xAdaLNs = (0..<6).map { Dense(count: k * h, name: "x_ada_ln_\($0)") }
@@ -525,12 +525,12 @@ func JointTransformerBlock(
   let xToKeys = Dense(count: k * h, name: "x_k")
   let xToQueries = Dense(count: k * h, name: "x_q")
   let xToValues = Dense(count: k * h, name: "x_v")
-  let downcastXOut = ((1.0 / 8) * xOut).to(.Float16)
+  let downcastXOut = ((1.0 / 16) * xOut).to(.Float16)
   var xK = xToKeys(downcastXOut).reshaped([b, hw, h, k])
-  let normK = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "x_norm_k")
+  let normK = RMSNorm(epsilon: 1e-6 / 256, axis: [3], name: "x_norm_k")
   xK = normK(xK)
   var xQ = xToQueries(downcastXOut).reshaped([b, hw, h, k])
-  let normQ = RMSNorm(epsilon: 1e-6 / 64, axis: [3], name: "x_norm_q")
+  let normQ = RMSNorm(epsilon: 1e-6 / 256, axis: [3], name: "x_norm_q")
   xQ = normQ(xQ)
   let xV = xToValues(downcastXOut).reshaped([b, hw, h, k])
   var keys = Functional.concat(axis: 1, contextK, xK)
@@ -569,7 +569,7 @@ func JointTransformerBlock(
   xOut = out.reshaped([b, hw, h * k], offset: [0, t, 0], strides: [(t + hw) * h * k, h * k, 1])
     .contiguous()
   let xUnifyheads = Dense(count: k * h, name: "x_o")
-  xOut = (8 * scaleFactor.0) * xUnifyheads((1.0 / scaleFactor.0) * xOut).to(of: x)
+  xOut = (16 * scaleFactor.0) * xUnifyheads((1.0 / scaleFactor.0) * xOut).to(of: x)
   if !contextBlockPreOnly {
     contextOut = context + (contextChunks[2]).to(of: context) .* contextOut
   }
@@ -608,7 +608,7 @@ func JointTransformerBlock(
       torch.float
     ).cpu().numpy()
     let txt_attn_q_bias =
-      ((1.0 / 8).pythonObject
+      ((1.0 / 16).pythonObject
       * state_dict["\(prefix).attn.add_q_proj.bias"].to(
         torch.float
       ).cpu()).numpy()
@@ -621,7 +621,7 @@ func JointTransformerBlock(
         torch.float
       ).cpu().numpy()
     let txt_attn_k_bias =
-      ((1.0 / 8).pythonObject
+      ((1.0 / 16).pythonObject
       * state_dict["\(prefix).attn.add_k_proj.bias"].to(
         torch.float
       ).cpu()).numpy()
@@ -633,7 +633,7 @@ func JointTransformerBlock(
       torch.float
     ).cpu().numpy()
     let txt_attn_v_bias =
-      ((1.0 / 8).pythonObject
+      ((1.0 / 16).pythonObject
       * state_dict["\(prefix).attn.add_v_proj.bias"].to(
         torch.float
       ).cpu()).numpy()
@@ -655,7 +655,7 @@ func JointTransformerBlock(
       torch.float
     ).cpu().numpy()
     let img_attn_q_bias =
-      ((1.0 / 8).pythonObject
+      ((1.0 / 16).pythonObject
       * state_dict["\(prefix).attn.to_q.bias"].to(
         torch.float
       ).cpu()).numpy()
@@ -668,7 +668,7 @@ func JointTransformerBlock(
         torch.float
       ).cpu().numpy()
     let img_attn_k_bias =
-      ((1.0 / 8).pythonObject
+      ((1.0 / 16).pythonObject
       * state_dict["\(prefix).attn.to_k.bias"].to(
         torch.float
       ).cpu()).numpy()
@@ -680,7 +680,7 @@ func JointTransformerBlock(
       torch.float
     ).cpu().numpy()
     let img_attn_v_bias =
-      ((1.0 / 8).pythonObject
+      ((1.0 / 16).pythonObject
       * state_dict["\(prefix).attn.to_v.bias"].to(
         torch.float
       ).cpu()).numpy()
@@ -706,7 +706,7 @@ func JointTransformerBlock(
       contextUnifyheads.weight.copy(
         from: Tensor<Float16>(from: try! Tensor<Float>(numpy: attn_to_add_out_weight)))
       let attn_to_add_out_bias =
-        ((1.0 / (8 * scaleFactor.0)).pythonObject
+        ((1.0 / (16 * scaleFactor.0)).pythonObject
         * state_dict["\(prefix).attn.to_add_out.bias"]
         .to(
           torch.float
@@ -720,7 +720,7 @@ func JointTransformerBlock(
     xUnifyheads.weight.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: attn_to_out_0_weight)))
     let attn_to_out_0_bias =
-      ((1.0 / (8 * scaleFactor.0)).pythonObject
+      ((1.0 / (16 * scaleFactor.0)).pythonObject
       * state_dict["\(prefix).attn.to_out.0.bias"].to(
         torch.float
       ).cpu()).numpy()
@@ -734,9 +734,11 @@ func JointTransformerBlock(
       ).cpu().numpy()
       contextLinear1.weight.copy(
         from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_context_linear_1_weight)))
-      let ff_context_linear_1_bias = state_dict["\(prefix).txt_mlp.net.0.proj.bias"].to(
-        torch.float
-      ).cpu().numpy()
+      let ff_context_linear_1_bias =
+        ((1.0 / 2).pythonObject
+        * state_dict["\(prefix).txt_mlp.net.0.proj.bias"].to(
+          torch.float
+        ).cpu()).numpy()
       contextLinear1.bias.copy(
         from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_context_linear_1_bias)))
       let ff_context_out_projection_weight =
@@ -762,9 +764,11 @@ func JointTransformerBlock(
     ).cpu().numpy()
     xLinear1.weight.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_linear_1_weight)))
-    let ff_linear_1_bias = state_dict["\(prefix).img_mlp.net.0.proj.bias"].to(
-      torch.float
-    ).cpu().numpy()
+    let ff_linear_1_bias =
+      ((1.0 / 2).pythonObject
+      * state_dict["\(prefix).img_mlp.net.0.proj.bias"].to(
+        torch.float
+      ).cpu()).numpy()
     xLinear1.bias.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_linear_1_bias)))
     let ff_out_projection_weight =
@@ -1097,10 +1101,10 @@ graph.withNoGrad {
   let (dit, reader) = QwenImage(
     height: 128, width: 128, textLength: 18, layers: 60, useAdditionalTCond: false)
   dit.maxConcurrency = .limit(4)
-  dit.compile(inputs: xTensor, rotTensorGPU, tTensor, /*rgbTensor, */ cTensor)
+  dit.compile(inputs: xTensor, rotTensorGPU, tTensor, /* rgbTensor,*/ cTensor)
   reader(state_dict)
-  debugPrint(dit(inputs: xTensor, rotTensorGPU, tTensor, /*rgbTensor, */ cTensor))
-  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_edit_2511_f16.ckpt") {
+  debugPrint(dit(inputs: xTensor, rotTensorGPU, tTensor, /* rgbTensor,*/ cTensor))
+  graph.openStore("/home/liu/workspace/swift-diffusion/qwen_image_2512_f16.ckpt") {
     $0.write("dit", model: dit)
   }
   exit(0)

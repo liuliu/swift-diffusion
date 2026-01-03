@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/qwen_image_edit_2511_f16.ckpt", flags: [.readOnly]
+  "/home/liu/workspace/swift-diffusion/qwen_image_layered_1.0_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/qwen_image_edit_2511_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/qwen_image_layered_1.0_q6p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -97,9 +97,9 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
         } else {
-          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
         }
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
