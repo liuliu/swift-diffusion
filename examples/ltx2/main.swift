@@ -259,32 +259,33 @@ func LTX2TransformerBlock(
   let rotCX = Input()
   let timesteps = (0..<6).map { _ in Input() }
   let attn1Modulations = (0..<6).map {
-    Parameter<Float16>(.GPU(2), .HWC(1, 1, k * h), name: "attn1_ada_ln_\($0)")
+    Parameter<Float>(.GPU(2), .HWC(1, 1, k * h), name: "attn1_ada_ln_\($0)")
   }
   let norm = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   var out =
     norm(vx) .* (1 + (attn1Modulations[1] + timesteps[1])) + (attn1Modulations[0] + timesteps[0])
   let (attn1Reader, attn1) = LTX2SelfAttention(
     prefix: "\(prefix).attn1", k: k, h: h, b: b, t: hw, name: "x")
-  out = vx + attn1(out, rot) .* (attn1Modulations[2] + timesteps[2])
+  out = vx + attn1(out.to(.Float16), rot).to(of: vx) .* (attn1Modulations[2] + timesteps[2])
   let (attn2Reader, attn2) = LTX2CrossAttention(
     prefix: "\(prefix).attn2", k: (k, k, k), h: h, b: b, t: (hw, t), name: "cv")
-  let normOut = norm(out)
-  out = out + attn2(normOut, rot, cv, rotC)
+  let normOut = norm(out).to(.Float16)
+  out = out + attn2(normOut, rot, cv, rotC).to(of: out)
   let audioTimesteps = (0..<6).map { _ in Input() }
   let audioAttn1Modulations = (0..<6).map {
-    Parameter<Float16>(.GPU(2), .HWC(1, 1, k / 2 * h), name: "audio_attn1_ada_ln_\($0)")
+    Parameter<Float>(.GPU(2), .HWC(1, 1, k / 2 * h), name: "audio_attn1_ada_ln_\($0)")
   }
   let (audioAttn1Reader, audioAttn1) = LTX2SelfAttention(
     prefix: "\(prefix).audio_attn1", k: k / 2, h: h, b: b, t: a, name: "a")
   var aOut =
     norm(ax) .* (1 + (audioAttn1Modulations[1] + audioTimesteps[1]))
     + (audioAttn1Modulations[0] + audioTimesteps[0])
-  aOut = ax + audioAttn1(aOut, rotA) .* (audioAttn1Modulations[2] + audioTimesteps[2])
+  aOut = ax + audioAttn1(aOut.to(.Float16), rotA).to(of: ax)
+    .* (audioAttn1Modulations[2] + audioTimesteps[2])
   let (audioAttn2Reader, audioAttn2) = LTX2CrossAttention(
     prefix: "\(prefix).audio_attn2", k: (k / 2, k / 2, k / 2), h: h, b: b, t: (a, t), name: "ca")
-  let normAOut = norm(aOut)
-  aOut = aOut + audioAttn2(normAOut, rotA, ca, rotAC)
+  let normAOut = norm(aOut).to(.Float16)
+  aOut = aOut + audioAttn2(normAOut, rotA, ca, rotAC).to(of: aOut)
   let vxNorm3 = norm(out)
   let axNorm3 = norm(aOut)
   let (audioToVideoAttnReader, audioToVideoAttn) = LTX2CrossAttention(
@@ -294,13 +295,13 @@ func LTX2TransformerBlock(
   let caGateTimesteps = Input()
   let audioToVideoAttnModulations = (0..<5).map {
     if $0 < 2 {
-      return Parameter<Float16>(
+      return Parameter<Float>(
         .GPU(2), .HWC(1, 1, k * h), name: "audio_to_video_attn_ada_ln_\($0)")
     } else if $0 < 4 {
-      return Parameter<Float16>(
+      return Parameter<Float>(
         .GPU(2), .HWC(1, 1, k / 2 * h), name: "audio_to_video_attn_ada_ln_\($0)")
     } else {
-      return Parameter<Float16>(
+      return Parameter<Float>(
         .GPU(2), .HWC(1, 1, k * h), name: "audio_to_video_attn_ada_ln_\($0)")
     }
   }
@@ -310,7 +311,8 @@ func LTX2TransformerBlock(
   let axScaled =
     axNorm3 .* (1 + (audioToVideoAttnModulations[3] + caScaleShiftTimesteps[3]))
     + (audioToVideoAttnModulations[2] + caScaleShiftTimesteps[2])
-  out = out + audioToVideoAttn(vxScaled, rotCX, axScaled, rotA)
+  out =
+    out + audioToVideoAttn(vxScaled.to(.Float16), rotCX, axScaled.to(.Float16), rotA).to(of: out)
     .* (audioToVideoAttnModulations[4] + caGateTimesteps)
   let (videoToAudioAttnReader, videoToAudioAttn) = LTX2CrossAttention(
     prefix: "\(prefix).video_to_audio_attn", k: (k / 2, k / 2, k), h: h, b: b, t: (a, hw),
@@ -319,11 +321,11 @@ func LTX2TransformerBlock(
   let audioCaGateTimesteps = Input()
   let videoToAudioAttnModulations = (0..<5).map {
     if $0 < 2 {
-      return Parameter<Float16>(
-        .GPU(2), .HWC(1, 1, k * h), name: "audio_to_video_attn_ada_ln_\($0)")
+      return Parameter<Float>(
+        .GPU(2), .HWC(1, 1, k * h), name: "video_to_audio_attn_ada_ln_\($0)")
     } else {
-      return Parameter<Float16>(
-        .GPU(2), .HWC(1, 1, k / 2 * h), name: "audio_to_video_attn_ada_ln_\($0)")
+      return Parameter<Float>(
+        .GPU(2), .HWC(1, 1, k / 2 * h), name: "video_to_audio_attn_ada_ln_\($0)")
     }
   }
   let audioVxScaled =
@@ -332,25 +334,29 @@ func LTX2TransformerBlock(
   let audioAxScaled =
     axNorm3 .* (1 + (videoToAudioAttnModulations[3] + audioCaScaleShiftTimesteps[3]))
     + (videoToAudioAttnModulations[2] + audioCaScaleShiftTimesteps[2])
-  aOut = aOut + videoToAudioAttn(audioAxScaled, rotA, audioVxScaled, rotCX)
+  aOut =
+    aOut
+    + videoToAudioAttn(audioAxScaled.to(.Float16), rotA, audioVxScaled.to(.Float16), rotCX).to(
+      of: aOut)
     .* (videoToAudioAttnModulations[4] + audioCaGateTimesteps)
   // Now attention done, do MLP.
   let (xLinear1, xOutProjection, xFF) = FeedForward(
     hiddenSize: 4096, intermediateSize: 4096 * 4, name: "x")
   let lastVxScaled =
     norm(out) .* (1 + (attn1Modulations[4] + timesteps[4])) + (attn1Modulations[3] + timesteps[3])
-  out = out + xFF(lastVxScaled) .* (attn1Modulations[5] + timesteps[5])
+  out = out + xFF(lastVxScaled.to(.Float16)).to(of: out) .* (attn1Modulations[5] + timesteps[5])
   let lastAxScaled =
     norm(aOut) .* (1 + (audioAttn1Modulations[4] + audioTimesteps[4]))
     + (audioAttn1Modulations[3] + audioTimesteps[3])
   let (audioLinear1, audioOutProjection, audioFF) = FeedForward(
     hiddenSize: 2048, intermediateSize: 2048 * 4, name: "a")
-  aOut = aOut + audioFF(lastAxScaled) .* (audioAttn1Modulations[5] + audioTimesteps[5])
+  aOut = aOut + audioFF(lastAxScaled.to(.Float16)).to(of: aOut)
+    .* (audioAttn1Modulations[5] + audioTimesteps[5])
   let reader: (PythonObject) -> Void = { state_dict in
     let scale_shift_table = state_dict["\(prefix).scale_shift_table"].to(torch.float).cpu().numpy()
     for i in 0..<6 {
       attn1Modulations[i].weight.copy(
-        from: Tensor<Float16>(
+        from: Tensor<Float>(
           from: try! Tensor<Float>(
             numpy: scale_shift_table[i..<(i + 1), ...])))
     }
@@ -360,7 +366,7 @@ func LTX2TransformerBlock(
       .cpu().numpy()
     for i in 0..<6 {
       audioAttn1Modulations[i].weight.copy(
-        from: Tensor<Float16>(
+        from: Tensor<Float>(
           from: try! Tensor<Float>(
             numpy: audio_scale_shift_table[i..<(i + 1), ...])))
     }
@@ -374,44 +380,44 @@ func LTX2TransformerBlock(
     ).cpu().numpy()
     // shift
     audioToVideoAttnModulations[0].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_video[1..<2, ...])))
     // scale
     audioToVideoAttnModulations[1].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_video[0..<1, ...])))
     // shift
     audioToVideoAttnModulations[2].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_audio[1..<2, ...])))
     // scale
     audioToVideoAttnModulations[3].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_audio[0..<1, ...])))
     // gate
     audioToVideoAttnModulations[4].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_video[4..<5, ...])))
     audioToVideoAttnReader(state_dict)
     // shift
     videoToAudioAttnModulations[0].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_video[3..<4, ...])))
     // scale
     videoToAudioAttnModulations[1].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_video[2..<3, ...])))
     // shift
     videoToAudioAttnModulations[2].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_audio[3..<4, ...])))
     // scale
     videoToAudioAttnModulations[3].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_audio[2..<3, ...])))
     // gate
     videoToAudioAttnModulations[4].weight.copy(
-      from: Tensor<Float16>(
+      from: Tensor<Float>(
         from: try! Tensor<Float>(numpy: scale_shift_table_a2v_ca_audio[4..<5, ...])))
     videoToAudioAttnReader(state_dict)
     let ff_net_0_proj_weight = state_dict["\(prefix).ff.net.0.proj.weight"].to(
@@ -468,14 +474,22 @@ func LTX2TransformerBlock(
   return (reader, Model(inputs, [out, aOut]))
 }
 
-func LTX2AdaLNSingle(prefix: String, channels: Int, count: Int, name: String) -> (
-  (PythonObject) -> Void, Model
+func LTX2AdaLNSingle(
+  prefix: String, channels: Int, count: Int, outputEmbedding: Bool, name: String, t: Input
+) -> (
+  (PythonObject) -> Void, Model.IO?, [Model.IO]
 ) {
-  let t = Input()
   let (tMlp0, tMlp2, tEmbedder) = MLPEmbedder(channels: channels, name: name)
-  let adaLNSingles = (0..<count).map { _ in Dense(count: channels, name: "\(name)_adaln_single") }
-  let tOut = tEmbedder(t).reshaped([1, 1, channels]).swish()
-  let chunks = adaLNSingles.map { $0(tOut) }
+  let adaLNSingles = (0..<count).map { Dense(count: channels, name: "\(name)_adaln_single_\($0)") }
+  var tOut = tEmbedder(t).reshaped([1, 1, channels])
+  let tEmb: Model.IO?
+  if outputEmbedding {
+    tEmb = tOut.to(.Float32)
+  } else {
+    tEmb = nil
+  }
+  tOut = tOut.swish()
+  let chunks = adaLNSingles.map { $0(tOut).to(.Float32) }
   let reader: (PythonObject) -> Void = { state_dict in
     let adaln_single_emb_timestep_embedder_linear_1_weight = state_dict[
       "\(prefix).emb.timestep_embedder.linear_1.weight"
@@ -530,7 +544,7 @@ func LTX2AdaLNSingle(prefix: String, channels: Int, count: Int, name: String) ->
             numpy: adaln_single_linear_bias[(channels * i)..<(channels * (i + 1))])))
     }
   }
-  return (reader, Model([t], chunks))
+  return (reader, tEmb, chunks)
 }
 
 func LTX2(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
@@ -542,48 +556,69 @@ func LTX2(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   let rotCX = Input()
   let xEmbedder = Dense(count: 4096, name: "x_embedder")
   let (contextMlp0, contextMlp2, contextEmbedder) = GELUMLPEmbedder(channels: 4096, name: "context")
-  var out = xEmbedder(x)
+  var out = xEmbedder(x).to(.Float32)
   let txt = Input()
-  var txtOut = contextEmbedder(txt)
+  let txtOut = contextEmbedder(txt)
   let a = Input()
   let aEmbedder = Dense(count: 2048, name: "a_embedder")
   let (aContextMlp0, aContextMlp2, aContextEmbedder) = GELUMLPEmbedder(
     channels: 2048, name: "a_context")
-  var aOut = aEmbedder(a)
+  var aOut = aEmbedder(a).to(.Float32)
   let aTxt = Input()
-  var aTxtOut = aContextEmbedder(aTxt)
+  let aTxtOut = aContextEmbedder(aTxt)
   let t = Input()
-  let (txReader, txAdaLnSingle) = LTX2AdaLNSingle(
-    prefix: "adaln_single", channels: 4096, count: 6, name: "tx")
-  let txEmbChunks = txAdaLnSingle(t)
-  let (taReader, taAdaLnSingle) = LTX2AdaLNSingle(
-    prefix: "audio_adaln_single", channels: 2048, count: 6, name: "ta")
-  let taEmbChunks = taAdaLnSingle(t)
-  let (caReader, caAdaLnSingle) = LTX2AdaLNSingle(
-    prefix: "av_ca_video_scale_shift_adaln_single", channels: 4096, count: 4, name: "tcx")
-  let tcxEmbChunks = caAdaLnSingle(t)
-  let (audioCaReader, audioCaAdaLnSingle) = LTX2AdaLNSingle(
-    prefix: "av_ca_audio_scale_shift_adaln_single", channels: 2048, count: 4, name: "tca")
-  let tcaEmbChunks = audioCaAdaLnSingle(t)
-  let (gateReader, gateAdaLnSingle) = LTX2AdaLNSingle(
-    prefix: "av_ca_a2v_gate_adaln_single", channels: 4096, count: 1, name: "a2v")
-  let a2vEmbChunks = gateAdaLnSingle(t)
-  let (audioGateReader, audioGateAdaLnSingle) = LTX2AdaLNSingle(
-    prefix: "av_ca_v2a_gate_adaln_single", channels: 2048, count: 1, name: "v2a")
-  let v2aEmbChunks = audioGateAdaLnSingle(t)
+  let (txReader, txEmb, txEmbChunks) = LTX2AdaLNSingle(
+    prefix: "adaln_single", channels: 4096, count: 6, outputEmbedding: true, name: "tx", t: t)
+  let (taReader, taEmb, taEmbChunks) = LTX2AdaLNSingle(
+    prefix: "audio_adaln_single", channels: 2048, count: 6, outputEmbedding: true, name: "ta", t: t)
+  let (caReader, _, tcxEmbChunks) = LTX2AdaLNSingle(
+    prefix: "av_ca_video_scale_shift_adaln_single", channels: 4096, count: 4,
+    outputEmbedding: false, name: "tcx", t: t)
+  let (audioCaReader, _, tcaEmbChunks) = LTX2AdaLNSingle(
+    prefix: "av_ca_audio_scale_shift_adaln_single", channels: 2048, count: 4,
+    outputEmbedding: false, name: "tca", t: t)
+  let (gateReader, _, a2vEmbChunks) = LTX2AdaLNSingle(
+    prefix: "av_ca_a2v_gate_adaln_single", channels: 4096, count: 1, outputEmbedding: false,
+    name: "a2v", t: t)
+  let (audioGateReader, _, v2aEmbChunks) = LTX2AdaLNSingle(
+    prefix: "av_ca_v2a_gate_adaln_single", channels: 2048, count: 1, outputEmbedding: false,
+    name: "v2a", t: t)
   var readers = [(PythonObject) -> Void]()
   for i in 0..<48 {
     let (reader, block) = LTX2TransformerBlock(
       prefix: "transformer_blocks.\(i)", k: 128, h: 32, b: 1, t: 1024, hw: 6144, a: 121,
       intermediateSize: 0)
     let blockOut = block(
-      out, rot, txtOut, rotC, aOut, rotA, aTxtOut, rotAC, rotCX, txEmbChunks, taEmbChunks,
-      tcxEmbChunks[1], tcxEmbChunks[0], tcaEmbChunks[1], tcaEmbChunks[0], a2vEmbChunks,
-      tcxEmbChunks[3], tcxEmbChunks[2], tcaEmbChunks[3], tcaEmbChunks[2], v2aEmbChunks)
+      out, rot, txtOut, rotC, aOut, rotA, aTxtOut, rotAC, rotCX,
+      txEmbChunks[0], txEmbChunks[1], txEmbChunks[2], txEmbChunks[3], txEmbChunks[4],
+      txEmbChunks[5],
+      taEmbChunks[0], taEmbChunks[1], taEmbChunks[2], taEmbChunks[3], taEmbChunks[4],
+      taEmbChunks[5],
+      tcxEmbChunks[1], tcxEmbChunks[0], tcaEmbChunks[1], tcaEmbChunks[0], a2vEmbChunks[0],
+      tcxEmbChunks[3], tcxEmbChunks[2], tcaEmbChunks[3], tcaEmbChunks[2], v2aEmbChunks[0])
     readers.append(reader)
     out = blockOut[0]
     aOut = blockOut[1]
   }
+  let scaleShiftModulations = (0..<2).map {
+    Parameter<Float>(.GPU(2), .HWC(1, 1, 4096), name: "norm_out_ada_ln_\($0)")
+  }
+  let normOut = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  if let txEmb = txEmb {
+    out = normOut(out) .* (1 + (scaleShiftModulations[1] + txEmb))
+      + (scaleShiftModulations[0] + txEmb)
+  }
+  let projOut = Dense(count: 128, name: "proj_out")
+  out = projOut(out.to(.Float16))
+  let audioScaleShiftModulations = (0..<2).map {
+    Parameter<Float>(.GPU(2), .HWC(1, 1, 2048), name: "audio_norm_out_ada_ln_\($0)")
+  }
+  if let taEmb = taEmb {
+    aOut = normOut(aOut) .* (1 + (audioScaleShiftModulations[1] + taEmb))
+      + (audioScaleShiftModulations[0] + taEmb)
+  }
+  let audioProjOut = Dense(count: 128, name: "audio_proj_out")
+  aOut = audioProjOut(aOut.to(.Float16))
   let reader: (PythonObject) -> Void = { state_dict in
     let patchify_proj_weight = state_dict["patchify_proj.weight"].to(
       torch.float
@@ -668,6 +703,31 @@ func LTX2(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
     for reader in readers {
       reader(state_dict)
     }
+    let scale_shift_table = state_dict["scale_shift_table"].to(torch.float).cpu().numpy()
+    for i in 0..<2 {
+      scaleShiftModulations[i].weight.copy(
+        from: Tensor<Float>(
+          from: try! Tensor<Float>(
+            numpy: scale_shift_table[i..<(i + 1), ...])))
+    }
+    let audio_scale_shift_table = state_dict["audio_scale_shift_table"].to(torch.float).cpu()
+      .numpy()
+    for i in 0..<2 {
+      audioScaleShiftModulations[i].weight.copy(
+        from: Tensor<Float>(
+          from: try! Tensor<Float>(
+            numpy: audio_scale_shift_table[i..<(i + 1), ...])))
+    }
+    let proj_out_weight = state_dict["proj_out.weight"].to(torch.float).cpu().numpy()
+    projOut.weight.copy(from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: proj_out_weight)))
+    let proj_out_bias = state_dict["proj_out.bias"].to(torch.float).cpu().numpy()
+    projOut.bias.copy(from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: proj_out_bias)))
+    let audio_proj_out_weight = state_dict["audio_proj_out.weight"].to(torch.float).cpu().numpy()
+    audioProjOut.weight.copy(
+      from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: audio_proj_out_weight)))
+    let audio_proj_out_bias = state_dict["audio_proj_out.bias"].to(torch.float).cpu().numpy()
+    audioProjOut.bias.copy(
+      from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: audio_proj_out_bias)))
   }
   return (reader, Model([x, txt, a, aTxt, t, rot, rotC, rotA, rotAC, rotCX], [out, aOut]))
 }
@@ -777,4 +837,7 @@ graph.withNoGrad {
     dit(
       inputs: xTensor, txtTensor, aTensor, aTxtTensor, timestepTensor, rot1TensorGPU, rot2TensorGPU,
       rot3TensorGPU, rot4TensorGPU, rot5TensorGPU))
+  graph.openStore("/home/liu/workspace/swift-diffusion/ltx_2_19b_dev_f16.ckpt") {
+    $0.write("dit", model: dit)
+  }
 }
