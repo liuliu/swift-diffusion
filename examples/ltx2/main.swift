@@ -4,8 +4,13 @@ import NNC
 import NNCPythonConversion
 import PNG
 import PythonKit
+import SentencePiece
 
 typealias FloatType = Float16
+
+let graph = DynamicGraph()
+
+graph.maxConcurrency = .limit(1)
 
 let torch = Python.import("torch")
 let PIL = Python.import("PIL")
@@ -26,11 +31,251 @@ let ltx_core_loader_single_gpu_model_builder = Python.import(
   "ltx_core.loader.single_gpu_model_builder")
 let ltx_core_model_transformer_model_configurator = Python.import(
   "ltx_core.model.transformer.model_configurator")
+let ltx_core_model_clip_gemma_encoders_av_encoder = Python.import(
+  "ltx_core.model.clip.gemma.encoders.av_encoder")
 let ltx_core_model_transformer_modality = Python.import("ltx_core.model.transformer.modality")
 let ltx_core_loader_sd_keys_ops = Python.import("ltx_core.loader.sd_keys_ops")
 let ltx_core_pipeline_components_patchifiers = Python.import(
   "ltx_core.pipeline.components.patchifiers")
 let ltx_core_pipeline_conditioning = Python.import("ltx_core.pipeline.conditioning")
+
+let prompt = "a dance party"
+// Text Encoder
+let text_encoder = ltx_core_loader_single_gpu_model_builder.SingleGPUModelBuilder(
+  model_path: "/fast/Data/ltx-2-19b-dev.safetensors",
+  model_class_configurator: ltx_core_model_clip_gemma_encoders_av_encoder
+    .AVGemmaTextEncoderModelConfigurator.with_gemma_root_path(
+      "/slow/Data/google/gemma-3-12b-it-qat-q4_0-unquantized"),
+  model_sd_key_ops: ltx_core_model_clip_gemma_encoders_av_encoder.AV_GEMMA_TEXT_ENCODER_KEY_OPS
+).build(device: "cuda")
+text_encoder.to(torch_device)
+let token_pairs = text_encoder.tokenizer.tokenize_with_weights(prompt)["gemma"]
+let inputIdsAndMask = text_encoder._process_token_pairs(token_pairs)
+let inputIds = inputIdsAndMask[0]
+let attentionMask = inputIdsAndMask[1]
+text_encoder.model(input_ids: inputIds, attention_mask: attentionMask, output_hidden_states: true)
+print(text_encoder.model)
+
+let text_state_dict = text_encoder.model.language_model.state_dict()
+
+let sentencePiece = SentencePiece(
+  file: "/home/liu/workspace/swift-diffusion/examples/ltx2/tokenizer.model")
+var positiveTokens = sentencePiece.encode(prompt).map { return $0.id }
+positiveTokens.insert(2, at: 0)
+
+func SelfAttention(prefix: String, width: Int, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
+  Model, (PythonObject) -> Void
+) {
+  let x = Input()
+  let rot = Input()
+  let tokeys = Dense(count: k * hk, noBias: true, name: "k_proj")
+  let toqueries = Dense(count: k * h, noBias: true, name: "q_proj")
+  let tovalues = Dense(count: k * hk, noBias: true, name: "v_proj")
+  var keys = tokeys(x).reshaped([b, t, hk, k])
+  var queries = toqueries(x).reshaped([b, t, h, k])
+  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_k")
+  keys = normK(keys)
+  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_q")
+  queries = normQ(queries)
+  let values = tovalues(x).reshaped([b, t, hk, k])
+  queries = Functional.cmul(left: queries, right: rot)
+  keys = Functional.cmul(left: keys, right: rot)
+  var out = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot(), isCausal: true)(
+    queries, keys, values
+  ).reshaped([b * t, h * k])
+  let unifyheads = Dense(count: width, noBias: true, name: "out_proj")
+  out = unifyheads(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    // The rotary in Qwen is first half and second half, we can be clever and do the extra transpose here to use with cmul.
+    let q_weight = state_dict["\(prefix).self_attn.q_proj.weight"].type(torch.float).view(
+      16, 2, 128, 3_840
+    ).transpose(1, 2).cpu().numpy()
+    toqueries.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: q_weight)))
+    let q_norm_weight =
+      (state_dict["\(prefix).self_attn.q_norm.weight"].type(torch.float).view(
+        2, 128
+      ).transpose(0, 1).cpu() + 1).numpy()
+    normQ.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: q_norm_weight)))
+    let k_weight = state_dict["\(prefix).self_attn.k_proj.weight"].type(torch.float).view(
+      8, 2, 128, 3_840
+    ).transpose(1, 2).cpu().numpy()
+    tokeys.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: k_weight)))
+    let k_norm_weight =
+      (state_dict["\(prefix).self_attn.k_norm.weight"].type(torch.float).view(
+        2, 128
+      ).transpose(0, 1).cpu() + 1).numpy()
+    normK.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: k_norm_weight)))
+    let v_weight = state_dict["\(prefix).self_attn.v_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    tovalues.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: v_weight)))
+    let proj_weight = state_dict["\(prefix).self_attn.o_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    unifyheads.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: proj_weight)))
+  }
+  return (Model([x, rot], [out]), reader)
+}
+
+func FeedForward(hiddenSize: Int, intermediateSize: Int, name: String = "") -> (
+  Model, Model, Model, Model
+) {
+  let x = Input()
+  let w1 = Dense(count: intermediateSize, noBias: true, name: "\(name)_gate_proj")
+  let w3 = Dense(count: intermediateSize, noBias: true, name: "\(name)_up_proj")
+  var out = w3(x) .* w1(x).GELU(approximate: .tanh)
+  let w2 = Dense(count: hiddenSize, noBias: true, name: "\(name)_down_proj")
+  out = w2(out)
+  return (w1, w2, w3, Model([x], [out]))
+}
+
+func TransformerBlock(prefix: String, width: Int, k: Int, h: Int, hk: Int, b: Int, t: Int, MLP: Int)
+  -> (
+    Model, (PythonObject) -> Void
+  )
+{
+  let x = Input()
+  let rot = Input()
+  let norm1 = RMSNorm(epsilon: 1e-6, axis: [1], name: "input_layernorm")
+  var out = norm1(x).to(.Float16)
+  let (attention, attnReader) = SelfAttention(
+    prefix: prefix, width: width, k: k, h: h, hk: hk, b: b, t: t)
+  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "post_attention_layernorm")
+  out = norm2(attention(out, rot).to(of: x)) + x
+  let residual = out
+  let norm3 = RMSNorm(epsilon: 1e-6, axis: [1], name: "pre_feedforward_layernorm")
+  out = norm3(out).to(.Float16)
+  let (w1, w2, w3, ffn) = FeedForward(hiddenSize: width, intermediateSize: MLP, name: "mlp")
+  let norm4 = RMSNorm(epsilon: 1e-6, axis: [1], name: "post_feedforward_layernorm")
+  out = residual + norm4(ffn(out).to(of: residual))
+  let reader: (PythonObject) -> Void = { state_dict in
+    let norm1_weight =
+      (state_dict["\(prefix).input_layernorm.weight"].type(torch.float)
+      .cpu() + 1).numpy()
+    norm1.weight.copy(from: Tensor<Float>(from: try! Tensor<Float>(numpy: norm1_weight)))
+    let norm2_weight =
+      (state_dict["\(prefix).post_attention_layernorm.weight"].type(torch.float)
+      .cpu() + 1).numpy()
+    norm2.weight.copy(from: Tensor<Float>(from: try! Tensor<Float>(numpy: norm2_weight)))
+    attnReader(state_dict)
+    let norm3_weight =
+      (state_dict["\(prefix).pre_feedforward_layernorm.weight"].type(torch.float)
+      .cpu() + 1).numpy()
+    norm3.weight.copy(from: Tensor<Float>(from: try! Tensor<Float>(numpy: norm3_weight)))
+    let norm4_weight =
+      (state_dict["\(prefix).post_feedforward_layernorm.weight"].type(torch.float)
+      .cpu() + 1).numpy()
+    norm4.weight.copy(from: Tensor<Float>(from: try! Tensor<Float>(numpy: norm4_weight)))
+    let w1_weight = state_dict["\(prefix).mlp.gate_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    w1.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: w1_weight)))
+    let w2_weight = state_dict["\(prefix).mlp.down_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    w2.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: w2_weight)))
+    let w3_weight = state_dict["\(prefix).mlp.up_proj.weight"].type(torch.float).cpu()
+      .numpy()
+    w3.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: w3_weight)))
+  }
+  return (Model([x, rot], [out]), reader)
+}
+
+func TextEmbedding<T: TensorNumeric>(
+  _ dataType: T.Type, batchSize: Int, vocabularySize: Int, maxLength: Int, embeddingSize: Int
+) -> (Model, (PythonObject) -> Void) {
+  let tokens = Input()
+  let tokenEmbed = Embedding(
+    T.self, vocabularySize: vocabularySize, embeddingSize: embeddingSize, name: "tok_embeddings")
+  let embedding = tokenEmbed(tokens)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let vocab = state_dict["embed_tokens.weight"].type(torch.float).cpu().numpy()
+    tokenEmbed.parameters.copy(from: Tensor<BFloat16>(from: try! Tensor<Float>(numpy: vocab)))
+  }
+  return (Model([tokens], [embedding]), reader)
+}
+
+func Transformer<T: TensorNumeric>(
+  _ dataType: T.Type, vocabularySize: Int, maxLength: Int, width: Int, tokenLength: Int,
+  layers: Int, MLP: Int, heads: Int, outputHiddenStates: Int?, batchSize: Int
+) -> (Model, (PythonObject) -> Void) {
+  let tokens = Input()
+  let rotLocal = Input()
+  let rot = Input()
+  let (embedding, embedReader) = TextEmbedding(
+    BFloat16.self, batchSize: batchSize, vocabularySize: vocabularySize, maxLength: maxLength,
+    embeddingSize: width)
+  var out = 62 * embedding(tokens).to(.Float32)
+  var readers = [(PythonObject) -> Void]()
+  var hiddenStates: Model.IO? = nil
+  for i in 0..<layers {
+    let (layer, reader) = TransformerBlock(
+      prefix: "layers.\(i)", width: width, k: 256, h: heads, hk: 8, b: batchSize,
+      t: tokenLength, MLP: MLP)
+    out = layer(out, (i + 1) % 6 == 0 ? rot : rotLocal)
+    readers.append(reader)
+    if let outputHiddenStates = outputHiddenStates, outputHiddenStates == i {
+      hiddenStates = out
+    }
+  }
+  let norm = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm")
+  out = norm(out).to(.Float16)
+  let reader: (PythonObject) -> Void = { state_dict in
+    embedReader(state_dict)
+    for reader in readers {
+      reader(state_dict)
+    }
+    let norm_weight = (state_dict["norm.weight"].type(torch.float).cpu() + 1).numpy()
+    norm.weight.copy(from: Tensor<Float>(from: try! Tensor<Float>(numpy: norm_weight)))
+  }
+  return (Model([tokens, rotLocal, rot], (hiddenStates.map { [$0] } ?? []) + [out]), reader)
+}
+
+let _ = graph.withNoGrad {
+  let positiveRotTensor = graph.variable(
+    .CPU, .NHWC(1, positiveTokens.count, 1, 256), of: Float.self)
+  for i in 0..<positiveTokens.count {
+    for k in 0..<128 {
+      let theta = Double(i) * 0.125 / pow(1_000_000, Double(k) * 2 / 256)
+      let sintheta = sin(theta)
+      let costheta = cos(theta)
+      positiveRotTensor[0, i, 0, k * 2] = Float(costheta)
+      positiveRotTensor[0, i, 0, k * 2 + 1] = Float(sintheta)
+    }
+  }
+  let positiveRotTensorLocal = graph.variable(
+    .CPU, .NHWC(1, positiveTokens.count, 1, 256), of: Float.self)
+  for i in 0..<positiveTokens.count {
+    for k in 0..<128 {
+      let theta = Double(i) * 1.0 / pow(10_000, Double(k) * 2 / 256)
+      let sintheta = sin(theta)
+      let costheta = cos(theta)
+      positiveRotTensorLocal[0, i, 0, k * 2] = Float(costheta)
+      positiveRotTensorLocal[0, i, 0, k * 2 + 1] = Float(sintheta)
+    }
+  }
+  let (transformer, reader) = Transformer(
+    Float16.self, vocabularySize: 262_208, maxLength: positiveTokens.count, width: 3_840,
+    tokenLength: positiveTokens.count,
+    layers: 48, MLP: 15_360, heads: 16, outputHiddenStates: nil, batchSize: 1
+  )
+  let positiveTokensTensor = graph.variable(
+    .CPU, format: .NHWC, shape: [positiveTokens.count], of: Int32.self)
+  for i in 0..<positiveTokens.count {
+    positiveTokensTensor[i] = positiveTokens[i]
+  }
+  let positiveTokensTensorGPU = positiveTokensTensor.toGPU(1)
+  let positiveRotTensorLocalGPU = DynamicGraph.Tensor<Float16>(from: positiveRotTensorLocal).toGPU(
+    1)
+  let positiveRotTensorGPU = DynamicGraph.Tensor<Float16>(from: positiveRotTensor).toGPU(1)
+  transformer.compile(
+    inputs: positiveTokensTensorGPU, positiveRotTensorLocalGPU, positiveRotTensorGPU)
+  reader(text_state_dict)
+  let positiveLastHiddenStates = transformer(
+    inputs: positiveTokensTensorGPU, positiveRotTensorLocalGPU, positiveRotTensorGPU)[
+      0
+    ].as(of: Float16.self)
+  debugPrint(positiveLastHiddenStates)
+  return positiveLastHiddenStates
+}
+
+exit(0)
 
 let audio_builder = ltx_core_pipeline_conditioning.AudioConditioningBuilder(
   patchifier: ltx_core_pipeline_components_patchifiers.AudioPatchifier(patch_size: 1), batch: 1,
@@ -70,10 +315,6 @@ transformer.to(torch_device)
 let output = transformer(video: video, audio: audio, perturbations: Python.None)
 
 let state_dict = transformer.state_dict()
-
-let graph = DynamicGraph()
-
-graph.maxConcurrency = .limit(1)
 
 func GELUMLPEmbedder(channels: Int, name: String) -> (Model, Model, Model) {
   let x = Input()

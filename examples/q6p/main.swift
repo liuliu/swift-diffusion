@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/qwen_image_layered_1.0_f16.ckpt", flags: [.readOnly]
+  "/home/liu/workspace/swift-diffusion/ltx_2_19b_dev_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/qwen_image_layered_1.0_q6p.ckpt",
+    "/home/liu/workspace/swift-diffusion/ltx_2_19b_dev_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -35,6 +35,7 @@ graph.openStore(
       print("write \(key) \(tensor)")
       if key.contains("embedder") || key.contains("pos_embed") || key.contains("-linear-")
         || key.contains("-linear_final-")
+        || key.contains("-proj_out-") || key.contains("-audio_proj_out-")
         || key.contains("_embeddings") || key.contains("register_tokens")
         || (key.contains("refiner_") && !key.contains("noise_refiner_")
           && !key.contains("context_refiner_"))
@@ -91,7 +92,7 @@ graph.openStore(
         continue
       }
       */
-      if n > 1 && key.contains("ada_ln") {
+      if n > 1 && (key.contains("ada_ln") || key.contains("adaln_")) {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         continue
       }
