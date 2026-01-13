@@ -53,9 +53,12 @@ let token_pairs = text_encoder.tokenizer.tokenize_with_weights(prompt)["gemma"]
 let inputIdsAndMask = text_encoder._process_token_pairs(token_pairs)
 let inputIds = inputIdsAndMask[0]
 let attentionMask = inputIdsAndMask[1]
-text_encoder.model(input_ids: inputIds, attention_mask: attentionMask, output_hidden_states: true)
-print(text_encoder.model)
+print(text_encoder)
 
+text_encoder(prompt)
+// text_encoder.model(input_ids: inputIds, attention_mask: attentionMask, output_hidden_states: true)
+
+let text_encoder_state_dict = text_encoder.cpu().state_dict()
 let text_state_dict = text_encoder.model.language_model.state_dict()
 
 let sentencePiece = SentencePiece(
@@ -193,7 +196,7 @@ func TextEmbedding<T: TensorNumeric>(
 
 func Transformer<T: TensorNumeric>(
   _ dataType: T.Type, vocabularySize: Int, maxLength: Int, width: Int, tokenLength: Int,
-  layers: Int, MLP: Int, heads: Int, outputHiddenStates: Int?, batchSize: Int
+  layers: Int, MLP: Int, heads: Int, batchSize: Int
 ) -> (Model, (PythonObject) -> Void) {
   let tokens = Input()
   let rotLocal = Input()
@@ -203,19 +206,17 @@ func Transformer<T: TensorNumeric>(
     embeddingSize: width)
   var out = 62 * embedding(tokens).to(.Float32)
   var readers = [(PythonObject) -> Void]()
-  var hiddenStates: Model.IO? = nil
+  var hiddenStates = [Model.IO]()
   for i in 0..<layers {
+    hiddenStates.append(out)
     let (layer, reader) = TransformerBlock(
       prefix: "layers.\(i)", width: width, k: 256, h: heads, hk: 8, b: batchSize,
       t: tokenLength, MLP: MLP)
     out = layer(out, (i + 1) % 6 == 0 ? rot : rotLocal)
     readers.append(reader)
-    if let outputHiddenStates = outputHiddenStates, outputHiddenStates == i {
-      hiddenStates = out
-    }
   }
   let norm = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm")
-  out = norm(out).to(.Float16)
+  hiddenStates.append(norm(out))
   let reader: (PythonObject) -> Void = { state_dict in
     embedReader(state_dict)
     for reader in readers {
@@ -224,7 +225,123 @@ func Transformer<T: TensorNumeric>(
     let norm_weight = (state_dict["norm.weight"].type(torch.float).cpu() + 1).numpy()
     norm.weight.copy(from: Tensor<Float>(from: try! Tensor<Float>(numpy: norm_weight)))
   }
-  return (Model([tokens, rotLocal, rot], (hiddenStates.map { [$0] } ?? []) + [out]), reader)
+  return (Model([tokens, rotLocal, rot], hiddenStates), reader)
+}
+
+func BasicTransformerBlock1D(prefix: String, k: Int, h: Int, b: Int, t: Int) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let norm = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  let normX = norm(x).to(.Float16)
+  let rot = Input()
+  let toKeys = Dense(count: k * h, name: "to_k")
+  let toQueries = Dense(count: k * h, name: "to_q")
+  let toValues = Dense(count: k * h, name: "to_v")
+  var keys = toKeys(normX)
+  let normK = RMSNorm(epsilon: 1e-6, axis: [2], name: "norm_k")
+  keys = normK(keys).reshaped([b, t, h, k])
+  var queries = toQueries(normX)
+  let normQ = RMSNorm(epsilon: 1e-6, axis: [2], name: "norm_q")
+  queries = normQ(queries).reshaped([b, t, h, k])
+  let values = toValues(normX).reshaped([b, t, h, k])
+  queries = (1 / Float(k).squareRoot().squareRoot()) * Functional.cmul(left: queries, right: rot)
+  keys = (1 / Float(k).squareRoot().squareRoot()) * Functional.cmul(left: keys, right: rot)
+  // Now run attention.
+  let scaledDotProductAttention = ScaledDotProductAttention(scale: 1, flags: [.Float16])
+  var out = scaledDotProductAttention(queries, keys, values).reshaped([b, t, k * h])
+  let unifyheads = Dense(count: k * h, name: "to_o")
+  out = unifyheads(out).to(of: x) + x
+  let residual = out
+  let upProj = Dense(count: k * h * 4, name: "up_proj")
+  out = (1.0 / 8.0) * upProj(norm(out).to(.Float16)).GELU(approximate: .tanh)
+  let downProj = Dense(count: k * h, name: "down_proj")
+  out = Add(leftScalar: 8, rightScalar: 1)(downProj(out).to(of: residual), residual)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let to_q_weight = state_dict["\(prefix).attn1.to_q.weight"].type(torch.float).cpu()
+    let to_q_bias = state_dict["\(prefix).attn1.to_q.bias"].type(torch.float).cpu()
+    let q_weight = to_q_weight.view(
+      h, 2, k / 2, k * h
+    ).transpose(1, 2).cpu().numpy()
+    let q_bias = to_q_bias.view(
+      h, 2, k / 2
+    ).transpose(1, 2).cpu().numpy()
+    toQueries.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: q_weight)))
+    toQueries.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: q_bias)))
+    let to_k_weight = state_dict["\(prefix).attn1.to_k.weight"].type(torch.float).cpu()
+    let to_k_bias = state_dict["\(prefix).attn1.to_k.bias"].type(torch.float).cpu()
+    let k_weight = to_k_weight.view(
+      h, 2, k / 2, k * h
+    ).transpose(1, 2).cpu().numpy()
+    let k_bias = to_k_bias.view(
+      h, 2, k / 2
+    ).transpose(1, 2).cpu().numpy()
+    toKeys.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: k_weight)))
+    toKeys.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: k_bias)))
+    let to_v_weight = state_dict["\(prefix).attn1.to_v.weight"].type(torch.float).cpu().numpy()
+    let to_v_bias = state_dict["\(prefix).attn1.to_v.bias"].type(torch.float).cpu().numpy()
+    toValues.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: to_v_weight)))
+    toValues.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: to_v_bias)))
+    let to_out_0_weight = state_dict["\(prefix).attn1.to_out.0.weight"].type(torch.float).cpu()
+      .numpy()
+    let to_out_0_bias = state_dict["\(prefix).attn1.to_out.0.bias"].type(torch.float).cpu()
+      .numpy()
+    unifyheads.weight.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: to_out_0_weight)))
+    unifyheads.bias.copy(from: Tensor<Float16>(from: try! Tensor<Float>(numpy: to_out_0_bias)))
+    let norm_k_weight = state_dict["\(prefix).attn1.k_norm.weight"]
+      .to(torch.float).cpu().view(h, 2, k / 2).transpose(1, 2).cpu().numpy()
+    normK.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm_k_weight)))
+    let norm_q_weight = state_dict["\(prefix).attn1.q_norm.weight"]
+      .to(torch.float).cpu().view(h, 2, k / 2).transpose(1, 2).cpu().numpy()
+    normQ.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm_q_weight)))
+
+    let ff_net_0_proj_weight = state_dict["\(prefix).ff.net.0.proj.weight"].type(torch.float).cpu()
+      .numpy()
+    let ff_net_0_proj_bias = state_dict["\(prefix).ff.net.0.proj.bias"].type(torch.float).cpu()
+      .numpy()
+    upProj.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_net_0_proj_weight)))
+    upProj.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_net_0_proj_bias)))
+    let ff_net_2_weight = state_dict["\(prefix).ff.net.2.weight"].type(torch.float).cpu().numpy()
+    let ff_net_2_bias = ((1.0 / 8) * state_dict["\(prefix).ff.net.2.bias"].type(torch.float).cpu())
+      .numpy()
+    downProj.weight.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_net_2_weight)))
+    downProj.bias.copy(
+      from: Tensor<Float16>(from: try! Tensor<Float>(numpy: ff_net_2_bias)))
+  }
+  return (reader, Model([x, rot], [out]))
+}
+
+func Embedding1DConnector(prefix: String, layers: Int, tokenLength: Int) -> (
+  Model, (PythonObject) -> Void
+) {
+  let x = Input()
+  let rot = Input()
+  var readers = [(PythonObject) -> Void]()
+  var out: Model.IO = x
+  for i in 0..<layers {
+    let (reader, block) = BasicTransformerBlock1D(
+      prefix: "\(prefix).transformer_1d_blocks.\(i)", k: 128, h: 30, b: 1, t: tokenLength)
+    out = block(out, rot)
+    readers.append(reader)
+  }
+  let norm = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  out = norm(out).to(.Float16)
+  let reader: (PythonObject) -> Void = { state_dict in
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
+  return (Model([x, rot], [out]), reader)
 }
 
 let _ = graph.withNoGrad {
@@ -253,7 +370,7 @@ let _ = graph.withNoGrad {
   let (transformer, reader) = Transformer(
     Float16.self, vocabularySize: 262_208, maxLength: positiveTokens.count, width: 3_840,
     tokenLength: positiveTokens.count,
-    layers: 48, MLP: 15_360, heads: 16, outputHiddenStates: nil, batchSize: 1
+    layers: 48, MLP: 15_360, heads: 16, batchSize: 1
   )
   let positiveTokensTensor = graph.variable(
     .CPU, format: .NHWC, shape: [positiveTokens.count], of: Int32.self)
@@ -267,15 +384,93 @@ let _ = graph.withNoGrad {
   transformer.compile(
     inputs: positiveTokensTensorGPU, positiveRotTensorLocalGPU, positiveRotTensorGPU)
   reader(text_state_dict)
-  let positiveLastHiddenStates = transformer(
-    inputs: positiveTokensTensorGPU, positiveRotTensorLocalGPU, positiveRotTensorGPU)[
-      0
-    ].as(of: Float16.self)
-  debugPrint(positiveLastHiddenStates)
-  return positiveLastHiddenStates
+  let positiveHiddenStates = transformer(
+    inputs: positiveTokensTensorGPU, positiveRotTensorLocalGPU, positiveRotTensorGPU
+  ).map {
+    $0.as(of: Float.self)
+  }
+  graph.openStore("/home/liu/workspace/swift-diffusion/gemma_3_12b_it_qat_f16.ckpt") {
+    $0.write("text_model", model: transformer)
+  }
+  let featureExtractorLinear = Dense(count: 3840, noBias: true)
+  var hiddenStates = graph.variable(.GPU(1), .HWC(positiveTokens.count, 3840, 49), of: Float.self)
+  for i in 0..<49 {
+    hiddenStates[0..<positiveTokens.count, 0..<3840, i..<(i + 1)] = positiveHiddenStates[i]
+      .reshaped(.HWC(positiveTokens.count, 3840, 1))
+  }
+  let mean = hiddenStates.reduced(.mean, axis: [0, 1])
+  let min_ = hiddenStates.reduced(.min, axis: [0, 1])
+  let max_ = hiddenStates.reduced(.max, axis: [0, 1])
+  let range_ = 8.0 * Functional.reciprocal(max_ - min_)
+  let normedHiddenStates = DynamicGraph.Tensor<BFloat16>(from: (hiddenStates - mean) .* range_)
+    .reshaped(.WC(positiveTokens.count, 3840 * 49))
+  featureExtractorLinear.compile(inputs: normedHiddenStates)
+  let aggregate_embed_weight = text_encoder_state_dict[
+    "feature_extractor_linear.aggregate_embed.weight"
+  ].type(torch.float).cpu().numpy()
+  featureExtractorLinear.weight.copy(
+    from: Tensor<BFloat16>(from: try! Tensor<Float>(numpy: aggregate_embed_weight)))
+  let features = DynamicGraph.Tensor<Float>(
+    from: featureExtractorLinear(inputs: normedHiddenStates)[0].as(of: BFloat16.self))
+  let connectorLearnableRegisters = graph.variable(
+    try! Tensor<Float>(
+      numpy: text_encoder_state_dict["embeddings_connector.learnable_registers"].type(torch.float)
+        .cpu().numpy()
+    ).toGPU(1))
+  let audioConnectorLearnableRegisters = graph.variable(
+    try! Tensor<Float>(
+      numpy: text_encoder_state_dict["audio_embeddings_connector.learnable_registers"].type(
+        torch.float
+      ).cpu().numpy()
+    ).toGPU(1))
+  var videoHiddenStates = graph.variable(.GPU(1), .HWC(1, 1024, 3840), of: Float.self)
+  for i in 0..<8 {
+    videoHiddenStates[0..<1, (i * 128)..<((i + 1) * 128), 0..<3840] =
+      connectorLearnableRegisters.reshaped(.HWC(1, 128, 3840))
+  }
+  videoHiddenStates[0..<1, 0..<positiveTokens.count, 0..<3840] = features.reshaped(
+    .HWC(1, positiveTokens.count, 3840))
+  let rotTensor = graph.variable(.CPU, .HWC(1, 1024, 3840), of: Float.self)
+  for i in 0..<1024 {
+    let fractionalPosition = Double(i) / 4096 * 2 - 1
+    for j in 0..<1920 {
+      let theta: Double = pow(10_000, Double(j) / 1919) * .pi * 0.5
+      let freq = theta * fractionalPosition
+      let cosFreq = cos(freq)
+      let sinFreq = sin(freq)
+      rotTensor[0, i, j * 2] = Float(cosFreq)
+      rotTensor[0, i, j * 2 + 1] = Float(sinFreq)
+    }
+  }
+  let rotTensorGPU = DynamicGraph.Tensor<FloatType>(
+    from: rotTensor.reshaped(.NHWC(1, 1024, 30, 128))
+  )
+  .toGPU(1)
+  let (connector, connectorReader) = Embedding1DConnector(
+    prefix: "embeddings_connector", layers: 2, tokenLength: 1024)
+  connector.compile(inputs: videoHiddenStates, rotTensorGPU)
+  connectorReader(text_encoder_state_dict)
+  debugPrint(connector(inputs: videoHiddenStates, rotTensorGPU))
+  for i in 0..<8 {
+    videoHiddenStates[0..<1, (i * 128)..<((i + 1) * 128), 0..<3840] =
+      audioConnectorLearnableRegisters.reshaped(.HWC(1, 128, 3840))
+  }
+  videoHiddenStates[0..<1, 0..<positiveTokens.count, 0..<3840] = features.reshaped(
+    .HWC(1, positiveTokens.count, 3840))
+  let (audioConnector, audioConnectorReader) = Embedding1DConnector(
+    prefix: "audio_embeddings_connector", layers: 2, tokenLength: 1024)
+  audioConnector.compile(inputs: videoHiddenStates, rotTensorGPU)
+  audioConnectorReader(text_encoder_state_dict)
+  debugPrint(audioConnector(inputs: videoHiddenStates, rotTensorGPU))
+  graph.openStore("/home/liu/workspace/swift-diffusion/ltx_2_19b_dev_f16.ckpt") {
+    $0.write("text_feature_extractor", model: featureExtractorLinear)
+    $0.write("text_video_connector_learnable_registers", variable: connectorLearnableRegisters)
+    $0.write("text_video_connector", model: connector)
+    $0.write("text_audio_connector_learnable_registers", variable: audioConnectorLearnableRegisters)
+    $0.write("text_audio_connector", model: audioConnector)
+  }
+  return positiveHiddenStates
 }
-
-exit(0)
 
 let audio_builder = ltx_core_pipeline_conditioning.AudioConditioningBuilder(
   patchifier: ltx_core_pipeline_components_patchifiers.AudioPatchifier(patch_size: 1), batch: 1,
