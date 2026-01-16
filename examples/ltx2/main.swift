@@ -29,24 +29,667 @@ torch.cuda.manual_seed_all(42)
 
 let ltx_core_loader_single_gpu_model_builder = Python.import(
   "ltx_core.loader.single_gpu_model_builder")
+let ltx_core_model_audio_vae_model_configurator = Python.import(
+  "ltx_core.model.audio_vae.model_configurator")
+
+let audio_encoder = ltx_core_loader_single_gpu_model_builder.SingleGPUModelBuilder(
+  model_path: "/fast/Data/ltx-2-19b-dev.safetensors",
+  model_class_configurator: ltx_core_model_audio_vae_model_configurator.AudioEncoderConfigurator,
+  model_sd_ops: ltx_core_model_audio_vae_model_configurator.AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER
+).build(device: "cuda")
+let audio_decoder = ltx_core_loader_single_gpu_model_builder.SingleGPUModelBuilder(
+  model_path: "/fast/Data/ltx-2-19b-dev.safetensors",
+  model_class_configurator: ltx_core_model_audio_vae_model_configurator.AudioDecoderConfigurator,
+  model_sd_ops: ltx_core_model_audio_vae_model_configurator.AUDIO_VAE_DECODER_COMFY_KEYS_FILTER
+).build(device: "cuda")
+let vocoder = ltx_core_loader_single_gpu_model_builder.SingleGPUModelBuilder(
+  model_path: "/fast/Data/ltx-2-19b-dev.safetensors",
+  model_class_configurator: ltx_core_model_audio_vae_model_configurator.VocoderConfigurator,
+  model_sd_ops: ltx_core_model_audio_vae_model_configurator.VOCODER_COMFY_KEYS_FILTER
+).build(device: "cuda")
+let a = torch.randn([1, 8, 121, 16]).to(torch.float).cuda()
+audio_decoder.to(torch.float)
+let decoded_audio = audio_decoder(a)
+audio_encoder.to(torch.float)
+debugPrint(decoded_audio)
+debugPrint(audio_encoder(decoded_audio))
+// vocoder.to(torch.float)
+// debugPrint(vocoder(decoded_audio))
+print(audio_encoder)
+
+func ResnetBlockCausal2D(prefix: String, inChannels: Int, outChannels: Int, shortcut: Bool) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let norm1 = RMSNorm(epsilon: 1e-8, axis: [1], elementwiseAffine: false, name: "resnet_norm1")
+  var out = norm1(x)
+  out = out.swish()
+  let conv1 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 0], end: [0, 0])),
+    name: "resnet_conv1")
+  out = conv1(out.padded(.zero, begin: [0, 0, 2, 1], end: [0, 0, 0, 1]))
+  let norm2 = RMSNorm(epsilon: 1e-8, axis: [1], elementwiseAffine: false, name: "resnet_norm2")
+  out = norm2(out)
+  out = out.swish()
+  let conv2 = Convolution(
+    groups: 1, filters: outChannels, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 0], end: [0, 0])),
+    name: "resnet_conv2")
+  out = conv2(out.padded(.zero, begin: [0, 0, 2, 1], end: [0, 0, 0, 1]))
+  let ninShortcut: Model?
+  if shortcut {
+    let nin = Convolution(
+      groups: 1, filters: outChannels, filterSize: [1, 1], hint: Hint(stride: [1, 1]),
+      name: "resnet_shortcut")
+    out = nin(x) + out
+    ninShortcut = nin
+  } else {
+    ninShortcut = nil
+    out = x + out
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    let conv1_weight = state_dict["\(prefix).conv1.conv.weight"].to(torch.float).cpu().numpy()
+    let conv1_bias = state_dict["\(prefix).conv1.conv.bias"].to(torch.float).cpu().numpy()
+    conv1.weight.copy(from: try! Tensor<Float>(numpy: conv1_weight))
+    conv1.bias.copy(from: try! Tensor<Float>(numpy: conv1_bias))
+    let conv2_weight = state_dict["\(prefix).conv2.conv.weight"].to(torch.float).cpu().numpy()
+    let conv2_bias = state_dict["\(prefix).conv2.conv.bias"].to(torch.float).cpu().numpy()
+    conv2.weight.copy(from: try! Tensor<Float>(numpy: conv2_weight))
+    conv2.bias.copy(from: try! Tensor<Float>(numpy: conv2_bias))
+    if let ninShortcut = ninShortcut {
+      let nin_shortcut_weight = state_dict["\(prefix).nin_shortcut.conv.weight"].to(torch.float)
+        .cpu()
+        .numpy()
+      let nin_shortcut_bias = state_dict["\(prefix).nin_shortcut.conv.bias"].to(torch.float).cpu()
+        .numpy()
+      ninShortcut.weight.copy(
+        from: try! Tensor<Float>(numpy: nin_shortcut_weight))
+      ninShortcut.bias.copy(from: try! Tensor<Float>(numpy: nin_shortcut_bias))
+    }
+  }
+  return (reader, Model([x], [out]))
+}
+
+func EncoderCausal2D(
+  channels: [Int], numRepeat: Int, startWidth: Int, startHeight: Int
+) -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  var previousChannel = channels[0]
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 0], end: [0, 0])),
+    name: "conv_in")
+  var out = convIn(x.padded(.zero, begin: [0, 0, 2, 1], end: [0, 0, 0, 1]))
+  var readers = [(PythonObject) -> Void]()
+  for (i, channel) in channels.enumerated() {
+    for j in 0..<numRepeat {
+      let (reader, block) = ResnetBlockCausal2D(
+        prefix: "down.\(i).block.\(j)", inChannels: previousChannel, outChannels: channel,
+        shortcut: previousChannel != channel)
+      out = block(out)
+      readers.append(reader)
+      previousChannel = channel
+    }
+    if i < channels.count - 1 {
+      let conv = Convolution(
+        groups: 1, filters: previousChannel, filterSize: [3, 3],
+        hint: Hint(stride: [2, 2], border: Hint.Border(begin: [0, 0], end: [0, 0])),
+        name: "upsample")
+      out = conv(out.padded(.zero, begin: [0, 0, 2, 0], end: [0, 0, 0, 1]))
+      let downBlocks = i
+      readers.append { state_dict in
+        let conv_weight = state_dict["down.\(downBlocks).downsample.conv.weight"].to(torch.float)
+          .cpu().numpy()
+        let conv_bias = state_dict["down.\(downBlocks).downsample.conv.bias"].to(torch.float).cpu()
+          .numpy()
+        conv.weight.copy(from: try! Tensor<Float>(numpy: conv_weight))
+        conv.bias.copy(from: try! Tensor<Float>(numpy: conv_bias))
+      }
+    }
+  }
+  let (midResnetBlock1Reader, midResnetBlock1) = ResnetBlockCausal2D(
+    prefix: "mid.block_1", inChannels: previousChannel, outChannels: previousChannel,
+    shortcut: false)
+  out = midResnetBlock1(out)
+  readers.append(midResnetBlock1Reader)
+  let (midResnetBlock2Reader, midResnetBlock2) = ResnetBlockCausal2D(
+    prefix: "mid.block_2", inChannels: previousChannel, outChannels: previousChannel,
+    shortcut: false)
+  out = midResnetBlock2(out)
+  readers.append(midResnetBlock2Reader)
+  let normOut = RMSNorm(epsilon: 1e-8, axis: [1], elementwiseAffine: false, name: "norm_out")
+  out = normOut(out).swish()
+  let convOut = Convolution(
+    groups: 1, filters: 16, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 0], end: [0, 0])), name: "conv_out")
+  out = convOut(out.padded(.zero, begin: [0, 0, 2, 1], end: [0, 0, 0, 1]))
+  let reader: (PythonObject) -> Void = { state_dict in
+    let conv_in_weight = state_dict["conv_in.conv.weight"].to(torch.float).cpu().numpy()
+    let conv_in_bias = state_dict["conv_in.conv.bias"].to(torch.float).cpu().numpy()
+    convIn.weight.copy(from: try! Tensor<Float>(numpy: conv_in_weight))
+    convIn.bias.copy(from: try! Tensor<Float>(numpy: conv_in_bias))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let conv_out_weight = state_dict["conv_out.conv.weight"].to(torch.float).cpu().numpy()
+    let conv_out_bias = state_dict["conv_out.conv.bias"].to(torch.float).cpu().numpy()
+    convOut.weight.copy(from: try! Tensor<Float>(numpy: conv_out_weight))
+    convOut.bias.copy(from: try! Tensor<Float>(numpy: conv_out_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+func DecoderCausal2D(
+  channels: [Int], numRepeat: Int, startWidth: Int, startHeight: Int
+) -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  var previousChannel = channels[channels.count - 1]
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 0], end: [0, 0])),
+    name: "conv_in")
+  var out = convIn(x.padded(.zero, begin: [0, 0, 2, 1], end: [0, 0, 0, 1]))
+  var readers = [(PythonObject) -> Void]()
+  let (midResnetBlock1Reader, midResnetBlock1) = ResnetBlockCausal2D(
+    prefix: "mid.block_1", inChannels: previousChannel, outChannels: previousChannel,
+    shortcut: false)
+  out = midResnetBlock1(out)
+  readers.append(midResnetBlock1Reader)
+  let (midResnetBlock2Reader, midResnetBlock2) = ResnetBlockCausal2D(
+    prefix: "mid.block_2", inChannels: previousChannel, outChannels: previousChannel,
+    shortcut: false)
+  out = midResnetBlock2(out)
+  readers.append(midResnetBlock2Reader)
+  for (i, channel) in channels.enumerated().reversed() {
+    for j in 0..<numRepeat {
+      let (reader, block) = ResnetBlockCausal2D(
+        prefix: "up.\(i).block.\(j)", inChannels: previousChannel, outChannels: channel,
+        shortcut: previousChannel != channel)
+      out = block(out)
+      readers.append(reader)
+      previousChannel = channel
+    }
+    if i > 0 {
+      out = Upsample(.nearest, widthScale: 2, heightScale: 2)(out)
+      let conv = Convolution(
+        groups: 1, filters: previousChannel, filterSize: [3, 3],
+        hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 0], end: [0, 0])),
+        name: "upsample")
+      out = conv(out.padded(.zero, begin: [0, 0, 1, 1], end: [0, 0, 0, 1]))
+      let upBlocks = i
+      readers.append { state_dict in
+        let conv_weight = state_dict["up.\(upBlocks).upsample.conv.conv.weight"].to(torch.float)
+          .cpu().numpy()
+        let conv_bias = state_dict["up.\(upBlocks).upsample.conv.conv.bias"].to(torch.float).cpu()
+          .numpy()
+        conv.weight.copy(from: try! Tensor<Float>(numpy: conv_weight))
+        conv.bias.copy(from: try! Tensor<Float>(numpy: conv_bias))
+      }
+    }
+  }
+  let normOut = RMSNorm(epsilon: 1e-8, axis: [1], elementwiseAffine: false, name: "norm_out")
+  out = normOut(out).swish()
+  let convOut = Convolution(
+    groups: 1, filters: 2, filterSize: [3, 3],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 0], end: [0, 0])), name: "conv_out")
+  out = convOut(out.padded(.zero, begin: [0, 0, 2, 1], end: [0, 0, 0, 1]))
+  let reader: (PythonObject) -> Void = { state_dict in
+    let conv_in_weight = state_dict["conv_in.conv.weight"].to(torch.float).cpu().numpy()
+    let conv_in_bias = state_dict["conv_in.conv.bias"].to(torch.float).cpu().numpy()
+    convIn.weight.copy(from: try! Tensor<Float>(numpy: conv_in_weight))
+    convIn.bias.copy(from: try! Tensor<Float>(numpy: conv_in_bias))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let conv_out_weight = state_dict["conv_out.conv.weight"].to(torch.float).cpu().numpy()
+    let conv_out_bias = state_dict["conv_out.conv.bias"].to(torch.float).cpu().numpy()
+    convOut.weight.copy(from: try! Tensor<Float>(numpy: conv_out_weight))
+    convOut.bias.copy(from: try! Tensor<Float>(numpy: conv_out_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+graph.withNoGrad {
+  let audio_vae_decoder_state_dict = audio_decoder.state_dict()
+  var aTensor = graph.variable(try! Tensor<Float>(numpy: a.to(torch.float).cpu().numpy())).toGPU(1)
+  /*
+  let std = graph.variable(try! Tensor<Float>(numpy: audio_vae_decoder_state_dict["per_channel_statistics.std-of-means"].to(torch.float).view(1, -1, 1, 1).cpu().numpy())).toGPU(1)
+  let mean = graph.variable(try! Tensor<Float>(numpy: audio_vae_decoder_state_dict["per_channel_statistics.mean-of-means"].to(torch.float).view(1, -1, 1, 1).cpu().numpy())).toGPU(1)
+  aTensor = aTensor .* std + mean
+  */
+  let (decoderReader, decoder) = DecoderCausal2D(
+    channels: [128, 256, 512], numRepeat: 3, startWidth: 16, startHeight: 121)
+  decoder.compile(inputs: aTensor)
+  decoderReader(audio_vae_decoder_state_dict)
+  let mel = decoder(inputs: aTensor)[0].as(of: Float.self)
+  debugPrint(mel)
+  let audio_vae_encoder_state_dict = audio_encoder.state_dict()
+  let (encoderReader, encoder) = EncoderCausal2D(
+    channels: [128, 256, 512], numRepeat: 2, startWidth: 16, startHeight: 121)
+  encoder.compile(inputs: mel)
+  encoderReader(audio_vae_encoder_state_dict)
+  debugPrint(encoder(inputs: mel)[0].as(of: Float.self))
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/ltx_2_video_vae_f32.ckpt") {
+    $0.write("decoder", model: decoder)
+    $0.write("encoder", model: encoder)
+    $0.write("mean", variable: mean)
+    $0.write("std", variable: std)
+  }
+  */
+}
+
+exit(0)
+
 let ltx_core_model_transformer_model_configurator = Python.import(
   "ltx_core.model.transformer.model_configurator")
-let ltx_core_model_clip_gemma_encoders_av_encoder = Python.import(
-  "ltx_core.model.clip.gemma.encoders.av_encoder")
+let ltx_core_text_encoders_gemma_encoders_av_encoder = Python.import(
+  "ltx_core.text_encoders.gemma.encoders.av_encoder")
 let ltx_core_model_transformer_modality = Python.import("ltx_core.model.transformer.modality")
-let ltx_core_loader_sd_keys_ops = Python.import("ltx_core.loader.sd_keys_ops")
-let ltx_core_pipeline_components_patchifiers = Python.import(
-  "ltx_core.pipeline.components.patchifiers")
-let ltx_core_pipeline_conditioning = Python.import("ltx_core.pipeline.conditioning")
+let ltx_core_model_video_vae_model_configurator = Python.import(
+  "ltx_core.model.video_vae.model_configurator")
+let ltx_core_loader_sd_ops = Python.import("ltx_core.loader.sd_ops")
+let ltx_core_components_patchifiers = Python.import(
+  "ltx_core.components.patchifiers")
+let ltx_core_conditioning = Python.import("ltx_core.conditioning")
+
+let vae_decoder = ltx_core_loader_single_gpu_model_builder.SingleGPUModelBuilder(
+  model_path: "/fast/Data/ltx-2-19b-dev.safetensors",
+  model_class_configurator: ltx_core_model_video_vae_model_configurator.VideoDecoderConfigurator,
+  model_sd_ops: ltx_core_model_video_vae_model_configurator.VAE_DECODER_COMFY_KEYS_FILTER
+).build(device: "cuda")
+let vae_encoder = ltx_core_loader_single_gpu_model_builder.SingleGPUModelBuilder(
+  model_path: "/fast/Data/ltx-2-19b-dev.safetensors",
+  model_class_configurator: ltx_core_model_video_vae_model_configurator.VideoEncoderConfigurator,
+  model_sd_ops: ltx_core_model_video_vae_model_configurator.VAE_ENCODER_COMFY_KEYS_FILTER
+).build(device: "cuda")
+let z = torch.randn([1, 128, 16, 16, 24]).to(torch.float).cuda()
+vae_decoder.to(torch.float)
+vae_encoder.to(torch.float)
+// let image = vae_decoder(z)
+// debugPrint(vae_encoder(image))
+
+print(vae_decoder)
+print(vae_encoder)
+
+func ResnetBlockCausal3D(
+  prefix: String, channels: Int, depth: Int, height: Int, width: Int, isCausal: Bool
+) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let norm1 = RMSNorm(epsilon: 1e-8, axis: [0], elementwiseAffine: false, name: "resnet_norm1")
+  var out = norm1(x.reshaped([channels, depth, height, width])).reshaped([
+    1, channels, depth, height, width,
+  ])
+  out = out.swish()
+  let conv1 = Convolution(
+    groups: 1, filters: channels, filterSize: [3, 3, 3],
+    hint: Hint(
+      stride: [1, 1, 1],
+      border: Hint.Border(
+        begin: [0, isCausal ? 1 : 0, isCausal ? 1 : 0],
+        end: [0, isCausal ? 1 : 0, isCausal ? 1 : 0])),
+    name: "resnet_conv1")
+  out = out.padded(
+    .replicate, begin: [0, 0, isCausal ? 2 : 1, 0, 0], end: [0, 0, isCausal ? 0 : 1, 0, 0])
+  if !isCausal {
+    out = out.padded(.reflect, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1])
+  }
+  out = conv1(out)
+  let norm2 = RMSNorm(epsilon: 1e-8, axis: [0], elementwiseAffine: false, name: "resnet_norm2")
+  out = norm2(out.reshaped([channels, depth, height, width])).reshaped([
+    1, channels, depth, height, width,
+  ])
+  out = out.swish()
+  let conv2 = Convolution(
+    groups: 1, filters: channels, filterSize: [3, 3, 3],
+    hint: Hint(
+      stride: [1, 1, 1],
+      border: Hint.Border(
+        begin: [0, isCausal ? 1 : 0, isCausal ? 1 : 0],
+        end: [0, isCausal ? 1 : 0, isCausal ? 1 : 0])),
+    name: "resnet_conv2")
+  out = out.padded(
+    .replicate, begin: [0, 0, isCausal ? 2 : 1, 0, 0], end: [0, 0, isCausal ? 0 : 1, 0, 0])
+  if !isCausal {
+    out = out.padded(.reflect, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1])
+  }
+  out = conv2(out)
+  out = x + out
+  let reader: (PythonObject) -> Void = { state_dict in
+    let conv1_weight = state_dict["\(prefix).conv1.conv.weight"].to(torch.float).cpu().numpy()
+    let conv1_bias = state_dict["\(prefix).conv1.conv.bias"].to(torch.float).cpu().numpy()
+    conv1.weight.copy(from: try! Tensor<Float>(numpy: conv1_weight))
+    conv1.bias.copy(from: try! Tensor<Float>(numpy: conv1_bias))
+    let conv2_weight = state_dict["\(prefix).conv2.conv.weight"].to(torch.float).cpu().numpy()
+    let conv2_bias = state_dict["\(prefix).conv2.conv.bias"].to(torch.float).cpu().numpy()
+    conv2.weight.copy(from: try! Tensor<Float>(numpy: conv2_weight))
+    conv2.bias.copy(from: try! Tensor<Float>(numpy: conv2_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+func DecoderCausal3D(
+  channels: [Int], numRepeat: Int, startWidth: Int, startHeight: Int,
+  startDepth: Int
+)
+  -> ((PythonObject) -> Void, Model)
+{
+  let x = Input()
+  var previousChannel = channels[channels.count - 1]
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "conv_in")
+  var out = convIn(
+    x.padded(.replicate, begin: [0, 0, 1, 0, 0], end: [0, 0, 1, 0, 0]).padded(
+      .reflect, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
+  var readers = [(PythonObject) -> Void]()
+  var j = 0
+  var depth = startDepth
+  var height = startHeight
+  var width = startWidth
+  for channel in channels.reversed() {
+    if previousChannel != channel {
+      // Convolution & reshape.
+      let conv = Convolution(
+        groups: 1, filters: channel * 8, filterSize: [3, 3, 3],
+        hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+        name: "depth_to_space_upsample")
+      var residual = out.reshaped([previousChannel / 8, 2, 2, 2, depth, height, width]).permuted(
+        0, 4, 1, 5, 2, 6, 3
+      ).contiguous().reshaped(
+        [1, previousChannel / 8, depth * 2 - 1, height * 2, width * 2], offset: [0, 0, 1, 0, 0],
+        strides: [
+          previousChannel * depth * height * width, depth * 2 * height * 2 * width * 2,
+          height * 2 * width * 2, width * 2, 1,
+        ]
+      ).contiguous()
+      residual = Functional.concat(
+        axis: 1, residual, residual, residual, residual, flags: [.disableOpt])
+      out = conv(
+        out.padded(.replicate, begin: [0, 0, 1, 0, 0], end: [0, 0, 1, 0, 0]).padded(
+          .reflect, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
+      let upBlocks = j
+      readers.append { state_dict in
+        let up_blocks_conv_conv_weight = state_dict["up_blocks.\(upBlocks).conv.conv.weight"].to(
+          torch.float
+        ).cpu().numpy()
+        let up_blocks_conv_conv_bias = state_dict["up_blocks.\(upBlocks).conv.conv.bias"].to(
+          torch.float
+        ).cpu().numpy()
+        conv.weight.copy(from: try! Tensor<Float>(numpy: up_blocks_conv_conv_weight))
+        conv.bias.copy(from: try! Tensor<Float>(numpy: up_blocks_conv_conv_bias))
+      }
+      out =
+        residual
+        + out.reshaped([channel, 2, 2, 2, depth, height, width]).permuted(0, 4, 1, 5, 2, 6, 3)
+        .contiguous().reshaped(
+          [1, channel, depth * 2 - 1, height * 2, width * 2], offset: [0, 0, 1, 0, 0],
+          strides: [
+            channel * depth * 2 * height * 2 * width * 2, depth * 2 * height * 2 * width * 2,
+            height * 2 * width * 2, width * 2, 1,
+          ]
+        ).contiguous()
+      j += 1
+      depth = depth * 2 - 1
+      height = height * 2
+      width = width * 2
+      previousChannel = channel
+    }
+    for i in 0..<numRepeat {
+      let (reader, block) = ResnetBlockCausal3D(
+        prefix: "up_blocks.\(j).res_blocks.\(i)", channels: channel, depth: depth, height: height,
+        width: width, isCausal: false)
+      out = block(out)
+      readers.append(reader)
+    }
+    j += 1
+  }
+  let normOut = RMSNorm(epsilon: 1e-8, axis: [0], elementwiseAffine: false, name: "norm_out")
+  out = normOut(out.reshaped([previousChannel, depth, height, width])).reshaped([
+    1, previousChannel, depth, height, width,
+  ]).swish()
+  let convOut = Convolution(
+    groups: 1, filters: 48, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 0, 0], end: [0, 0, 0])),
+    name: "conv_out")
+  out = convOut(
+    out.padded(.replicate, begin: [0, 0, 1, 0, 0], end: [0, 0, 1, 0, 0]).padded(
+      .reflect, begin: [0, 0, 0, 1, 1], end: [0, 0, 0, 1, 1]))
+  // LTXV weirdly, did "b (c p r q) f h w -> b c (f p) (h q) (w r)"
+  out = out.reshaped([3, 4, 4, depth, height, width]).permuted(0, 3, 4, 2, 5, 1).contiguous()
+    .reshaped([3, depth, height * 4, width * 4])
+
+  let reader: (PythonObject) -> Void = { state_dict in
+    let conv_in_weight = state_dict["conv_in.conv.weight"].to(torch.float).cpu().numpy()
+    let conv_in_bias = state_dict["conv_in.conv.bias"].to(torch.float).cpu().numpy()
+    convIn.weight.copy(from: try! Tensor<Float>(numpy: conv_in_weight))
+    convIn.bias.copy(from: try! Tensor<Float>(numpy: conv_in_bias))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let conv_out_weight = state_dict["conv_out.conv.weight"].to(torch.float).cpu().numpy()
+    let conv_out_bias = state_dict["conv_out.conv.bias"].to(torch.float).cpu().numpy()
+    convOut.weight.copy(from: try! Tensor<Float>(numpy: conv_out_weight))
+    convOut.bias.copy(from: try! Tensor<Float>(numpy: conv_out_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+func EncoderCausal3D(
+  layers: [(channels: Int, numRepeat: Int, stride: (Int, Int, Int))], startWidth: Int,
+  startHeight: Int,
+  startDepth: Int
+)
+  -> ((PythonObject) -> Void, Model)
+{
+  let x = Input()
+  var height = startHeight
+  var width = startWidth
+  var depth = startDepth
+  for layer in layers {
+    depth = (depth - 1) * layer.stride.0 + 1
+    height *= layer.stride.1
+    width *= layer.stride.2
+  }
+  // LTXV weirdly, did "b (c p r q) f h w -> b c (f p) (h q) (w r)"
+  var out = x.reshaped([3, depth, height, 4, width, 4]).permuted(0, 5, 3, 1, 2, 4).contiguous()
+    .reshaped([1, 48, depth, height, width])
+  var previousChannel = layers[0].channels
+  let convIn = Convolution(
+    groups: 1, filters: previousChannel, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 1, 1], end: [0, 1, 1])),
+    name: "conv_in")
+  out = convIn(out.padded(.replicate, begin: [0, 0, 2, 0, 0], end: [0, 0, 0, 0, 0]))
+  var j = 0
+  var readers = [(PythonObject) -> Void]()
+  for layer in layers {
+    let channels = layer.channels
+    if layer.stride.0 > 1 || layer.stride.1 > 1 || layer.stride.2 > 1 {
+      // Convolution & reshape.
+      let conv = Convolution(
+        groups: 1, filters: channels / (layer.stride.0 * layer.stride.1 * layer.stride.2),
+        filterSize: [3, 3, 3],
+        hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 1, 1], end: [0, 1, 1])),
+        name: "space_to_depth_downsample")
+      if layer.stride.0 == 1 {
+        var residual = out.reshaped([
+          previousChannel, depth, height / layer.stride.1, layer.stride.1, width / layer.stride.2,
+          layer.stride.2,
+        ]).permuted(0, 3, 5, 1, 2, 4).contiguous().reshaped([
+          1, channels, previousChannel * layer.stride.1 * layer.stride.2 / channels, depth,
+          height / layer.stride.1, width / layer.stride.2,
+        ])
+        residual = residual.reduced(.mean, axis: [2]).reshaped([
+          1, channels, depth, height / layer.stride.1, width / layer.stride.2,
+        ])
+        out = conv(out.padded(.replicate, begin: [0, 0, 2, 0, 0]))
+        out = out.reshaped([
+          channels / (layer.stride.1 * layer.stride.2), depth, height / layer.stride.1,
+          layer.stride.1, width / layer.stride.2, layer.stride.2,
+        ]).permuted(0, 3, 5, 1, 2, 4).contiguous().reshaped([
+          1, channels, depth, height / layer.stride.1, width / layer.stride.2,
+        ])
+        out = residual + out
+        height = height / layer.stride.1
+        width = width / layer.stride.2
+      } else if layer.stride.1 == 1 && layer.stride.2 == 1 {
+        var residual = out.padded(.replicate, begin: [0, 0, 1, 0, 0]).reshaped([
+          previousChannel, (depth + 1) / layer.stride.0, layer.stride.0, height, width,
+        ]).permuted(0, 2, 1, 3, 4).contiguous()
+        if previousChannel * layer.stride.0 / channels > 1 {
+          residual = residual.reshaped([
+            1, channels, previousChannel * layer.stride.0 / channels, (depth + 1) / layer.stride.0,
+            height, width,
+          ])
+          residual = residual.reduced(.mean, axis: [2]).reshaped([
+            1, channels, (depth + 1) / layer.stride.0, height, width,
+          ])
+        } else {
+          residual = residual.reshaped([1, channels, (depth + 1) / layer.stride.0, height, width])
+        }
+        out = conv(out.padded(.replicate, begin: [0, 0, 3, 0, 0]))
+        out = out.reshaped([
+          channels / layer.stride.0, (depth + 1) / layer.stride.0, layer.stride.0, height, width,
+        ]).permuted(0, 2, 1, 3, 4).contiguous().reshaped([
+          1, channels, (depth + 1) / layer.stride.0, height, width,
+        ])
+        out = residual + out
+        depth = (depth + 1) / layer.stride.0
+      } else {
+        var residual = out.padded(.replicate, begin: [0, 0, 1, 0, 0]).reshaped([
+          previousChannel, (depth + 1) / layer.stride.0, layer.stride.0, height / layer.stride.1,
+          layer.stride.1, width / layer.stride.2, layer.stride.2,
+        ]).permuted(0, 2, 4, 6, 1, 3, 5).contiguous().reshaped([
+          1, channels,
+          previousChannel * layer.stride.0 * layer.stride.1 * layer.stride.2 / channels,
+          (depth + 1) / layer.stride.0, height / layer.stride.1, width / layer.stride.2,
+        ])
+        residual = residual.reduced(.mean, axis: [2]).reshaped([
+          1, channels, (depth + 1) / layer.stride.0, height / layer.stride.1,
+          width / layer.stride.2,
+        ])
+        out = conv(out.padded(.replicate, begin: [0, 0, 3, 0, 0]))
+        out = out.reshaped([
+          channels / (layer.stride.0 * layer.stride.1 * layer.stride.2),
+          (depth + 1) / layer.stride.0, layer.stride.0, height / layer.stride.1, layer.stride.1,
+          width / layer.stride.2, layer.stride.2,
+        ]).permuted(0, 2, 4, 6, 1, 3, 5).contiguous().reshaped([
+          1, channels, (depth + 1) / layer.stride.0, height / layer.stride.1,
+          width / layer.stride.2,
+        ])
+        out = residual + out
+        depth = (depth + 1) / layer.stride.0
+        height = height / layer.stride.1
+        width = width / layer.stride.2
+      }
+      previousChannel = channels
+      let downBlocks = j
+      readers.append { state_dict in
+        let down_blocks_conv_conv_weight = state_dict["down_blocks.\(downBlocks).conv.conv.weight"]
+          .to(torch.float).cpu().numpy()
+        let down_blocks_conv_conv_bias = state_dict["down_blocks.\(downBlocks).conv.conv.bias"].to(
+          torch.float
+        ).cpu().numpy()
+        conv.weight.copy(from: try! Tensor<Float>(numpy: down_blocks_conv_conv_weight))
+        conv.bias.copy(from: try! Tensor<Float>(numpy: down_blocks_conv_conv_bias))
+      }
+      j += 1
+    }
+    for i in 0..<layer.numRepeat {
+      let (reader, block) = ResnetBlockCausal3D(
+        prefix: "down_blocks.\(j).res_blocks.\(i)", channels: channels, depth: depth,
+        height: height, width: width, isCausal: true)
+      out = block(out)
+      readers.append(reader)
+    }
+    j += 1
+  }
+  let normOut = RMSNorm(epsilon: 1e-8, axis: [0], elementwiseAffine: false, name: "norm_out")
+  out = normOut(out.reshaped([previousChannel, depth, height, width])).reshaped([
+    1, previousChannel, depth, height, width,
+  ]).swish()
+  let convOut = Convolution(
+    groups: 1, filters: 129, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 1, 1], end: [0, 1, 1])),
+    name: "conv_out")
+  out = convOut(out.padded(.replicate, begin: [0, 0, 2, 0, 0]))
+  let reader: (PythonObject) -> Void = { state_dict in
+    let conv_in_weight = state_dict["conv_in.conv.weight"].to(torch.float).cpu().numpy()
+    let conv_in_bias = state_dict["conv_in.conv.bias"].to(torch.float).cpu().numpy()
+    convIn.weight.copy(from: try! Tensor<Float>(numpy: conv_in_weight))
+    convIn.bias.copy(from: try! Tensor<Float>(numpy: conv_in_bias))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let conv_out_weight = state_dict["conv_out.conv.weight"].to(torch.float).cpu().numpy()
+    let conv_out_bias = state_dict["conv_out.conv.bias"].to(torch.float).cpu().numpy()
+    convOut.weight.copy(from: try! Tensor<Float>(numpy: conv_out_weight))
+    convOut.bias.copy(from: try! Tensor<Float>(numpy: conv_out_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+graph.withNoGrad {
+  let vae_decoder_state_dict = vae_decoder.state_dict()
+  let std = graph.variable(
+    try! Tensor<Float>(
+      numpy: vae_decoder_state_dict["per_channel_statistics.std-of-means"].to(torch.float).view(
+        1, -1, 1, 1, 1
+      ).cpu().numpy())
+  ).toGPU(1)
+  let mean = graph.variable(
+    try! Tensor<Float>(
+      numpy: vae_decoder_state_dict["per_channel_statistics.mean-of-means"].to(torch.float).view(
+        1, -1, 1, 1, 1
+      ).cpu().numpy())
+  ).toGPU(1)
+  var zTensor = graph.variable(try! Tensor<Float>(numpy: z.to(torch.float).cpu().numpy())).toGPU(1)
+  zTensor = zTensor .* std + mean
+  let (decoderReader, decoder) = DecoderCausal3D(
+    channels: [128, 256, 512, 1024], numRepeat: 5, startWidth: 24, startHeight: 16, startDepth: 16)
+  decoder.compile(inputs: zTensor)
+  decoderReader(vae_decoder_state_dict)
+  let image = decoder(inputs: zTensor)[0].as(of: Float.self)
+  let (encoderReader, encoder) = EncoderCausal3D(
+    layers: [
+      (channels: 128, numRepeat: 4, stride: (1, 1, 1)),
+      (channels: 256, numRepeat: 6, stride: (1, 2, 2)),
+      (channels: 512, numRepeat: 6, stride: (2, 1, 1)),
+      (channels: 1024, numRepeat: 2, stride: (2, 2, 2)),
+      (channels: 2048, numRepeat: 2, stride: (2, 2, 2)),
+    ], startWidth: 24, startHeight: 16, startDepth: 16)
+  encoder.compile(inputs: image)
+  let vae_encoder_state_dict = vae_encoder.state_dict()
+  print(vae_encoder_state_dict.keys())
+  encoderReader(vae_encoder_state_dict)
+  let x = encoder(inputs: image)[0].as(of: Float.self)
+  let norm =
+    (x[0..<1, 0..<128, 0..<16, 0..<16, 0..<24].contiguous() - mean) .* Functional.reciprocal(std)
+  debugPrint(norm)
+  /*
+  graph.openStore("/home/liu/workspace/swift-diffusion/ltx_2_video_vae_f32.ckpt") {
+    $0.write("decoder", model: decoder)
+    $0.write("encoder", model: encoder)
+    $0.write("mean", variable: mean)
+    $0.write("std", variable: std)
+  }
+  */
+}
+
+exit(0)
 
 let prompt = "a dance party"
 // Text Encoder
 let text_encoder = ltx_core_loader_single_gpu_model_builder.SingleGPUModelBuilder(
   model_path: "/fast/Data/ltx-2-19b-dev.safetensors",
-  model_class_configurator: ltx_core_model_clip_gemma_encoders_av_encoder
+  model_class_configurator: ltx_core_text_encoders_gemma_encoders_av_encoder
     .AVGemmaTextEncoderModelConfigurator.with_gemma_root_path(
       "/slow/Data/google/gemma-3-12b-it-qat-q4_0-unquantized"),
-  model_sd_key_ops: ltx_core_model_clip_gemma_encoders_av_encoder.AV_GEMMA_TEXT_ENCODER_KEY_OPS
+  model_sd_ops: ltx_core_text_encoders_gemma_encoders_av_encoder.AV_GEMMA_TEXT_ENCODER_KEY_OPS
 ).build(device: "cuda")
 text_encoder.to(torch_device)
 let token_pairs = text_encoder.tokenizer.tokenize_with_weights(prompt)["gemma"]
@@ -232,7 +875,7 @@ func BasicTransformerBlock1D(prefix: String, k: Int, h: Int, b: Int, t: Int) -> 
   (PythonObject) -> Void, Model
 ) {
   let x = Input()
-  let norm = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  let norm = RMSNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   let normX = norm(x).to(.Float16)
   let rot = Input()
   let toKeys = Dense(count: k * h, name: "to_k")
@@ -334,7 +977,7 @@ func Embedding1DConnector(prefix: String, layers: Int, tokenLength: Int) -> (
     out = block(out, rot)
     readers.append(reader)
   }
-  let norm = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  let norm = RMSNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   out = norm(out).to(.Float16)
   let reader: (PythonObject) -> Void = { state_dict in
     for reader in readers {
@@ -472,11 +1115,11 @@ let _ = graph.withNoGrad {
   return positiveHiddenStates
 }
 
-let audio_builder = ltx_core_pipeline_conditioning.AudioConditioningBuilder(
-  patchifier: ltx_core_pipeline_components_patchifiers.AudioPatchifier(patch_size: 1), batch: 1,
+let audio_builder = ltx_core_conditioning.AudioConditioningBuilder(
+  patchifier: ltx_core_components_patchifiers.AudioPatchifier(patch_size: 1), batch: 1,
   duration: 121.0 / 25.0)
-let video_builder = ltx_core_pipeline_conditioning.VideoConditioningBuilder(
-  patchifier: ltx_core_pipeline_components_patchifiers.VideoLatentPatchifier(patch_size: 1),
+let video_builder = ltx_core_conditioning.VideoConditioningBuilder(
+  patchifier: ltx_core_components_patchifiers.VideoLatentPatchifier(patch_size: 1),
   batch: 1, width: 768, height: 512, num_frames: 121, fps: 25.0)
 let generator = torch.Generator(device: torch_device)
 generator.manual_seed(42)
@@ -488,7 +1131,7 @@ let video_input = video_builder.build(
 let transformer_builder = ltx_core_loader_single_gpu_model_builder.SingleGPUModelBuilder(
   model_path: "/fast/Data/ltx-2-19b-dev.safetensors",
   model_class_configurator: ltx_core_model_transformer_model_configurator.LTXModelConfigurator,
-  model_sd_key_ops: ltx_core_loader_sd_keys_ops.LTXV_MODEL_COMFY_RENAMING_MAP)
+  model_sd_ops: ltx_core_loader_sd_ops.LTXV_LORA_COMFY_RENAMING_MAP)
 print(transformer_builder)
 let Modality = ltx_core_model_transformer_modality.Modality
 let transformer = transformer_builder.build(device: "cuda")
@@ -697,7 +1340,7 @@ func LTX2TransformerBlock(
   let attn1Modulations = (0..<6).map {
     Parameter<Float>(.GPU(2), .HWC(1, 1, k * h), name: "attn1_ada_ln_\($0)")
   }
-  let norm = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  let norm = RMSNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   var out =
     norm(vx) .* (1 + (attn1Modulations[1] + timesteps[1])) + (attn1Modulations[0] + timesteps[0])
   let (attn1Reader, attn1) = LTX2SelfAttention(
@@ -1039,7 +1682,7 @@ func LTX2(b: Int, h: Int, w: Int) -> ((PythonObject) -> Void, Model) {
   let scaleShiftModulations = (0..<2).map {
     Parameter<Float>(.GPU(2), .HWC(1, 1, 4096), name: "norm_out_ada_ln_\($0)")
   }
-  let normOut = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
+  let normOut = RMSNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
   if let txEmb = txEmb {
     out = normOut(out) .* (1 + (scaleShiftModulations[1] + txEmb))
       + (scaleShiftModulations[0] + txEmb)

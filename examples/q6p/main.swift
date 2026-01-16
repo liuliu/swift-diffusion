@@ -98,9 +98,9 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         } else {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         }
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
