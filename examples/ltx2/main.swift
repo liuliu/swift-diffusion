@@ -52,10 +52,11 @@ audio_decoder.to(torch.float)
 let decoded_audio = audio_decoder(a)
 audio_encoder.to(torch.float)
 debugPrint(decoded_audio)
-debugPrint(audio_encoder(decoded_audio))
-// vocoder.to(torch.float)
-// debugPrint(vocoder(decoded_audio))
-print(audio_encoder)
+// debugPrint(audio_encoder(decoded_audio))
+vocoder.to(torch.float)
+debugPrint(vocoder(decoded_audio))
+print(vocoder)
+// print(audio_encoder)
 
 func ResnetBlockCausal2D(prefix: String, inChannels: Int, outChannels: Int, shortcut: Bool) -> (
   (PythonObject) -> Void, Model
@@ -250,6 +251,105 @@ func DecoderCausal2D(
   return (reader, Model([x], [out]))
 }
 
+func ResBlock1(prefix: String, channels: Int, kernelSize: Int) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  var out: Model.IO = x
+  var readers = [(PythonObject) -> Void]()
+  for (i, k) in [1, 3, 5].enumerated() {
+    let residual = out
+    out = out.leakyReLU(negativeSlope: 0.1)
+    let conv1 = Convolution(
+      groups: 1, filters: channels, filterSize: [1, kernelSize], dilation: [1, k],
+      hint: Hint(
+        stride: [1, 1],
+        border: Hint.Border(
+          begin: [0, (kernelSize - 1) * k / 2], end: [0, (kernelSize - 1) * k / 2])),
+      name: "resnet_conv1")
+    out = conv1(out)
+    out = out.leakyReLU(negativeSlope: 0.1)
+    let conv2 = Convolution(
+      groups: 1, filters: channels, filterSize: [1, kernelSize],
+      hint: Hint(
+        stride: [1, 1],
+        border: Hint.Border(begin: [0, (kernelSize - 1) / 2], end: [0, (kernelSize - 1) / 2])),
+      name: "resnet_conv2")
+    out = conv2(out) + residual
+    let idx = i
+    readers.append { state_dict in
+      let conv1_weight = state_dict["\(prefix).convs1.\(idx).weight"].to(torch.float).cpu().numpy()
+      let conv1_bias = state_dict["\(prefix).convs1.\(idx).bias"].to(torch.float).cpu().numpy()
+      conv1.weight.copy(from: try! Tensor<Float>(numpy: conv1_weight))
+      conv1.bias.copy(from: try! Tensor<Float>(numpy: conv1_bias))
+      let conv2_weight = state_dict["\(prefix).convs2.\(idx).weight"].to(torch.float).cpu().numpy()
+      let conv2_bias = state_dict["\(prefix).convs2.\(idx).bias"].to(torch.float).cpu().numpy()
+      conv2.weight.copy(from: try! Tensor<Float>(numpy: conv2_weight))
+      conv2.bias.copy(from: try! Tensor<Float>(numpy: conv2_bias))
+    }
+  }
+  let reader: (PythonObject) -> Void = { state_dict in
+    for reader in readers {
+      reader(state_dict)
+    }
+  }
+  return (reader, Model([x], [out]))
+}
+
+func Vocoder(width: Int, layers: [(channels: Int, kernelSize: Int, stride: Int, padding: Int)]) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let convPre = Convolution(
+    groups: 1, filters: 1024, filterSize: [1, 7],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 3], end: [0, 3])), name: "conv_pre")
+  var out = convPre(x)
+  var readers = [(PythonObject) -> Void]()
+  for (i, layer) in layers.enumerated() {
+    out = out.leakyReLU(negativeSlope: 0.1)
+    let up = ConvolutionTranspose(
+      groups: 1, filters: layer.channels, filterSize: [1, layer.kernelSize],
+      hint: Hint(
+        stride: [1, layer.stride],
+        border: Hint.Border(begin: [0, layer.padding], end: [0, layer.padding])), name: "up")
+    out = up(out)
+    let upIdx = i
+    readers.append { state_dict in
+      let ups_weight = state_dict["ups.\(upIdx).weight"].to(torch.float).cpu().numpy()
+      let ups_bias = state_dict["ups.\(upIdx).bias"].to(torch.float).cpu().numpy()
+      up.weight.copy(from: try! Tensor<Float>(numpy: ups_weight))
+      up.bias.copy(from: try! Tensor<Float>(numpy: ups_bias))
+    }
+    let resBlock1 = [
+      ResBlock1(prefix: "resblocks.\(i * 3)", channels: layer.channels, kernelSize: 3),
+      ResBlock1(prefix: "resblocks.\(i * 3 + 1)", channels: layer.channels, kernelSize: 7),
+      ResBlock1(prefix: "resblocks.\(i * 3 + 2)", channels: layer.channels, kernelSize: 11),
+    ]
+    readers.append(resBlock1[0].0)
+    readers.append(resBlock1[1].0)
+    readers.append(resBlock1[2].0)
+    out = (1.0 / 3) * (resBlock1[0].1(out) + resBlock1[1].1(out) + resBlock1[2].1(out))
+  }
+  let convPost = Convolution(
+    groups: 1, filters: 2, filterSize: [1, 7],
+    hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 3], end: [0, 3])), name: "conv_post")
+  out = convPost(out.leakyReLU(negativeSlope: 0.01)).tanh()
+  let reader: (PythonObject) -> Void = { state_dict in
+    let conv_pre_weight = state_dict["conv_pre.weight"].to(torch.float).cpu().numpy()
+    let conv_pre_bias = state_dict["conv_pre.bias"].to(torch.float).cpu().numpy()
+    convPre.weight.copy(from: try! Tensor<Float>(numpy: conv_pre_weight))
+    convPre.bias.copy(from: try! Tensor<Float>(numpy: conv_pre_bias))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let conv_post_weight = state_dict["conv_post.weight"].to(torch.float).cpu().numpy()
+    let conv_post_bias = state_dict["conv_post.bias"].to(torch.float).cpu().numpy()
+    convPost.weight.copy(from: try! Tensor<Float>(numpy: conv_post_weight))
+    convPost.bias.copy(from: try! Tensor<Float>(numpy: conv_post_bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
 graph.withNoGrad {
   let audio_vae_decoder_state_dict = audio_decoder.state_dict()
   var aTensor = graph.variable(try! Tensor<Float>(numpy: a.to(torch.float).cpu().numpy())).toGPU(1)
@@ -264,23 +364,32 @@ graph.withNoGrad {
   decoderReader(audio_vae_decoder_state_dict)
   let mel = decoder(inputs: aTensor)[0].as(of: Float.self)
   debugPrint(mel)
+  let vocoder_state_dict = vocoder.state_dict()
+  let (vocoderReader, vocoder) = Vocoder(
+    width: 481,
+    layers: [
+      (channels: 512, kernelSize: 16, stride: 6, padding: 5),
+      (channels: 256, kernelSize: 15, stride: 5, padding: 5),
+      (channels: 128, kernelSize: 8, stride: 2, padding: 3),
+      (channels: 64, kernelSize: 4, stride: 2, padding: 1),
+      (channels: 32, kernelSize: 4, stride: 2, padding: 1),
+    ])
+  let voIn = mel.transposed(2, 3).reshaped(.NCHW(1, 128, 1, 481))
+  vocoder.compile(inputs: voIn)
+  vocoderReader(vocoder_state_dict)
+  debugPrint(vocoder(inputs: voIn))
   let audio_vae_encoder_state_dict = audio_encoder.state_dict()
   let (encoderReader, encoder) = EncoderCausal2D(
     channels: [128, 256, 512], numRepeat: 2, startWidth: 16, startHeight: 121)
   encoder.compile(inputs: mel)
   encoderReader(audio_vae_encoder_state_dict)
-  debugPrint(encoder(inputs: mel)[0].as(of: Float.self))
-  /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/ltx_2_video_vae_f32.ckpt") {
-    $0.write("decoder", model: decoder)
-    $0.write("encoder", model: encoder)
-    $0.write("mean", variable: mean)
-    $0.write("std", variable: std)
+  encoder(inputs: mel)[0].as(of: Float.self)
+  graph.openStore("/home/liu/workspace/swift-diffusion/ltx_2_audio_video_vae_f32.ckpt") {
+    $0.write("audio_decoder", model: decoder)
+    $0.write("audio_encoder", model: encoder)
+    $0.write("vocoder", model: vocoder)
   }
-  */
 }
-
-exit(0)
 
 let ltx_core_model_transformer_model_configurator = Python.import(
   "ltx_core.model.transformer.model_configurator")
@@ -670,14 +779,10 @@ graph.withNoGrad {
   let norm =
     (x[0..<1, 0..<128, 0..<16, 0..<16, 0..<24].contiguous() - mean) .* Functional.reciprocal(std)
   debugPrint(norm)
-  /*
-  graph.openStore("/home/liu/workspace/swift-diffusion/ltx_2_video_vae_f32.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/ltx_2_audio_video_vae_f32.ckpt") {
     $0.write("decoder", model: decoder)
     $0.write("encoder", model: encoder)
-    $0.write("mean", variable: mean)
-    $0.write("std", variable: std)
   }
-  */
 }
 
 exit(0)
