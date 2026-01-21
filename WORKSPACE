@@ -1,17 +1,11 @@
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository", "new_git_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
-local_repository(
-    name = "ccv",
-    path = "/home/liu/workspace/ccv"
-)
-
-local_repository(
+git_repository(
     name = "s4nnc",
-    path = "/home/liu/workspace/s4nnc"
-    # commit = "9acc996c790bbb93da4dafce06edc5dd471476f2",
-    # remote = "https://github.com/liuliu/s4nnc.git",
-    # shallow_since = "1765583871 -0500",
+    commit = "02a26aba4e536bdee7a91c6e765e5d8b161431b0",
+    remote = "https://github.com/liuliu/s4nnc.git",
+    shallow_since = "1768936955 -0500",
 )
 
 load("@s4nnc//:deps.bzl", "s4nnc_deps")

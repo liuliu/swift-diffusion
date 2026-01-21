@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/fast/Data/flux_2_klein_base_9b_f16.ckpt", flags: [.readOnly]
+  "/home/liu/workspace/swift-diffusion/ltx_2_19b_distilled_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/fast/Data/flux_2_klein_base_9b_q6p.ckpt",
+    "/home/liu/workspace/swift-diffusion/ltx_2_19b_distilled_q8p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -98,9 +98,9 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         } else {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
         }
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
