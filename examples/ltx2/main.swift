@@ -12,12 +12,31 @@ let graph = DynamicGraph()
 
 graph.maxConcurrency = .limit(1)
 
+let sys = Python.import("sys")
+let osPath = Python.import("os.path")
+let site = Python.import("site")
+let userSitePackages = site.getusersitepackages()
+if (Bool(osPath.isdir(userSitePackages)) ?? false)
+  && (Bool(sys.path.__contains__(userSitePackages)) ?? false) == false
+{
+  sys.path.insert(0, userSitePackages)
+}
+let systemDistPackages = "/usr/lib/python3/dist-packages"
+if (Bool(osPath.isdir(systemDistPackages)) ?? false)
+  && (Bool(sys.path.__contains__(systemDistPackages)) ?? false) == false
+{
+  sys.path.insert(0, systemDistPackages)
+}
+
 let torch = Python.import("torch")
-let PIL = Python.import("PIL")
+let json = Python.import("json")
+let safetensors = Python.import("safetensors")
+let safetensors_torch = Python.import("safetensors.torch")
 
 torch.set_grad_enabled(false)
 
-let torch_device = torch.device("cuda")
+let hasCUDA = Bool(torch.cuda.is_available()) ?? false
+let torch_device = hasCUDA ? torch.device("cuda") : torch.device("cpu")
 
 let random = Python.import("random")
 let numpy = Python.import("numpy")
@@ -25,13 +44,187 @@ let numpy = Python.import("numpy")
 random.seed(42)
 numpy.random.seed(42)
 torch.manual_seed(42)
-torch.cuda.manual_seed_all(42)
+if hasCUDA {
+  torch.cuda.manual_seed_all(42)
+}
+
+let freshLTX2CorePath = "/home/liu/workspace/ltx2/LTX-2/packages/ltx-core/src"
+if (Bool(sys.path.__contains__(freshLTX2CorePath)) ?? false) == false {
+  sys.path.insert(0, freshLTX2CorePath)
+}
+
+let ltx_core_model_upsampler_model_configurator = Python.import(
+  "ltx_core.model.upsampler.model_configurator")
+
+func LTX2SpatialResBlock3D(
+  prefix: String, channels: Int, depth: Int, height: Int, width: Int
+) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let conv1 = Convolution(
+    groups: 1, filters: channels, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [1, 1, 1], end: [1, 1, 1])),
+    name: "conv1")
+  var out = conv1(x)
+  let norm1 = GroupNorm(axis: 0, groups: 32, epsilon: 1e-5, reduce: [1, 2, 3], name: "norm1")
+  out = norm1(out.reshaped([channels, depth, height, width])).reshaped([
+    1, channels, depth, height, width,
+  ])
+  out = out.swish()
+  let conv2 = Convolution(
+    groups: 1, filters: channels, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [1, 1, 1], end: [1, 1, 1])),
+    name: "conv2")
+  out = conv2(out)
+  let norm2 = GroupNorm(axis: 0, groups: 32, epsilon: 1e-5, reduce: [1, 2, 3], name: "norm2")
+  out = norm2(out.reshaped([channels, depth, height, width])).reshaped([
+    1, channels, depth, height, width,
+  ])
+  out = (out + x).swish()
+  let reader: (PythonObject) -> Void = { state_dict in
+    let conv1Weight = state_dict["\(prefix).conv1.weight"].to(torch.float).cpu().numpy()
+    let conv1Bias = state_dict["\(prefix).conv1.bias"].to(torch.float).cpu().numpy()
+    conv1.weight.copy(from: try! Tensor<Float>(numpy: conv1Weight))
+    conv1.bias.copy(from: try! Tensor<Float>(numpy: conv1Bias))
+    let norm1Weight = state_dict["\(prefix).norm1.weight"].to(torch.float).cpu().numpy()
+    let norm1Bias = state_dict["\(prefix).norm1.bias"].to(torch.float).cpu().numpy()
+    norm1.weight.copy(from: try! Tensor<Float>(numpy: norm1Weight))
+    norm1.bias.copy(from: try! Tensor<Float>(numpy: norm1Bias))
+    let conv2Weight = state_dict["\(prefix).conv2.weight"].to(torch.float).cpu().numpy()
+    let conv2Bias = state_dict["\(prefix).conv2.bias"].to(torch.float).cpu().numpy()
+    conv2.weight.copy(from: try! Tensor<Float>(numpy: conv2Weight))
+    conv2.bias.copy(from: try! Tensor<Float>(numpy: conv2Bias))
+    let norm2Weight = state_dict["\(prefix).norm2.weight"].to(torch.float).cpu().numpy()
+    let norm2Bias = state_dict["\(prefix).norm2.bias"].to(torch.float).cpu().numpy()
+    norm2.weight.copy(from: try! Tensor<Float>(numpy: norm2Weight))
+    norm2.bias.copy(from: try! Tensor<Float>(numpy: norm2Bias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+func LTX2SpatialUpscaler3D(
+  inChannels: Int, midChannels: Int, numBlocks: Int, depth: Int, height: Int, width: Int
+) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let initialConv = Convolution(
+    groups: 1, filters: midChannels, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [1, 1, 1], end: [1, 1, 1])),
+    name: "initial_conv")
+  var out = initialConv(x)
+  let initialNorm = GroupNorm(
+    axis: 0, groups: 32, epsilon: 1e-5, reduce: [1, 2, 3], name: "initial_norm")
+  out = initialNorm(out.reshaped([midChannels, depth, height, width])).reshaped([
+    1, midChannels, depth, height, width,
+  ])
+  out = out.swish()
+  var readers = [(PythonObject) -> Void]()
+  for i in 0..<numBlocks {
+    let (reader, block) = LTX2SpatialResBlock3D(
+      prefix: "res_blocks.\(i)", channels: midChannels, depth: depth, height: height, width: width)
+    out = block(out)
+    readers.append(reader)
+  }
+  // This checkpoint uses rational_resampler=True with scale=2.0.
+  // In LTX-2 this is Conv2d + pixel shuffle + blur_down(stride=1), where blur_down is a no-op.
+  let upsampleConv = Convolution(
+    groups: 1, filters: midChannels * 4, filterSize: [1, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [0, 1, 1], end: [0, 1, 1])),
+    name: "upsampler_conv")
+  out = upsampleConv(out)
+  out = out.reshaped([1, midChannels, 2, 2, depth, height, width]).permuted(
+    0, 1, 4, 5, 2, 6, 3
+  ).contiguous()
+  out = out.reshaped([1, midChannels, depth, height * 2, width * 2])
+  for i in 0..<numBlocks {
+    let (reader, block) = LTX2SpatialResBlock3D(
+      prefix: "post_upsample_res_blocks.\(i)", channels: midChannels, depth: depth,
+      height: height * 2, width: width * 2)
+    out = block(out)
+    readers.append(reader)
+  }
+  let finalConv = Convolution(
+    groups: 1, filters: inChannels, filterSize: [3, 3, 3],
+    hint: Hint(stride: [1, 1, 1], border: Hint.Border(begin: [1, 1, 1], end: [1, 1, 1])),
+    name: "final_conv")
+  out = finalConv(out)
+  let reader: (PythonObject) -> Void = { state_dict in
+    let initialConvWeight = state_dict["initial_conv.weight"].to(torch.float).cpu().numpy()
+    let initialConvBias = state_dict["initial_conv.bias"].to(torch.float).cpu().numpy()
+    initialConv.weight.copy(from: try! Tensor<Float>(numpy: initialConvWeight))
+    initialConv.bias.copy(from: try! Tensor<Float>(numpy: initialConvBias))
+    let initialNormWeight = state_dict["initial_norm.weight"].to(torch.float).cpu().numpy()
+    let initialNormBias = state_dict["initial_norm.bias"].to(torch.float).cpu().numpy()
+    initialNorm.weight.copy(from: try! Tensor<Float>(numpy: initialNormWeight))
+    initialNorm.bias.copy(from: try! Tensor<Float>(numpy: initialNormBias))
+    for reader in readers {
+      reader(state_dict)
+    }
+    let upsampleConvWeight = state_dict["upsampler.conv.weight"].to(torch.float).unsqueeze(2).cpu()
+      .numpy()
+    let upsampleConvBias = state_dict["upsampler.conv.bias"].to(torch.float).cpu().numpy()
+    upsampleConv.weight.copy(from: try! Tensor<Float>(numpy: upsampleConvWeight))
+    upsampleConv.bias.copy(from: try! Tensor<Float>(numpy: upsampleConvBias))
+    let finalConvWeight = state_dict["final_conv.weight"].to(torch.float).cpu().numpy()
+    let finalConvBias = state_dict["final_conv.bias"].to(torch.float).cpu().numpy()
+    finalConv.weight.copy(from: try! Tensor<Float>(numpy: finalConvWeight))
+    finalConv.bias.copy(from: try! Tensor<Float>(numpy: finalConvBias))
+  }
+  return (reader, Model([x], [out]))
+}
+
+let spatialUpscalerPath =
+  "/home/liu/workspace/swift-diffusion/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+let upsamplerConfig = json.loads(
+  safetensors.safe_open(spatialUpscalerPath, framework: "pt", device: "cpu").metadata()["config"])
+let spatialUpscaler = ltx_core_model_upsampler_model_configurator.LatentUpsamplerConfigurator
+  .from_config(upsamplerConfig)
+let spatialUpscalerStateDict = safetensors_torch.load_file(spatialUpscalerPath, device: "cpu")
+_ = spatialUpscaler.load_state_dict(spatialUpscalerStateDict, strict: false)
+spatialUpscaler.to(torch_device)
+spatialUpscaler.eval()
+spatialUpscaler.to(torch.float)
+let inChannels = Int(spatialUpscaler.in_channels)!
+let midChannels = Int(spatialUpscaler.mid_channels)!
+let numBlocks = Int(spatialUpscaler.num_blocks_per_stage)!
+let rationalResampler = Bool(spatialUpscaler.rational_resampler)!
+let spatialScale = Double(spatialUpscaler.spatial_scale)!
+precondition(rationalResampler && abs(spatialScale - 2.0) < 1e-6)
+
+let testDepth = 16
+let testHeight = 16
+let testWidth = 16
+let latent = torch.randn([1, inChannels, testDepth, testHeight, testWidth]).to(torch.float).to(
+  torch_device)
+let upscaled = spatialUpscaler(latent).to(torch.float)
+print("Spatial upscaler input shape: \(latent.shape), output shape: \(upscaled.shape)")
+
+graph.withNoGrad {
+  let latentTensor = graph.variable(try! Tensor<Float>(numpy: latent.to(torch.float).cpu().numpy()))
+    .toGPU(1)
+  let (reader, swiftUpscaler) = LTX2SpatialUpscaler3D(
+    inChannels: inChannels, midChannels: midChannels, numBlocks: numBlocks, depth: testDepth,
+    height: testHeight, width: testWidth)
+  swiftUpscaler.compile(inputs: latentTensor)
+  reader(spatialUpscaler.state_dict())
+  let swiftUpscaled = swiftUpscaler(inputs: latentTensor)[0].as(of: Float.self).toCPU()
+  let torchUpscaled = try! Tensor<Float>(numpy: upscaled.cpu().numpy())
+  print("Swift upscaler output shape: \(swiftUpscaled.shape)")
+  debugPrint(swiftUpscaled[0..<1, 0..<1, 0..<1, 0..<2, 0..<2])
+  debugPrint(torchUpscaled[0..<1, 0..<1, 0..<1, 0..<2, 0..<2])
+  graph.openStore("/home/liu/workspace/swift-diffusion/ltx_2_spatial_upscaler_x2_f32.ckpt") {
+    $0.write("spatial_upsampler", model: swiftUpscaler)
+  }
+  print("Wrote /home/liu/workspace/swift-diffusion/ltx_2_spatial_upscaler_x2_f32.ckpt")
+}
+exit(0)
 
 let ltx_core_loader_single_gpu_model_builder = Python.import(
   "ltx_core.loader.single_gpu_model_builder")
 let ltx_core_model_audio_vae_model_configurator = Python.import(
   "ltx_core.model.audio_vae.model_configurator")
-
 let audio_encoder = ltx_core_loader_single_gpu_model_builder.SingleGPUModelBuilder(
   model_path: "/fast/Data/ltx-2-19b-dev.safetensors",
   model_class_configurator: ltx_core_model_audio_vae_model_configurator.AudioEncoderConfigurator,
