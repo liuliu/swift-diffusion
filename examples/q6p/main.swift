@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/ltx_2_19b_distilled_f16.ckpt", flags: [.readOnly]
+  "/slow/Data/ltx_2_19b_dev_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/home/liu/workspace/swift-diffusion/ltx_2_19b_distilled_q8p.ckpt",
+    "/home/liu/workspace/swift-diffusion/ltx_2_19b_dev_q6p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -40,6 +40,8 @@ graph.openStore(
         || (key.contains("refiner_") && !key.contains("noise_refiner_")
           && !key.contains("context_refiner_"))
         || key.contains("position_embedding") || key.contains("-shared-")
+        || key.contains("_pad_token")  // Z-Image related.
+        || key.contains("_registers") || key.contains("_connector") || key.contains("_extractor")  // LTX-2 related.
       {
         $0.write(key, tensor: tensor)
         continue

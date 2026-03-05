@@ -25,7 +25,7 @@ torch.cuda.manual_seed_all(42)
 let diffusers = Python.import("diffusers")
 
 let pipe = diffusers.ZImagePipeline.from_pretrained(
-  "Tongyi-MAI/Z-Image-Turbo",
+  "Tongyi-MAI/Z-Image",
   torch_dtype: torch.bfloat16,
   low_cpu_mem_usage: false
 )
@@ -470,7 +470,7 @@ func ZImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
   for i in 0..<2 {
     let (block, reader) = ZImageTransformerBlock(
       prefix: "noise_refiner.\(i)", name: "noise_refiner", k: 128, h: 30, b: 1, t: (h * w, h * w),
-      scaleFactor: (4, 8), modulation: true)
+      scaleFactor: (32, 32), modulation: true)
     xOut = block(xOut, xRot, tOut)
     readers.append(reader)
   }
@@ -479,7 +479,7 @@ func ZImage(height: Int, width: Int, textLength: Int, layers: Int) -> (
   for i in 0..<layers {
     let (block, reader) = ZImageTransformerBlock(
       prefix: "layers.\(i)", name: "", k: 128, h: 30, b: 1,
-      t: (h * w + textLength, i == layers - 1 ? h * w : h * w + textLength), scaleFactor: (4, 16),
+      t: (h * w + textLength, i == layers - 1 ? h * w : h * w + textLength), scaleFactor: (32, 32),
       modulation: true)
     out = block(out, rot, tOut)
     readers.append(reader)
@@ -642,7 +642,7 @@ graph.withNoGrad {
   let xPadToken = Tensor<Float16>(from: try! Tensor<Float>(numpy: x_pad_token))
   let capPadToken = Tensor<Float16>(from: try! Tensor<Float>(numpy: cap_pad_token))
   debugPrint(dit(inputs: xTensor, xRotTensorGPU, txtTensor, txtRotTensorGPU, tTensor))
-  graph.openStore("/home/liu/workspace/swift-diffusion/z_image_turbo_f16.ckpt") {
+  graph.openStore("/home/liu/workspace/swift-diffusion/z_image_f16.ckpt") {
     $0.write("dit", model: dit)
     $0.write("x_pad_token", tensor: xPadToken)
     $0.write("cap_pad_token", tensor: capPadToken)

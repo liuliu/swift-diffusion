@@ -357,6 +357,8 @@ graph.withNoGrad {
   let std = graph.variable(try! Tensor<Float>(numpy: audio_vae_decoder_state_dict["per_channel_statistics.std-of-means"].to(torch.float).view(1, -1, 1, 1).cpu().numpy())).toGPU(1)
   let mean = graph.variable(try! Tensor<Float>(numpy: audio_vae_decoder_state_dict["per_channel_statistics.mean-of-means"].to(torch.float).view(1, -1, 1, 1).cpu().numpy())).toGPU(1)
   aTensor = aTensor .* std + mean
+  print(audio_vae_decoder_state_dict["per_channel_statistics.std-of-means"].to(torch.float).view(-1).cpu())
+  print(audio_vae_decoder_state_dict["per_channel_statistics.mean-of-means"].to(torch.float).view(-1).cpu())
   */
   let (decoderReader, decoder) = DecoderCausal2D(
     channels: [128, 256, 512], numRepeat: 3, startWidth: 16, startHeight: 121)
@@ -756,6 +758,11 @@ graph.withNoGrad {
         1, -1, 1, 1, 1
       ).cpu().numpy())
   ).toGPU(1)
+  /*
+  print(vae_decoder_state_dict["per_channel_statistics.std-of-means"].to(torch.float).view(-1).cpu().numpy())
+  print(vae_decoder_state_dict["per_channel_statistics.mean-of-means"].to(torch.float).view(-1).cpu().numpy())
+  exit(0)
+  */
   var zTensor = graph.variable(try! Tensor<Float>(numpy: z.to(torch.float).cpu().numpy())).toGPU(1)
   zTensor = zTensor .* std + mean
   let (decoderReader, decoder) = DecoderCausal3D(
