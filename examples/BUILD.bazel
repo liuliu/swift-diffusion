@@ -1213,3 +1213,19 @@ swift_binary(
         "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )
+
+swift_binary(
+    name = "ltx23",
+    srcs = ["ltx23/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+        "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
