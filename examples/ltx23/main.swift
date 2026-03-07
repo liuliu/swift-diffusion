@@ -657,17 +657,66 @@ func AMPResBlock1(
   return (reader, Model([x], [out]))
 }
 
-func Vocoder(
-  prefix: String, width: Int, initialChannels: Int,
-  layers: [(channels: Int, kernelSize: Int, stride: Int, padding: Int)], resblockKernelSizes: [Int],
-  resblockDilations: [[Int]], useAMP: Bool, activation: String, useBiasAtFinal: Bool,
-  applyFinalActivation: Bool, useTanhAtFinal: Bool, name: String
-) -> (
+enum LTX23VocoderVariant {
+  case core
+  case bwe
+}
+
+let ltx23VocoderResblockKernelSizes = [3, 7, 11]
+let ltx23VocoderResblockDilations = [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
+let ltx23CoreVocoderInitialChannels = 1536
+let ltx23CoreVocoderLayers: [(channels: Int, kernelSize: Int, stride: Int, padding: Int)] = [
+  (channels: 768, kernelSize: 11, stride: 5, padding: 3),
+  (channels: 384, kernelSize: 4, stride: 2, padding: 1),
+  (channels: 192, kernelSize: 4, stride: 2, padding: 1),
+  (channels: 96, kernelSize: 4, stride: 2, padding: 1),
+  (channels: 48, kernelSize: 4, stride: 2, padding: 1),
+  (channels: 24, kernelSize: 4, stride: 2, padding: 1),
+]
+let ltx23BWEVocoderInitialChannels = 512
+let ltx23BWEVocoderLayers: [(channels: Int, kernelSize: Int, stride: Int, padding: Int)] = [
+  (channels: 256, kernelSize: 12, stride: 6, padding: 3),
+  (channels: 128, kernelSize: 11, stride: 5, padding: 3),
+  (channels: 64, kernelSize: 4, stride: 2, padding: 1),
+  (channels: 32, kernelSize: 4, stride: 2, padding: 1),
+  (channels: 16, kernelSize: 4, stride: 2, padding: 1),
+]
+let ltx23VocoderHopLength = 80
+let ltx23VocoderNFFT = 512
+let ltx23VocoderNMelChannels = 64
+let ltx23BWEResampleRatio = 3
+let ltx23BWEResampleKernelSize = 43
+let ltx23BWEResamplePad = 7
+let ltx23BWEResamplePadLeft = 42
+
+func Vocoder(width: Int, variant: LTX23VocoderVariant) -> (
   (PythonObject) -> Void, Model
 ) {
-  precondition(useAMP)
-  precondition(activation == "snakebeta")
-  precondition(resblockKernelSizes.count == resblockDilations.count)
+  let prefix: String
+  let name: String
+  let initialChannels: Int
+  let layers: [(channels: Int, kernelSize: Int, stride: Int, padding: Int)]
+  let useBiasAtFinal: Bool
+  let applyFinalActivation: Bool
+  let useTanhAtFinal: Bool
+  switch variant {
+  case .core:
+    prefix = "vocoder"
+    name = ""
+    initialChannels = ltx23CoreVocoderInitialChannels
+    layers = ltx23CoreVocoderLayers
+    useBiasAtFinal = false
+    applyFinalActivation = true
+    useTanhAtFinal = false
+  case .bwe:
+    prefix = "bwe_generator"
+    name = "bwe"
+    initialChannels = ltx23BWEVocoderInitialChannels
+    layers = ltx23BWEVocoderLayers
+    useBiasAtFinal = false
+    applyFinalActivation = false
+    useTanhAtFinal = false
+  }
   let x = Input()
   let convPre = Convolution(
     groups: 1, filters: initialChannels, filterSize: [1, 7],
@@ -693,11 +742,11 @@ func Vocoder(
       up.bias.copy(from: try! Tensor<Float>(numpy: upsBias))
     }
     var blockOutputs = [Model.IO]()
-    for (j, kernelSize) in resblockKernelSizes.enumerated() {
-      let blockIndex = i * resblockKernelSizes.count + j
+    for (j, kernelSize) in ltx23VocoderResblockKernelSizes.enumerated() {
+      let blockIndex = i * ltx23VocoderResblockKernelSizes.count + j
       let (blockReader, block) = AMPResBlock1(
         prefix: "\(prefix).resblocks.\(blockIndex)", channels: layer.channels, width: currentWidth,
-        kernelSize: kernelSize, dilations: resblockDilations[j], name: name)
+        kernelSize: kernelSize, dilations: ltx23VocoderResblockDilations[j], name: name)
       readers.append(blockReader)
       blockOutputs.append(block(out))
     }
@@ -741,18 +790,7 @@ func Vocoder(
   return (reader, Model([x], [out]))
 }
 
-func VocoderWithBWE(
-  inputMelWidth: Int, melBins: Int, coreInitialChannels: Int,
-  coreLayers: [(channels: Int, kernelSize: Int, stride: Int, padding: Int)],
-  coreResblockKernelSizes: [Int], coreResblockDilations: [[Int]], coreUseAMP: Bool,
-  coreActivation: String, coreUseBiasAtFinal: Bool, coreApplyFinalActivation: Bool,
-  coreUseTanhAtFinal: Bool, bweInitialChannels: Int,
-  bweLayers: [(channels: Int, kernelSize: Int, stride: Int, padding: Int)],
-  bweResblockKernelSizes: [Int], bweResblockDilations: [[Int]], bweUseAMP: Bool,
-  bweActivation: String, bweUseBiasAtFinal: Bool, bweApplyFinalActivation: Bool,
-  bweUseTanhAtFinal: Bool, nFFT: Int, hopLength: Int, nMelChannels: Int, resampleRatio: Int,
-  resampleKernelSize: Int, resamplePad: Int, resamplePadLeft: Int, resamplePadRight: Int
-) -> (
+func VocoderWithBWE(inputMelWidth: Int, melBins: Int) -> (
   (PythonObject) -> Void, Model
 ) {
   let x = Input()  // [1, 2, T, mel_bins]
@@ -761,72 +799,68 @@ func VocoderWithBWE(
     [1, 2 * melBins, 1, inputMelWidth], offset: [0, 0, 0, 0],
     strides: [2 * melBins * inputMelWidth, inputMelWidth, inputMelWidth, 1]
   ).contiguous()  // [1, 128, 1, T]
-  let (coreReader, coreVocoder) = Vocoder(
-    prefix: "vocoder", width: inputMelWidth, initialChannels: coreInitialChannels,
-    layers: coreLayers,
-    resblockKernelSizes: coreResblockKernelSizes, resblockDilations: coreResblockDilations,
-    useAMP: coreUseAMP, activation: coreActivation, useBiasAtFinal: coreUseBiasAtFinal,
-    applyFinalActivation: coreApplyFinalActivation, useTanhAtFinal: coreUseTanhAtFinal, name: "")
+  let (coreReader, coreVocoder) = Vocoder(width: inputMelWidth, variant: .core)
   let coreOut = coreVocoder(coreInput)  // [1, 2, 1, coreWidth]
-  let coreWidth = inputMelWidth * coreLayers.reduce(1) { $0 * $1.stride }
-  let remainder = coreWidth % hopLength
-  let corePad = remainder == 0 ? 0 : (hopLength - remainder)
+  let coreWidth = inputMelWidth * ltx23CoreVocoderLayers.reduce(1) { $0 * $1.stride }
+  let remainder = coreWidth % ltx23VocoderHopLength
+  let corePad = remainder == 0 ? 0 : (ltx23VocoderHopLength - remainder)
   let paddedCoreWidth = coreWidth + corePad
-  let bweInputWidth = paddedCoreWidth / hopLength
+  let bweInputWidth = paddedCoreWidth / ltx23VocoderHopLength
   var paddedCoreOut = coreOut
   if corePad > 0 {
     paddedCoreOut = coreOut.padded(.zero, begin: [0, 0, 0, 0], end: [0, 0, 0, corePad])
   }
-  let nFreqs = nFFT / 2 + 1
-  let leftPad = max(0, nFFT - hopLength)
+  let nFreqs = ltx23VocoderNFFT / 2 + 1
+  let leftPad = max(0, ltx23VocoderNFFT - ltx23VocoderHopLength)
   let stft = Convolution(
-    groups: 1, filters: nFreqs * 2, filterSize: [1, nFFT], noBias: true,
-    hint: Hint(stride: [1, hopLength]), name: "mel_stft_forward")
+    groups: 1, filters: nFreqs * 2, filterSize: [1, ltx23VocoderNFFT], noBias: true,
+    hint: Hint(stride: [1, ltx23VocoderHopLength]), name: "mel_stft_forward")
   var stftInput = paddedCoreOut.reshaped([2, 1, 1, paddedCoreWidth])
   stftInput = stftInput.padded(.zero, begin: [0, 0, 0, leftPad], end: [0, 0, 0, 0])
   let stftOut = stft(stftInput)  // [2, 2*nFreqs, 1, T_frames]
   let stftParts = stftOut.chunked(2, axis: 1)
   let magnitude = ((stftParts[0] .* stftParts[0]) + (stftParts[1] .* stftParts[1])).squareRoot()
   let melProjection = Convolution(
-    groups: 1, filters: nMelChannels, filterSize: [1, 1], noBias: true,
+    groups: 1, filters: ltx23VocoderNMelChannels, filterSize: [1, 1], noBias: true,
     hint: Hint(stride: [1, 1]), name: "mel_projection")
   var mel = melProjection(magnitude).clamped(1e-5...).log()
   mel = mel.reshaped(
-    [1, 2, nMelChannels, bweInputWidth], offset: [0, 0, 0, 0],
-    strides: [2 * nMelChannels * bweInputWidth, nMelChannels * bweInputWidth, bweInputWidth, 1]
+    [1, 2, ltx23VocoderNMelChannels, bweInputWidth], offset: [0, 0, 0, 0],
+    strides: [
+      2 * ltx23VocoderNMelChannels * bweInputWidth, ltx23VocoderNMelChannels * bweInputWidth,
+      bweInputWidth, 1,
+    ]
   ).contiguous()  // [1, 2, mel_bins, T_frames]
   let bweInput = mel.reshaped(
-    [1, 2 * nMelChannels, 1, bweInputWidth], offset: [0, 0, 0, 0],
-    strides: [2 * nMelChannels * bweInputWidth, bweInputWidth, bweInputWidth, 1]
+    [1, 2 * ltx23VocoderNMelChannels, 1, bweInputWidth], offset: [0, 0, 0, 0],
+    strides: [
+      2 * ltx23VocoderNMelChannels * bweInputWidth, bweInputWidth, bweInputWidth, 1,
+    ]
   ).contiguous()  // [1, 128, 1, T_frames]
-  let (bweReader, bweGenerator) = Vocoder(
-    prefix: "bwe_generator", width: bweInputWidth, initialChannels: bweInitialChannels,
-    layers: bweLayers,
-    resblockKernelSizes: bweResblockKernelSizes, resblockDilations: bweResblockDilations,
-    useAMP: bweUseAMP, activation: bweActivation, useBiasAtFinal: bweUseBiasAtFinal,
-    applyFinalActivation: bweApplyFinalActivation, useTanhAtFinal: bweUseTanhAtFinal, name: "bwe")
+  let (bweReader, bweGenerator) = Vocoder(width: bweInputWidth, variant: .bwe)
   let residual = bweGenerator(bweInput)  // [1, 2, 1, coreWidth * ratio]
   let resampler = ConvolutionTranspose(
-    groups: 1, filters: 1, filterSize: [1, resampleKernelSize], noBias: true,
-    hint: Hint(stride: [1, resampleRatio]), name: "bwe_resampler")
+    groups: 1, filters: 1, filterSize: [1, ltx23BWEResampleKernelSize], noBias: true,
+    hint: Hint(stride: [1, ltx23BWEResampleRatio]), name: "bwe_resampler")
   let resampleRawWidth =
-    (paddedCoreWidth + 2 * resamplePad - 1) * resampleRatio + resampleKernelSize
+    (paddedCoreWidth + 2 * ltx23BWEResamplePad - 1) * ltx23BWEResampleRatio
+    + ltx23BWEResampleKernelSize
   var skip = paddedCoreOut.reshaped([2, 1, 1, paddedCoreWidth]).padded(
-    .replicate, begin: [0, 0, 0, resamplePad], end: [0, 0, 0, resamplePad])
-  skip = Float(resampleRatio) * resampler(skip)
+    .replicate, begin: [0, 0, 0, ltx23BWEResamplePad], end: [0, 0, 0, ltx23BWEResamplePad])
+  skip = Float(ltx23BWEResampleRatio) * resampler(skip)
   skip = skip.reshaped(
-    [2, 1, 1, paddedCoreWidth * resampleRatio], offset: [0, 0, 0, resamplePadLeft],
+    [2, 1, 1, paddedCoreWidth * ltx23BWEResampleRatio], offset: [0, 0, 0, ltx23BWEResamplePadLeft],
     strides: [resampleRawWidth, resampleRawWidth, resampleRawWidth, 1]
   ).contiguous()
-  skip = skip.reshaped([1, 2, 1, paddedCoreWidth * resampleRatio])
+  skip = skip.reshaped([1, 2, 1, paddedCoreWidth * ltx23BWEResampleRatio])
   var out = (residual + skip).clamped(-1...1)
-  let outputLength = coreWidth * resampleRatio
-  if outputLength != paddedCoreWidth * resampleRatio {
+  let outputLength = coreWidth * ltx23BWEResampleRatio
+  if outputLength != paddedCoreWidth * ltx23BWEResampleRatio {
     out = out.reshaped(
       [1, 2, 1, outputLength], offset: [0, 0, 0, 0],
       strides: [
-        2 * paddedCoreWidth * resampleRatio, paddedCoreWidth * resampleRatio,
-        paddedCoreWidth * resampleRatio, 1,
+        2 * paddedCoreWidth * ltx23BWEResampleRatio, paddedCoreWidth * ltx23BWEResampleRatio,
+        paddedCoreWidth * ltx23BWEResampleRatio, 1,
       ]
     ).contiguous()
   }
@@ -840,9 +874,8 @@ func VocoderWithBWE(
       .numpy()
     melProjection.weight.copy(from: try! Tensor<Float>(numpy: melWeight))
     let resamplerWeight = hannUpSample1dFilterWeight(
-      ratio: resampleRatio, kernelSize: resampleKernelSize)
+      ratio: ltx23BWEResampleRatio, kernelSize: ltx23BWEResampleKernelSize)
     resampler.weight.copy(from: resamplerWeight)
-    _ = resamplePadRight
   }
   return (reader, Model([x], [out]))
 }
@@ -1004,6 +1037,77 @@ func maxAbsDiff5D(_ swiftTensor: DynamicGraph.Tensor<Float>, _ torchTensor: Tens
   return maxDiff
 }
 
+let runVocoderParityOnly =
+  (ProcessInfo.processInfo.environment["LTX23_VOCODER_PARITY_ONLY"] ?? "") == "1"
+if runVocoderParityOnly {
+  print("vocoder parity: start")
+  let audioVocoderStateDict = audio_vocoder.state_dict()
+  precondition(Int(audio_vocoder.hop_length)! == ltx23VocoderHopLength)
+  precondition(Int(audio_vocoder.resampler.ratio)! == ltx23BWEResampleRatio)
+  precondition(Int(audio_vocoder.resampler.kernel_size)! == ltx23BWEResampleKernelSize)
+  precondition(
+    Int(audioVocoderStateDict["mel_stft.stft_fn.forward_basis"].shape[2])! == ltx23VocoderNFFT)
+  precondition(
+    Int(audioVocoderStateDict["mel_stft.mel_basis"].shape[0])! == ltx23VocoderNMelChannels)
+  audio_vocoder.to(torch.float)
+  audio_vocoder.eval()
+  graph.withNoGrad {
+    let pythonModelDevice = audio_vocoder.vocoder.conv_pre.weight.device
+    let testCoreMel = torch.randn([1, 2, 481, 64]).to(torch.float).to(pythonModelDevice)
+    let torchCoreOut = audio_vocoder.vocoder(testCoreMel)
+    let coreInputWidth = Int(testCoreMel.shape[2])!
+    let (coreReader, swiftCoreVocoder) = Vocoder(width: coreInputWidth, variant: .core)
+    let coreSwiftInputTorch = testCoreMel.transpose(2, 3).reshape([1, 128, 1, coreInputWidth])
+    let coreSwiftInputCPU = graph.variable(
+      try! Tensor<Float>(numpy: coreSwiftInputTorch.to(torch.float).cpu().numpy()))
+    let coreSwiftInput = coreSwiftInputCPU.toGPU(swiftDevice)
+    swiftCoreVocoder.compile(inputs: coreSwiftInput)
+    coreReader(audioVocoderStateDict)
+    let swiftCoreOut = swiftCoreVocoder(inputs: coreSwiftInput)[0].as(of: Float.self).toCPU()
+    let torchCoreTensor = try! Tensor<Float>(numpy: torchCoreOut.to(torch.float).cpu().numpy())
+    print("core vocoder max abs diff:", maxAbsDiffVocoder(swiftCoreOut, torchCoreTensor))
+
+    var coreForBWE = torchCoreOut
+    let coreRemainder = Int(coreForBWE.shape[2])! % ltx23VocoderHopLength
+    if coreRemainder != 0 {
+      coreForBWE = torch.nn.functional.pad(coreForBWE, [0, ltx23VocoderHopLength - coreRemainder])
+    }
+    let melForBWE = audio_vocoder._compute_mel(coreForBWE).transpose(2, 3)
+    let torchBWEResidual = audio_vocoder.bwe_generator(melForBWE)
+    let bweInputWidth = Int(melForBWE.shape[2])!
+    let (bweReader, swiftBWEGenerator) = Vocoder(width: bweInputWidth, variant: .bwe)
+    let bweSwiftInputTorch = melForBWE.transpose(2, 3).reshape([1, 128, 1, bweInputWidth])
+    let bweSwiftInputCPU = graph.variable(
+      try! Tensor<Float>(numpy: bweSwiftInputTorch.to(torch.float).cpu().numpy()))
+    let bweSwiftInput = bweSwiftInputCPU.toGPU(swiftDevice)
+    swiftBWEGenerator.compile(inputs: bweSwiftInput)
+    bweReader(audioVocoderStateDict)
+    let swiftBWEOut = swiftBWEGenerator(inputs: bweSwiftInput)[0].as(of: Float.self).toCPU()
+    let torchBWETensor = try! Tensor<Float>(numpy: torchBWEResidual.to(torch.float).cpu().numpy())
+    print("bwe generator max abs diff:", maxAbsDiffVocoder(swiftBWEOut, torchBWETensor))
+
+    let inputMelWidth = Int(testCoreMel.shape[2])!
+    let melBins = Int(testCoreMel.shape[3])!
+    let (vocoderWithBWEReader, swiftVocoderWithBWE) = VocoderWithBWE(
+      inputMelWidth: inputMelWidth, melBins: melBins)
+    let fullSwiftInputCPU = graph.variable(
+      try! Tensor<Float>(numpy: testCoreMel.to(torch.float).cpu().numpy()))
+    let fullSwiftInput = fullSwiftInputCPU.toGPU(swiftDevice)
+    swiftVocoderWithBWE.compile(inputs: fullSwiftInput)
+    vocoderWithBWEReader(audioVocoderStateDict)
+    let swiftVocoderWithBWEOut = swiftVocoderWithBWE(inputs: fullSwiftInput)[0].as(of: Float.self)
+      .toCPU()
+    let torchVocoderWithBWEOut = audio_vocoder(testCoreMel)
+    let torchVocoderWithBWETensor = try! Tensor<Float>(
+      numpy: torchVocoderWithBWEOut.to(torch.float).cpu().numpy())
+    print(
+      "vocoder_with_bwe max abs diff:",
+      maxAbsDiffVocoder(swiftVocoderWithBWEOut, torchVocoderWithBWETensor))
+  }
+  print("vocoder parity: done")
+  exit(0)
+}
+
 let ltx_core_model_transformer_model_configurator = Python.import(
   "ltx_core.model.transformer.model_configurator")
 let ltx_core_text_encoders_gemma_encoders_av_encoder = Python.None
@@ -1025,29 +1129,6 @@ let ltx_core_conditioning = Python.import("ltx_core.conditioning")  // legacy se
   var exportedVideoEncoder: Model? = nil
 
   print("audio vae + vocoder parity: start")
-  let ltxMetadata = safetensors.safe_open(ltx23ModelPath, framework: "pt", device: "cpu").metadata()
-  let ltxConfig = json.loads(ltxMetadata["config"])
-  let vocoderConfig = ltxConfig["vocoder"]
-  let coreVocoderConfig = vocoderConfig["vocoder"]
-  let bweConfig = vocoderConfig["bwe"]
-  let coreVocoderLayers = vocoderLayers(from: coreVocoderConfig)
-  let bweVocoderLayers = vocoderLayers(from: bweConfig)
-  let coreResblockKernelSizes = intArray(from: coreVocoderConfig["resblock_kernel_sizes"])
-  let coreResblockDilations = intMatrix(from: coreVocoderConfig["resblock_dilation_sizes"])
-  let coreInitialChannels = Int(coreVocoderConfig["upsample_initial_channel"])!
-  let coreUseAMP = (String(coreVocoderConfig["resblock"]) ?? "") == "AMP1"
-  let coreActivation = String(coreVocoderConfig["activation"]) ?? "snake"
-  let coreUseBiasAtFinal = boolConfig(coreVocoderConfig, key: "use_bias_at_final", default: true)
-  let coreApplyFinalActivation = boolConfig(coreVocoderConfig, key: "apply_final_activation", default: true)
-  let coreUseTanhAtFinal = boolConfig(coreVocoderConfig, key: "use_tanh_at_final", default: true)
-  let bweResblockKernelSizes = intArray(from: bweConfig["resblock_kernel_sizes"])
-  let bweResblockDilations = intMatrix(from: bweConfig["resblock_dilation_sizes"])
-  let bweInitialChannels = Int(bweConfig["upsample_initial_channel"])!
-  let bweUseAMP = (String(bweConfig["resblock"]) ?? "") == "AMP1"
-  let bweActivation = String(bweConfig["activation"]) ?? "snake"
-  let bweUseBiasAtFinal = boolConfig(bweConfig, key: "use_bias_at_final", default: true)
-  let bweApplyFinalActivation = boolConfig(bweConfig, key: "apply_final_activation", default: true)
-  let bweUseTanhAtFinal = boolConfig(bweConfig, key: "use_tanh_at_final", default: true)
   let audioVocoderStateDict = audio_vocoder.state_dict()
 
   audio_vocoder.to(torch.float)
@@ -1119,11 +1200,7 @@ graph.withNoGrad {
   let testCoreMel = torch.randn([1, 2, 481, 64]).to(torch.float).to(pythonModelDevice)
   let torchCoreOut = audio_vocoder.vocoder(testCoreMel)
   let coreInputWidth = Int(testCoreMel.shape[2])!
-  let (coreReader, swiftCoreVocoder) = Vocoder(
-    prefix: "vocoder", width: coreInputWidth, initialChannels: coreInitialChannels, layers: coreVocoderLayers,
-    resblockKernelSizes: coreResblockKernelSizes, resblockDilations: coreResblockDilations,
-    useAMP: coreUseAMP, activation: coreActivation, useBiasAtFinal: coreUseBiasAtFinal,
-    applyFinalActivation: coreApplyFinalActivation, useTanhAtFinal: coreUseTanhAtFinal, name: "")
+  let (coreReader, swiftCoreVocoder) = Vocoder(width: coreInputWidth, variant: .core)
   let coreSwiftInputTorch = testCoreMel.transpose(2, 3).reshape([1, 128, 1, coreInputWidth])
   let coreSwiftInputCPU = graph.variable(
     try! Tensor<Float>(numpy: coreSwiftInputTorch.to(torch.float).cpu().numpy()))
@@ -1134,20 +1211,15 @@ graph.withNoGrad {
   let torchCoreTensor = try! Tensor<Float>(numpy: torchCoreOut.to(torch.float).cpu().numpy())
   print("core vocoder max abs diff:", maxAbsDiffVocoder(swiftCoreOut, torchCoreTensor))
 
-  let hopLength = Int(audio_vocoder.hop_length)!
   var coreForBWE = torchCoreOut
-  let coreRemainder = Int(coreForBWE.shape[2])! % hopLength
+  let coreRemainder = Int(coreForBWE.shape[2])! % ltx23VocoderHopLength
   if coreRemainder != 0 {
-    coreForBWE = torch.nn.functional.pad(coreForBWE, [0, hopLength - coreRemainder])
+    coreForBWE = torch.nn.functional.pad(coreForBWE, [0, ltx23VocoderHopLength - coreRemainder])
   }
   let melForBWE = audio_vocoder._compute_mel(coreForBWE).transpose(2, 3)
   let torchBWEResidual = audio_vocoder.bwe_generator(melForBWE)
   let bweInputWidth = Int(melForBWE.shape[2])!
-  let (bweReader, swiftBWEGenerator) = Vocoder(
-    prefix: "bwe_generator", width: bweInputWidth, initialChannels: bweInitialChannels, layers: bweVocoderLayers,
-    resblockKernelSizes: bweResblockKernelSizes, resblockDilations: bweResblockDilations,
-    useAMP: bweUseAMP, activation: bweActivation, useBiasAtFinal: bweUseBiasAtFinal,
-    applyFinalActivation: bweApplyFinalActivation, useTanhAtFinal: bweUseTanhAtFinal, name: "bwe")
+  let (bweReader, swiftBWEGenerator) = Vocoder(width: bweInputWidth, variant: .bwe)
   let bweSwiftInputTorch = melForBWE.transpose(2, 3).reshape([1, 128, 1, bweInputWidth])
   let bweSwiftInputCPU = graph.variable(
     try! Tensor<Float>(numpy: bweSwiftInputTorch.to(torch.float).cpu().numpy()))
@@ -1160,25 +1232,8 @@ graph.withNoGrad {
 
   let inputMelWidth = Int(testCoreMel.shape[2])!
   let melBins = Int(testCoreMel.shape[3])!
-  let nFFT = Int(audioVocoderStateDict["mel_stft.stft_fn.forward_basis"].shape[2])!
-  let nMelChannels = Int(audioVocoderStateDict["mel_stft.mel_basis"].shape[0])!
-  let resampleRatio = Int(audio_vocoder.resampler.ratio)!
-  let resampleKernelSize = Int(audio_vocoder.resampler.kernel_size)!
-  let resamplePad = Int(audio_vocoder.resampler.pad)!
-  let resamplePadLeft = Int(audio_vocoder.resampler.pad_left)!
-  let resamplePadRight = Int(audio_vocoder.resampler.pad_right)!
   let (vocoderWithBWEReader, swiftVocoderWithBWE) = VocoderWithBWE(
-    inputMelWidth: inputMelWidth, melBins: melBins, coreInitialChannels: coreInitialChannels,
-    coreLayers: coreVocoderLayers, coreResblockKernelSizes: coreResblockKernelSizes,
-    coreResblockDilations: coreResblockDilations, coreUseAMP: coreUseAMP, coreActivation: coreActivation,
-    coreUseBiasAtFinal: coreUseBiasAtFinal, coreApplyFinalActivation: coreApplyFinalActivation,
-    coreUseTanhAtFinal: coreUseTanhAtFinal, bweInitialChannels: bweInitialChannels, bweLayers: bweVocoderLayers,
-    bweResblockKernelSizes: bweResblockKernelSizes, bweResblockDilations: bweResblockDilations,
-    bweUseAMP: bweUseAMP, bweActivation: bweActivation, bweUseBiasAtFinal: bweUseBiasAtFinal,
-    bweApplyFinalActivation: bweApplyFinalActivation, bweUseTanhAtFinal: bweUseTanhAtFinal, nFFT: nFFT,
-    hopLength: hopLength, nMelChannels: nMelChannels, resampleRatio: resampleRatio,
-    resampleKernelSize: resampleKernelSize, resamplePad: resamplePad, resamplePadLeft: resamplePadLeft,
-    resamplePadRight: resamplePadRight)
+    inputMelWidth: inputMelWidth, melBins: melBins)
   let fullSwiftInputCPU = graph.variable(
     try! Tensor<Float>(numpy: testCoreMel.to(torch.float).cpu().numpy()))
   let fullSwiftInput = fullSwiftInputCPU.toGPU(swiftDevice)

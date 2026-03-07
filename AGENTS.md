@@ -133,6 +133,14 @@ These notes capture what worked for `examples/ltx2` (LTX-2 spatial upscaler) and
   - BWE generator (`config.vocoder.bwe`):
     - `use_bias_at_final=false`
     - `apply_final_activation=false` (no tanh/clamp).
+- `VocoderWithBWE` resampler constants are computed in Python (`UpSample1d(window_type="hann")`):
+  - `ratio = output_sampling_rate // input_sampling_rate`
+  - `width = ceil(lowpass_filter_width / rolloff)` with `lowpass_filter_width=6`, `rolloff=0.99`
+  - `kernel_size = 2 * width * ratio + 1`
+  - `pad = width`
+  - `pad_left = 2 * width * ratio`
+  - `pad_right = kernel_size - ratio`
+  - LTX-2.3 values (`input=16000`, `output=48000`): `ratio=3`, `width=7`, `kernel_size=43`, `pad=7`, `pad_left=42`, `pad_right=40`.
 - Current parity status in `examples/ltx23/main.swift` early-exit block:
   - Core vocoder: max-abs diff `4.196167e-05`.
   - BWE generator: max-abs diff `5.5576675e-07`.
