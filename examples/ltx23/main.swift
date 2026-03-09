@@ -2742,7 +2742,8 @@ func LTX2SelfAttention(prefix: String, k: Int, h: Int, b: Int, t: Int, name: Str
 }
 
 func LTX2CrossAttention(
-  prefix: String, k: (Int, Int, Int), h: Int, b: Int, t: (Int, Int), name: String
+  prefix: String, k: (Int, Int, Int), h: Int, b: Int, t: (Int, Int), name: String,
+  useRotary: Bool = true
 ) -> ((PythonObject) -> Void, Model) {
   let x = Input()
   let context = Input()
@@ -2759,8 +2760,14 @@ func LTX2CrossAttention(
   let normQ = RMSNorm(epsilon: 1e-6, axis: [2], name: "\(name)_norm_q")
   queries = normQ(queries).reshaped([b, t.0, h, k.1])
   let values = toValues(context).reshaped([b, t.1, h, k.1])
-  queries = (1 / Float(k.1).squareRoot().squareRoot()) * Functional.cmul(left: queries, right: rot)
-  keys = (1 / Float(k.1).squareRoot().squareRoot()) * Functional.cmul(left: keys, right: rotK)
+  let attentionScale = 1 / Float(k.1).squareRoot().squareRoot()
+  if useRotary {
+    queries = attentionScale * Functional.cmul(left: queries, right: rot)
+    keys = attentionScale * Functional.cmul(left: keys, right: rotK)
+  } else {
+    queries = attentionScale * queries
+    keys = attentionScale * keys
+  }
   // Now run attention.
   let scaledDotProductAttention = ScaledDotProductAttention(scale: 1, flags: [.Float16])
   var out = scaledDotProductAttention(queries, keys, values).reshaped([b, t.0, h, k.1])
@@ -2823,7 +2830,11 @@ func LTX2CrossAttention(
     normQ.weight.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: norm_q_weight)))
   }
-  return (reader, Model([x, rot, context, rotK], [out]))
+  if useRotary {
+    return (reader, Model([x, rot, context, rotK], [out]))
+  } else {
+    return (reader, Model([x, context], [out]))
+  }
 }
 
 func FeedForward(hiddenSize: Int, intermediateSize: Int, name: String) -> (Model, Model, Model) {
@@ -2859,7 +2870,7 @@ func LTX2TransformerBlock(
     prefix: "\(prefix).attn1", k: k, h: h, b: b, t: hw, name: "x")
   out = vx + attn1(out.to(.Float16), rot).to(of: vx) .* (attn1Modulations[2] + timesteps[2])
   let (attn2Reader, attn2) = LTX2CrossAttention(
-    prefix: "\(prefix).attn2", k: (k, k, k), h: h, b: b, t: (hw, t), name: "cv")
+    prefix: "\(prefix).attn2", k: (k, k, k), h: h, b: b, t: (hw, t), name: "cv", useRotary: false)
   let promptTimesteps = (0..<2).map { _ in Input() }
   let promptScaleShiftModulations = (0..<2).map {
     Parameter<Float>(.GPU(1), .HWC(1, 1, k * h), name: "prompt_scale_shift_ada_ln_\($0)")
@@ -2871,7 +2882,7 @@ func LTX2TransformerBlock(
   let cvScale = (promptScaleShiftModulations[1] + promptTimesteps[1]).to(.Float16)
   let cvShift = (promptScaleShiftModulations[0] + promptTimesteps[0]).to(.Float16)
   let cvScaled = cv .* (1 + cvScale) + cvShift
-  out = out + attn2(normOutScaled.to(.Float16), rot, cvScaled.to(.Float16), rotC).to(of: out)
+  out = out + attn2(normOutScaled.to(.Float16), cvScaled.to(.Float16)).to(of: out)
     .* (attn1Modulations[8] + timesteps[8])
   let audioTimesteps = (0..<9).map { _ in Input() }
   let audioAttn1Modulations = (0..<9).map {
@@ -2885,7 +2896,8 @@ func LTX2TransformerBlock(
   aOut = ax + audioAttn1(aOut.to(.Float16), rotA).to(of: ax)
     .* (audioAttn1Modulations[2] + audioTimesteps[2])
   let (audioAttn2Reader, audioAttn2) = LTX2CrossAttention(
-    prefix: "\(prefix).audio_attn2", k: (k / 2, k / 2, k / 2), h: h, b: b, t: (a, t), name: "ca")
+    prefix: "\(prefix).audio_attn2", k: (k / 2, k / 2, k / 2), h: h, b: b, t: (a, t), name: "ca",
+    useRotary: false)
   let audioPromptTimesteps = (0..<2).map { _ in Input() }
   let audioPromptScaleShiftModulations = (0..<2).map {
     Parameter<Float>(.GPU(1), .HWC(1, 1, k / 2 * h), name: "audio_prompt_scale_shift_ada_ln_\($0)")
@@ -2898,7 +2910,7 @@ func LTX2TransformerBlock(
   let caShift = (audioPromptScaleShiftModulations[0] + audioPromptTimesteps[0]).to(.Float16)
   let caScaled = ca .* (1 + caScale) + caShift
   aOut =
-    aOut + audioAttn2(normAOutScaled.to(.Float16), rotA, caScaled.to(.Float16), rotAC).to(of: aOut)
+    aOut + audioAttn2(normAOutScaled.to(.Float16), caScaled.to(.Float16)).to(of: aOut)
     .* (audioAttn1Modulations[8] + audioTimesteps[8])
   let vxNorm3 = norm(out)
   let axNorm3 = norm(aOut)
