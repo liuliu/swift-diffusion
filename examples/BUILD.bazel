@@ -1229,3 +1229,16 @@ swift_binary(
         "@swift-sentencepiece//:swift-sentencepiece",
     ],
 )
+
+swift_binary(
+    name = "anima",
+    srcs = ["anima/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)

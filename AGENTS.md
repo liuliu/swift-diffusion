@@ -16,6 +16,9 @@ These notes capture what worked for `examples/ltx2` (LTX-2 spatial upscaler) and
   - insert `site.getusersitepackages()` into `sys.path` when missing.
   - insert `/usr/lib/python3/dist-packages` into `sys.path` when missing (needed for modules like `setuptools` transitively required by `triton`/`ltx_core` imports).
 - Keep optional/heavy imports below early `exit(0)` when iterating on one submodel to avoid unrelated dependency failures.
+- For CUDA-related work in this repo, prefer running direct Python probes, parity binaries, and other GPU executions **outside the sandbox**.
+  - Sandboxed runs can report misleading CUDA failures such as `cuInit(0) = 100` / `cudaErrorNoDevice` even when unrestricted runs see all GPUs normally.
+  - If a CUDA / PyTorch / ccv issue appears suspicious, rerun the same command unrestricted before drawing conclusions.
 
 ## 3) Swift model parity rules (must match PyTorch op order)
 
@@ -45,10 +48,23 @@ These notes capture what worked for `examples/ltx2` (LTX-2 spatial upscaler) and
 
 ## 6) Validation-before-export checklist
 
+- Numeric parity checks are **mandatory** for every model conversion in this repo.
+  - Do this per converted submodel first (for example: text encoder, adapter / connector, diffusion model, VAE pieces).
+  - Then do an end-to-end parity check for the active exported unit when feasible.
+  - Do not treat a conversion as complete just because it builds, runs, or writes a ckpt.
 - Always run Swift and PyTorch on the same seeded random latent.
 - Confirm output shape equality first.
-- Compare sample values (and ideally full max-abs diff) before writing ckpt.
-- Only export graph (`graph.openStore(...).write(...)`) after numeric parity is confirmed.
+- Compare sample values and record at least max-abs diff before writing ckpt.
+- Prefer also recording relative diff when reference magnitudes vary significantly.
+- After parity passes, ask the user before running the export step.
+- When performing the final export run, rerun the numeric parity check in that same session before writing ckpt when practical.
+- Only export graph (`graph.openStore(...).write(...)`) after numeric parity is confirmed and the user has approved export.
+
+## 6.1) Model config representation
+
+- Prefer to keep model architecture / config values on the Swift side as explicit constants.
+- It is fine to group them into constant structs or tables instead of inlining them, but they should stay easy to inspect in Swift.
+- Do not rely on opaque Python / JSON config reads for core architecture choices during conversion unless there is a specific reason and the user asked for it.
 
 ## 7) Iteration pattern in `examples/ltx2/main.swift`
 

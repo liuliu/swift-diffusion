@@ -215,8 +215,12 @@ func LTX2SpatialUpscaler3D(
     upsampleConv.bias.copy(from: try! Tensor<Float>(numpy: upsampleConvBias))
     if let blurDown = blurDown {
       let blurDownKernel = state_dict["upsampler.blur_down.kernel"].to(torch.float).unsqueeze(2)
-        .repeat([midChannels, 1, 1, 1, 1]).cpu().numpy()
-      blurDown.weight.copy(from: try! Tensor<Float>(numpy: blurDownKernel))
+      // Materialize broadcasted depthwise kernel explicitly for grouped 3D conv weights.
+      let kernelH = Int(blurDownKernel.shape[3])!
+      let kernelW = Int(blurDownKernel.shape[4])!
+      let blurDownKernelExpanded = blurDownKernel.expand([midChannels, 1, 1, kernelH, kernelW])
+        .contiguous()
+      blurDown.weight.copy(from: try! Tensor<Float>(numpy: blurDownKernelExpanded.cpu().numpy()))
       let blurDownBias = torch.zeros([midChannels]).to(torch.float).cpu().numpy()
       blurDown.bias.copy(from: try! Tensor<Float>(numpy: blurDownBias))
     }
@@ -289,15 +293,11 @@ func convertLTX2SpatialUpscaler(
 let testDepth = 16
 let testHeight = 16
 let testWidth = 16
-// Spatial upscaler conversion (kept here for reference while actively working on audio VAE).
-// convertLTX2SpatialUpscaler(
-//   modelPath: "/fast/Data/ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
-//   ckptPath: "/home/liu/workspace/swift-diffusion/ltx_2_3_spatial_upscaler_x2_f32.ckpt",
-//   testDepth: testDepth, testHeight: testHeight, testWidth: testWidth)
-// convertLTX2SpatialUpscaler(
-//   modelPath: "/fast/Data/ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors",
-//   ckptPath: "/home/liu/workspace/swift-diffusion/ltx_2_3_spatial_upscaler_x1_5_f32.ckpt",
-//   testDepth: testDepth, testHeight: testHeight, testWidth: testWidth)
+convertLTX2SpatialUpscaler(
+  modelPath: "/fast/Data/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+  ckptPath: "/home/liu/workspace/swift-diffusion/ltx_2.3_spatial_upscaler_x2_1.1_f32.ckpt",
+  testDepth: testDepth, testHeight: testHeight, testWidth: testWidth)
+exit(0)
 
 let ltx_core_loader_single_gpu_model_builder = Python.import(
   "ltx_core.loader.single_gpu_model_builder")
