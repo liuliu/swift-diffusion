@@ -100,6 +100,10 @@ enum AnimaParityConfig {
   static let timestep: Float = 1
 }
 
+enum AnimaDebugConfig {
+  static let sampleTokenIDs: [Int32] = [64, 5562]
+}
+
 enum AnimaParityThresholds {
   // The Qwen text path is accepted at a looser tolerance than the adapter / DiT.
   static let textMaxAbs: Float = 0.5
@@ -120,6 +124,17 @@ enum AnimaPaths {
     "\(referenceRoot)/llm_adapter/diffusion_pytorch_model.safetensors"
   static let transformerStateDictPath =
     "\(referenceRoot)/transformer/diffusion_pytorch_model.safetensors"
+}
+
+enum AnimaPreview3Paths {
+  static let baseStateDictPath = "\(AnimaPaths.outputRoot)/anima-preview3-base.safetensors"
+  static let mainOutputPath = "\(AnimaPaths.outputRoot)/anima_preview_3_f32.ckpt"
+}
+
+enum AnimaMainDefaults {
+  static let usesPreview3Base = true
+  static let label = "anima preview 3"
+  static let outputPath = AnimaPreview3Paths.mainOutputPath
 }
 
 func validateConfig(sequenceLength: Int, latentHeight: Int, latentWidth: Int) {
@@ -553,6 +568,10 @@ func makeReferenceTextEncoder() -> PythonObject {
 }
 
 func makeReferenceAdapter() -> PythonObject {
+  makeReferenceAdapter(adapterStateDict: adapterStateDict)
+}
+
+func makeReferenceAdapter(adapterStateDict: PythonObject) -> PythonObject {
   let adapterModule = Python.import("modeling_llm_adapter")
   let model = adapterModule.AnimaLLMAdapter(
     source_dim: AnimaAdapterConfig.sourceDimension,
@@ -570,6 +589,10 @@ func makeReferenceAdapter() -> PythonObject {
 }
 
 func makeReferenceTransformer() -> PythonObject {
+  makeReferenceTransformer(transformerStateDict: transformerStateDict)
+}
+
+func makeReferenceTransformer(transformerStateDict: PythonObject) -> PythonObject {
   let diffusersModels = Python.import("diffusers.models")
   let model = diffusersModels.CosmosTransformer3DModel(
     in_channels: AnimaDiTConfig.inChannels,
@@ -598,6 +621,122 @@ func makeReferenceTransformer() -> PythonObject {
   return model
 }
 
+func pythonStateDictKeys(_ stateDict: PythonObject) -> Set<String> {
+  var keys = Set<String>()
+  for keyObject in stateDict.keys() {
+    if let key = String(keyObject) {
+      keys.insert(key)
+    }
+  }
+  return keys
+}
+
+func makePreview3StateDicts() -> (PythonObject, PythonObject) {
+  let combinedStateDict = safetensorsTorch.load_file(AnimaPreview3Paths.baseStateDictPath)
+  let preview3AdapterStateDict = Python.dict()
+  let preview3TransformerStateDict = Python.dict()
+  for keyObject in combinedStateDict.keys() {
+    guard let key = String(keyObject) else { continue }
+    let value = combinedStateDict[keyObject]
+    if key.hasPrefix("net.llm_adapter.") {
+      let remappedKey = String(key.dropFirst("net.llm_adapter.".count))
+      preview3AdapterStateDict[PythonObject(remappedKey)] = value
+      continue
+    }
+    guard key.hasPrefix("net.") else { continue }
+    let remappedKey: String
+    switch key {
+    case "net.x_embedder.proj.1.weight":
+      remappedKey = "patch_embed.proj.weight"
+    case "net.t_embedding_norm.weight":
+      remappedKey = "time_embed.norm.weight"
+    case "net.t_embedder.1.linear_1.weight":
+      remappedKey = "time_embed.t_embedder.linear_1.weight"
+    case "net.t_embedder.1.linear_2.weight":
+      remappedKey = "time_embed.t_embedder.linear_2.weight"
+    case "net.final_layer.adaln_modulation.1.weight":
+      remappedKey = "norm_out.linear_1.weight"
+    case "net.final_layer.adaln_modulation.2.weight":
+      remappedKey = "norm_out.linear_2.weight"
+    case "net.final_layer.linear.weight":
+      remappedKey = "proj_out.weight"
+    default:
+      if key.hasPrefix("net.blocks.") {
+        let blockKey = String(key.dropFirst("net.blocks.".count))
+        let components = blockKey.split(separator: ".", omittingEmptySubsequences: false)
+        precondition(components.count >= 4)
+        let blockIndex = components[0]
+        let scope = components[1]
+        let remainder = components.dropFirst(2).joined(separator: ".")
+        switch (scope, remainder) {
+        case ("self_attn", "q_proj.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn1.to_q.weight"
+        case ("self_attn", "k_proj.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn1.to_k.weight"
+        case ("self_attn", "v_proj.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn1.to_v.weight"
+        case ("self_attn", "output_proj.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn1.to_out.0.weight"
+        case ("self_attn", "q_norm.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn1.norm_q.weight"
+        case ("self_attn", "k_norm.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn1.norm_k.weight"
+        case ("cross_attn", "q_proj.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn2.to_q.weight"
+        case ("cross_attn", "k_proj.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn2.to_k.weight"
+        case ("cross_attn", "v_proj.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn2.to_v.weight"
+        case ("cross_attn", "output_proj.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn2.to_out.0.weight"
+        case ("cross_attn", "q_norm.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn2.norm_q.weight"
+        case ("cross_attn", "k_norm.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).attn2.norm_k.weight"
+        case ("mlp", "layer1.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).ff.net.0.proj.weight"
+        case ("mlp", "layer2.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).ff.net.2.weight"
+        case ("adaln_modulation_self_attn", "1.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).norm1.linear_1.weight"
+        case ("adaln_modulation_self_attn", "2.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).norm1.linear_2.weight"
+        case ("adaln_modulation_cross_attn", "1.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).norm2.linear_1.weight"
+        case ("adaln_modulation_cross_attn", "2.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).norm2.linear_2.weight"
+        case ("adaln_modulation_mlp", "1.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).norm3.linear_1.weight"
+        case ("adaln_modulation_mlp", "2.weight"):
+          remappedKey = "transformer_blocks.\(blockIndex).norm3.linear_2.weight"
+        default:
+          fatalError("Unhandled preview3 transformer key: \(key)")
+        }
+      } else {
+        fatalError("Unhandled preview3 key: \(key)")
+      }
+    }
+    preview3TransformerStateDict[PythonObject(remappedKey)] = value
+  }
+  let referenceAdapterKeys = pythonStateDictKeys(adapterStateDict)
+  let referenceTransformerKeys = pythonStateDictKeys(transformerStateDict)
+  let previewAdapterKeys = pythonStateDictKeys(preview3AdapterStateDict)
+  let previewTransformerKeys = pythonStateDictKeys(preview3TransformerStateDict)
+  precondition(previewAdapterKeys == referenceAdapterKeys)
+  precondition(previewTransformerKeys == referenceTransformerKeys)
+  print(
+    "preview3 mapping sanity: adapter keys", previewAdapterKeys.count, "transformer keys",
+    previewTransformerKeys.count)
+  return (preview3AdapterStateDict, preview3TransformerStateDict)
+}
+
+func makeDefaultMainStateDicts() -> (PythonObject, PythonObject) {
+  if AnimaMainDefaults.usesPreview3Base {
+    return makePreview3StateDicts()
+  }
+  return (adapterStateDict, transformerStateDict)
+}
+
 func requireExportApproval() {
   precondition(
     ProcessInfo.processInfo.environment["ANIMA_ALLOW_EXPORT"] == "1",
@@ -619,7 +758,7 @@ func QwenFeedForward(hiddenSize: Int, intermediateSize: Int, name: String) -> (
   let up = Dense(count: intermediateSize, noBias: true, name: "\(name)_up_proj")
   let down = Dense(count: hiddenSize, noBias: true, name: "\(name)_down_proj")
   let out = down(up(x) .* gate(x).swish())
-  return (gate, down, up, Model([x], [out]))
+  return (gate, down, up, Model([x], [out], name: name))
 }
 
 func manualAttentionNHWC(
@@ -821,14 +960,14 @@ func AdapterCrossAttention(
   let context = Input()
   let queryRot = Input()
   let contextRot = Input()
-  let toKeys = Dense(count: headDimension * heads, noBias: true, name: "k_proj")
-  let toQueries = Dense(count: headDimension * heads, noBias: true, name: "q_proj")
-  let toValues = Dense(count: headDimension * heads, noBias: true, name: "v_proj")
+  let toKeys = Dense(count: headDimension * heads, noBias: true, name: "c_k_proj")
+  let toQueries = Dense(count: headDimension * heads, noBias: true, name: "c_q_proj")
+  let toValues = Dense(count: headDimension * heads, noBias: true, name: "c_v_proj")
   var keys = toKeys(context).reshaped(.NHWC(batchSize, contextLength, heads, headDimension))
-  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_k")
+  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_k")
   keys = Functional.cmul(left: normK(keys), right: contextRot)
   var queries = toQueries(x).reshaped(.NHWC(batchSize, tokenLength, heads, headDimension))
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_q")
+  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_q")
   queries = Functional.cmul(left: normQ(queries), right: queryRot)
   let values = toValues(context).reshaped(.NHWC(batchSize, contextLength, heads, headDimension))
   let out = manualAttentionNHWC(
@@ -836,7 +975,7 @@ func AdapterCrossAttention(
     keyLength: contextLength,
     heads: heads, headDimension: headDimension
   ).reshaped([batchSize * tokenLength, queryDim])
-  let unifyHeads = Dense(count: queryDim, noBias: true, name: "out_proj")
+  let unifyHeads = Dense(count: queryDim, noBias: true, name: "c_out_proj")
   let projected = unifyHeads(out)
   let reader: (PythonObject) -> Void = { stateDict in
     toQueries.weight.copy(
@@ -912,7 +1051,7 @@ func AnimaLLMAdapter(tokenLength: Int, contextLength: Int) -> (Model, (PythonObj
     readers.append(reader)
   }
   let outProj = Dense(count: AnimaAdapterConfig.targetDimension, name: "out_proj")
-  let norm = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm")
+  let norm = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm_out")
   out = norm(outProj(out))
   let reader: (PythonObject) -> Void = { stateDict in
     embed.parameters.copy(from: tensorFromPython(stateDict["embed.weight"]))
@@ -927,7 +1066,7 @@ func AnimaLLMAdapter(tokenLength: Int, contextLength: Int) -> (Model, (PythonObj
 }
 
 func CosmosAdaLayerNormZero(
-  prefix: String, hiddenSize: Int, hiddenFeatures: Int
+  prefix: String, hiddenSize: Int, hiddenFeatures: Int, name: String
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let embeddedTimestep = Input()
@@ -935,10 +1074,10 @@ func CosmosAdaLayerNormZero(
   let tembScale = Input()
   let tembGate = Input()
   let norm = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  let linear1 = Dense(count: hiddenFeatures, noBias: true, name: "linear_1")
-  let shift = Dense(count: hiddenSize, noBias: true, name: "shift")
-  let scale = Dense(count: hiddenSize, noBias: true, name: "scale")
-  let gate = Dense(count: hiddenSize, noBias: true, name: "gate")
+  let linear1 = Dense(count: hiddenFeatures, noBias: true, name: "\(name)_linear_1")
+  let shift = Dense(count: hiddenSize, noBias: true, name: "\(name)_shift")
+  let scale = Dense(count: hiddenSize, noBias: true, name: "\(name)_scale")
+  let gate = Dense(count: hiddenSize, noBias: true, name: "\(name)_gate")
   let hidden = linear1(embeddedTimestep.swish())
   let shiftOut = shift(hidden) + tembShift
   let scaleOut = scale(hidden) + tembScale
@@ -958,7 +1097,7 @@ func CosmosAdaLayerNormZero(
   return (Model([x, embeddedTimestep, tembShift, tembScale, tembGate], [out, gateOut]), reader)
 }
 
-func CosmosAdaLayerNorm(prefix: String, hiddenSize: Int, hiddenFeatures: Int) -> (
+func CosmosAdaLayerNorm(prefix: String, hiddenSize: Int, hiddenFeatures: Int, name: String) -> (
   Model, (PythonObject) -> Void
 ) {
   let x = Input()
@@ -966,9 +1105,9 @@ func CosmosAdaLayerNorm(prefix: String, hiddenSize: Int, hiddenFeatures: Int) ->
   let tembShift = Input()
   let tembScale = Input()
   let norm = LayerNorm(epsilon: 1e-6, axis: [2], elementwiseAffine: false)
-  let linear1 = Dense(count: hiddenFeatures, noBias: true, name: "linear_1")
-  let shift = Dense(count: hiddenSize, noBias: true, name: "shift")
-  let scale = Dense(count: hiddenSize, noBias: true, name: "scale")
+  let linear1 = Dense(count: hiddenFeatures, noBias: true, name: "\(name)_linear_1")
+  let shift = Dense(count: hiddenSize, noBias: true, name: "\(name)_shift")
+  let scale = Dense(count: hiddenSize, noBias: true, name: "\(name)_scale")
   let hidden = linear1(embeddedTimestep.swish())
   let shiftOut = shift(hidden) + tembShift
   let scaleOut = scale(hidden) + tembScale
@@ -1034,16 +1173,16 @@ func CosmosCrossAttention(prefix: String, tokenLength: Int, contextLength: Int) 
 ) {
   let x = Input()
   let context = Input()
-  let toKeys = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "k_proj")
-  let toQueries = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "q_proj")
-  let toValues = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "v_proj")
+  let toKeys = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "c_k_proj")
+  let toQueries = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "c_q_proj")
+  let toValues = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "c_v_proj")
   var keys = toKeys(context).reshaped(
     .NHWC(batchSize, contextLength, AnimaDiTConfig.attentionHeads, AnimaDiTConfig.headDimension))
-  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_k")
+  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_k")
   keys = normK(keys)
   var queries = toQueries(x).reshaped(
     .NHWC(batchSize, tokenLength, AnimaDiTConfig.attentionHeads, AnimaDiTConfig.headDimension))
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_q")
+  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "c_norm_q")
   queries = normQ(queries)
   let values = toValues(context).reshaped(
     .NHWC(batchSize, contextLength, AnimaDiTConfig.attentionHeads, AnimaDiTConfig.headDimension))
@@ -1053,7 +1192,7 @@ func CosmosCrossAttention(prefix: String, tokenLength: Int, contextLength: Int) 
     heads: AnimaDiTConfig.attentionHeads, headDimension: AnimaDiTConfig.headDimension
   ).reshaped(
     [batchSize, tokenLength, AnimaDiTConfig.hiddenSize])
-  let unifyHeads = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "out_proj")
+  let unifyHeads = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "c_out_proj")
   let projected = unifyHeads(out)
   let reader: (PythonObject) -> Void = { stateDict in
     toQueries.weight.copy(from: tensorFromPython(stateDict["\(prefix).to_q.weight"]))
@@ -1091,7 +1230,7 @@ func CosmosTransformerBlock(prefix: String, tokenLength: Int, contextLength: Int
   let rot = Input()
   let (norm1, norm1Reader) = CosmosAdaLayerNormZero(
     prefix: "\(prefix).norm1", hiddenSize: AnimaDiTConfig.hiddenSize,
-    hiddenFeatures: AnimaDiTConfig.adaLoraDimension)
+    hiddenFeatures: AnimaDiTConfig.adaLoraDimension, name: "norm1")
   let norm1Out = norm1(x, embeddedTimestep, tembShift, tembScale, tembGate)
   let (selfAttention, selfAttentionReader) = CosmosSelfAttention(
     prefix: "\(prefix).attn1", tokenLength: tokenLength)
@@ -1101,7 +1240,7 @@ func CosmosTransformerBlock(prefix: String, tokenLength: Int, contextLength: Int
     .* selfAttention(norm1Out[0], rot)
   let (norm2, norm2Reader) = CosmosAdaLayerNormZero(
     prefix: "\(prefix).norm2", hiddenSize: AnimaDiTConfig.hiddenSize,
-    hiddenFeatures: AnimaDiTConfig.adaLoraDimension)
+    hiddenFeatures: AnimaDiTConfig.adaLoraDimension, name: "norm2")
   let norm2Out = norm2(out, embeddedTimestep, tembShift, tembScale, tembGate)
   let (crossAttention, crossAttentionReader) = CosmosCrossAttention(
     prefix: "\(prefix).attn2", tokenLength: tokenLength, contextLength: contextLength)
@@ -1111,7 +1250,7 @@ func CosmosTransformerBlock(prefix: String, tokenLength: Int, contextLength: Int
     .* crossAttention(norm2Out[0], context)
   let (norm3, norm3Reader) = CosmosAdaLayerNormZero(
     prefix: "\(prefix).norm3", hiddenSize: AnimaDiTConfig.hiddenSize,
-    hiddenFeatures: AnimaDiTConfig.adaLoraDimension)
+    hiddenFeatures: AnimaDiTConfig.adaLoraDimension, name: "norm3")
   let norm3Out = norm3(out, embeddedTimestep, tembShift, tembScale, tembGate)
   let (feedForward, feedForwardReader) = CosmosFeedForward(prefix: "\(prefix).ff")
   out =
@@ -1142,7 +1281,7 @@ func CosmosTransformer(latentHeight: Int, latentWidth: Int, textLength: Int) -> 
   let context = Input()
   let timestepProjection = Input()
   let rot = Input()
-  let patchEmbed = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "patch_embed")
+  let patchEmbed = Dense(count: AnimaDiTConfig.hiddenSize, noBias: true, name: "x_embedder")
   let paddedHiddenStates = Functional.concat(
     axis: 1, hiddenStates, paddingMask.reshaped([batchSize, 1, 1, latentHeight, latentWidth]))
   var out = paddedHiddenStates.reshaped(
@@ -1172,7 +1311,7 @@ func CosmosTransformer(latentHeight: Int, latentWidth: Int, textLength: Int) -> 
   }
   let (normOut, normOutReader) = CosmosAdaLayerNorm(
     prefix: "norm_out", hiddenSize: AnimaDiTConfig.hiddenSize,
-    hiddenFeatures: AnimaDiTConfig.adaLoraDimension)
+    hiddenFeatures: AnimaDiTConfig.adaLoraDimension, name: "norm_out")
   out = normOut(out, embeddedTimestep, tembShift, tembScale)
   let projOut = Dense(count: AnimaDiTConfig.projOutChannels, noBias: true, name: "proj_out")
   out = projOut(out).reshaped(
@@ -1262,20 +1401,66 @@ func runTextParity(tokenLength: Int = AnimaParityConfig.maxSequenceLength) -> Bo
   }
 }
 
+func runTextProbe(tokenIDs: [Int32] = AnimaDebugConfig.sampleTokenIDs) {
+  graph.withNoGrad {
+    print("anima text probe: start")
+    let tokenLength = tokenIDs.count
+    let tokenIDsTorch = torch.tensor([tokenIDs.map { Int($0) }], dtype: torch.int64)
+    let expected: Tensor<Float> = {
+      var referenceModel = makeReferenceTextEncoder()
+      let referenceOutputs = referenceModel(input_ids: tokenIDsTorch)
+      let expected = try! Tensor<Float>(
+        numpy: referenceOutputs.last_hidden_state.squeeze(0).to(torch.float).cpu().numpy())
+      releasePythonReferenceModel(&referenceModel)
+      return expected
+    }()
+    let (textModel, reader) = Qwen3TextTransformer(tokenLength: tokenLength)
+    let swiftTokensCPU = graph.variable(.CPU, format: .NHWC, shape: [tokenLength], of: Int32.self)
+    for i in 0..<tokenLength {
+      swiftTokensCPU[i] = tokenIDs[i]
+    }
+    let rotCPU = graph.variable(
+      .CPU, format: .NHWC, shape: [1, tokenLength, 1, AnimaTextConfig.headDimension],
+      of: Float.self)
+    let rotValues = makeHalfSplitRotary(
+      tokenLength: tokenLength, headDimension: AnimaTextConfig.headDimension,
+      theta: AnimaTextConfig.ropeTheta)
+    for i in 0..<tokenLength {
+      for j in 0..<AnimaTextConfig.headDimension {
+        rotCPU[0, i, 0, j] = rotValues[0, i, 0, j]
+      }
+    }
+    let swiftTokens = swiftTokensCPU.toGPU(swiftDevice)
+    let rot = DynamicGraph.Tensor<Float16>(from: rotCPU).toGPU(swiftDevice)
+    textModel.compile(inputs: swiftTokens, rot)
+    reader(textStateDict)
+    let swiftOutput = textModel(inputs: swiftTokens, rot)[0].as(of: Float16.self).toCPU()
+    print("anima text probe token ids:", tokenIDs)
+    print("anima text probe swift output")
+    debugPrint(swiftOutput)
+    print("anima text probe reference output")
+    debugPrint(expected)
+    let (maxAbsDiff, relativeDiff) = maxAbsAndRelativeDiff2D(swiftOutput, expected)
+    print("anima text probe max-abs diff:", maxAbsDiff, "relative:", relativeDiff)
+  }
+}
+
 @discardableResult
 func runAdapterParity(
+  adapterStateDict: PythonObject = adapterStateDict,
+  label: String = "anima",
   tokenLength: Int = AnimaParityConfig.maxSequenceLength,
   contextLength: Int = AnimaParityConfig.maxSequenceLength
 ) -> Bool {
   return graph.withNoGrad {
-    print("anima adapter parity: start")
+    print("\(label) adapter parity: start")
     DynamicGraph.logLevel = envFlag("ANIMA_VERBOSE_GRAPH") ? .verbose : .none
     let sourceHiddenStatesTorch = torch.randn(
       [batchSize, contextLength, AnimaAdapterConfig.sourceDimension], dtype: torch.float32)
     let targetInputIDsTorch = torch.randint(
       AnimaAdapterConfig.vocabularySize, [batchSize, tokenLength], dtype: torch.int64)
     let expected: Tensor<Float> = {
-      var referenceModel = makeReferenceAdapter()
+      var referenceModel = makeReferenceAdapter(adapterStateDict: adapterStateDict)
       let expected = try! Tensor<Float>(
         numpy: referenceModel(
           source_hidden_states: sourceHiddenStatesTorch, target_input_ids: targetInputIDsTorch
@@ -1314,9 +1499,9 @@ func runAdapterParity(
       inputs: swiftSourceHiddenStates, swiftTargetInputIDs, targetRot, sourceRot)[0]
       .as(of: Float.self)
       .toCPU()
-    print("anima adapter parity shapes:", swiftOutput.shape, expected.shape)
+    print("\(label) adapter parity shapes:", swiftOutput.shape, expected.shape)
     let (maxAbsDiff, relativeDiff) = maxAbsAndRelativeDiff2D(swiftOutput, expected)
-    print("anima adapter max-abs diff:", maxAbsDiff, "relative:", relativeDiff)
+    print("\(label) adapter max-abs diff:", maxAbsDiff, "relative:", relativeDiff)
     return maxAbsDiff <= AnimaParityThresholds.adapterMaxAbs
       && relativeDiff <= AnimaParityThresholds.adapterRelative
   }
@@ -1324,12 +1509,14 @@ func runAdapterParity(
 
 @discardableResult
 func runTransformerParity(
+  transformerStateDict: PythonObject = transformerStateDict,
+  label: String = "anima",
   textLength: Int = AnimaParityConfig.maxSequenceLength,
   latentHeight: Int = AnimaParityConfig.latentHeight,
   latentWidth: Int = AnimaParityConfig.latentWidth
 ) -> Bool {
   return graph.withNoGrad {
-    print("anima dit parity: start")
+    print("\(label) dit parity: start")
     DynamicGraph.logLevel = envFlag("ANIMA_VERBOSE_GRAPH") ? .verbose : .none
     let hiddenStatesTorch = torch.randn(
       [batchSize, AnimaDiTConfig.inChannels, latentFrames, latentHeight, latentWidth],
@@ -1340,7 +1527,7 @@ func runTransformerParity(
       [batchSize, textLength, AnimaDiTConfig.textEmbedDimension], dtype: torch.float32)
     let timestepTorch = torch.tensor([AnimaParityConfig.timestep], dtype: torch.float32)
     let expected: Tensor<Float> = {
-      var referenceModel = makeReferenceTransformer()
+      var referenceModel = makeReferenceTransformer(transformerStateDict: transformerStateDict)
       let expected = try! Tensor<Float>(
         numpy: referenceModel(
           hidden_states: hiddenStatesTorch,
@@ -1393,9 +1580,9 @@ func runTransformerParity(
       inputs: swiftHiddenStates, swiftPaddingMask, swiftContext, timestepProjection, rot)[0]
       .as(of: Float.self)
       .toCPU()
-    print("anima dit parity shapes:", swiftOutput.shape, expected.shape)
+    print("\(label) dit parity shapes:", swiftOutput.shape, expected.shape)
     let (maxAbsDiff, relativeDiff) = maxAbsAndRelativeDiff5D(swiftOutput, expected)
-    print("anima dit max-abs diff:", maxAbsDiff, "relative:", relativeDiff)
+    print("\(label) dit max-abs diff:", maxAbsDiff, "relative:", relativeDiff)
     return maxAbsDiff <= AnimaParityThresholds.ditMaxAbs
       && relativeDiff <= AnimaParityThresholds.ditRelative
   }
@@ -1423,11 +1610,20 @@ func exportTextModel() {
   }
 }
 
-func exportMainModels() {
+func exportMainModels(
+  adapterStateDict: PythonObject = adapterStateDict,
+  transformerStateDict: PythonObject = transformerStateDict,
+  outputPath: String = AnimaPaths.mainOutputPath,
+  label: String = "anima"
+) {
   graph.withNoGrad {
     requireExportApproval()
-    precondition(runAdapterParity(), "Adapter parity must pass before export.")
-    precondition(runTransformerParity(), "DiT parity must pass before export.")
+    precondition(
+      runAdapterParity(adapterStateDict: adapterStateDict, label: label),
+      "Adapter parity must pass before export.")
+    precondition(
+      runTransformerParity(transformerStateDict: transformerStateDict, label: label),
+      "DiT parity must pass before export.")
     let sequenceLength = AnimaExportConfig.maxSequenceLength
     let latentHeight = AnimaExportConfig.latentHeight
     let latentWidth = AnimaExportConfig.latentWidth
@@ -1470,11 +1666,11 @@ func exportMainModels() {
         )))
     dit.compile(inputs: hiddenStates, paddingMask, context, timestepProjection, rot)
     ditReader(transformerStateDict)
-    graph.openStore(AnimaPaths.mainOutputPath) {
+    graph.openStore(outputPath) {
       $0.write("llm_adapter", model: adapter)
       $0.write("dit", model: dit)
     }
-    print("Wrote \(AnimaPaths.mainOutputPath)")
+    print("Wrote \(outputPath)")
   }
 }
 
@@ -1483,22 +1679,80 @@ let mode = CommandLine.arguments.dropFirst().first ?? "parity"
 switch mode {
 case "parity-text":
   if !runTextParity() { exit(2) }
+case "probe-text":
+  runTextProbe()
 case "parity-adapter":
-  if !runAdapterParity() { exit(2) }
+  let (defaultAdapterStateDict, _) = makeDefaultMainStateDicts()
+  if !runAdapterParity(adapterStateDict: defaultAdapterStateDict, label: AnimaMainDefaults.label) {
+    exit(2)
+  }
 case "parity-dit":
-  if !runTransformerParity() { exit(2) }
+  let (_, defaultTransformerStateDict) = makeDefaultMainStateDicts()
+  if !runTransformerParity(
+    transformerStateDict: defaultTransformerStateDict, label: AnimaMainDefaults.label)
+  {
+    exit(2)
+  }
 case "parity":
   if !runTextParity() { exit(2) }
-  if !runAdapterParity() { exit(2) }
-  if !runTransformerParity() { exit(2) }
+  let (defaultAdapterStateDict, defaultTransformerStateDict) = makeDefaultMainStateDicts()
+  if !runAdapterParity(adapterStateDict: defaultAdapterStateDict, label: AnimaMainDefaults.label) {
+    exit(2)
+  }
+  if !runTransformerParity(
+    transformerStateDict: defaultTransformerStateDict, label: AnimaMainDefaults.label)
+  {
+    exit(2)
+  }
+case "preview3-parity-adapter":
+  let (preview3AdapterStateDict, _) = makePreview3StateDicts()
+  if !runAdapterParity(adapterStateDict: preview3AdapterStateDict, label: "anima preview 3") {
+    exit(2)
+  }
+case "preview3-parity-dit":
+  let (_, preview3TransformerStateDict) = makePreview3StateDicts()
+  if !runTransformerParity(
+    transformerStateDict: preview3TransformerStateDict, label: "anima preview 3")
+  {
+    exit(2)
+  }
+case "preview3-parity":
+  let (preview3AdapterStateDict, preview3TransformerStateDict) = makePreview3StateDicts()
+  if !runAdapterParity(adapterStateDict: preview3AdapterStateDict, label: "anima preview 3") {
+    exit(2)
+  }
+  if !runTransformerParity(
+    transformerStateDict: preview3TransformerStateDict, label: "anima preview 3")
+  {
+    exit(2)
+  }
 case "text":
   exportTextModel()
 case "main":
-  exportMainModels()
+  let (defaultAdapterStateDict, defaultTransformerStateDict) = makeDefaultMainStateDicts()
+  exportMainModels(
+    adapterStateDict: defaultAdapterStateDict,
+    transformerStateDict: defaultTransformerStateDict,
+    outputPath: AnimaMainDefaults.outputPath,
+    label: AnimaMainDefaults.label)
 case "all":
   exportTextModel()
-  exportMainModels()
+  let (defaultAdapterStateDict, defaultTransformerStateDict) = makeDefaultMainStateDicts()
+  exportMainModels(
+    adapterStateDict: defaultAdapterStateDict,
+    transformerStateDict: defaultTransformerStateDict,
+    outputPath: AnimaMainDefaults.outputPath,
+    label: AnimaMainDefaults.label)
+case "preview3-main":
+  let (preview3AdapterStateDict, preview3TransformerStateDict) = makePreview3StateDicts()
+  exportMainModels(
+    adapterStateDict: preview3AdapterStateDict,
+    transformerStateDict: preview3TransformerStateDict,
+    outputPath: AnimaPreview3Paths.mainOutputPath,
+    label: "anima preview 3")
 default:
-  fputs("Usage: anima [parity-text|parity-adapter|parity-dit|parity|text|main|all]\n", stderr)
+  fputs(
+    "Usage: anima [parity-text|probe-text|parity-adapter|parity-dit|parity|text|main|all|preview3-parity-adapter|preview3-parity-dit|preview3-parity|preview3-main]\n",
+    stderr)
   exit(1)
 }

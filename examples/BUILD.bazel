@@ -1199,6 +1199,20 @@ swift_binary(
 )
 
 swift_binary(
+    name = "ernie_image",
+    srcs = ["ernie_image/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "ltx2",
     srcs = ["ltx2/main.swift"],
     data = [
@@ -1227,6 +1241,23 @@ swift_binary(
         "@s4nnc//nnc",
         "@s4nnc//nnc:nnc_python",
         "@swift-sentencepiece//:swift-sentencepiece",
+    ],
+)
+
+swift_binary(
+    name = "seedvr2",
+    srcs = ["seedvr2/main.swift"],
+    data = [
+        "seedvr2/apex/__init__.py",
+        "seedvr2/apex/normalization.py",
+        "seedvr2/reference.py",
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
     ],
 )
 
