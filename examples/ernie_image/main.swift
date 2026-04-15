@@ -107,6 +107,10 @@ let prompt =
   ?? "A poster on a city wall shows the words ERNIE IMAGE TURBO in large white letters."
 let textReferenceTorchDType: PythonObject = torch.bfloat16
 let exportModels = ProcessInfo.processInfo.environment["ERNIE_IMAGE_EXPORT"] == "1"
+let exportTextModel =
+  ProcessInfo.processInfo.environment["ERNIE_IMAGE_EXPORT_TEXT"] != "0"
+let exportDitModel =
+  ProcessInfo.processInfo.environment["ERNIE_IMAGE_EXPORT_DIT"] != "0"
 let textExportPath =
   ProcessInfo.processInfo.environment["ERNIE_IMAGE_TEXT_EXPORT_PATH"]
   ?? "/home/liu/workspace/swift-diffusion/ernie_image_turbo_text_model_f16.ckpt"
@@ -235,6 +239,66 @@ func diffusersTimestepEmbedding(timestep: Float, embeddingSize: Int, maxPeriod: 
     embedding[i + half] = cos(value)
   }
   return embedding
+}
+
+func Ministral3YaRNAttentionFactor(factor: Double, mscale: Double = 1.0, mscaleAllDim: Double = 1.0)
+  -> Double
+{
+  func getMScale(_ scale: Double, _ mscale: Double) -> Double {
+    if scale <= 1 {
+      return 1.0
+    }
+    return 0.1 * mscale * log(scale) + 1.0
+  }
+  return getMScale(factor, mscale) / getMScale(factor, mscaleAllDim)
+}
+
+func Ministral3YaRNRotaryEmbedding<FloatType: TensorNumeric & BinaryFloatingPoint>(
+  sequenceLength: Int, positionOffset: Int = 0, headDim: Int = 128, ropeTheta: Double = 1_000_000.0,
+  factor: Double = 16.0, originalMaxPositionEmbeddings: Double = 16_384.0, betaFast: Double = 32.0,
+  betaSlow: Double = 1.0, mscale: Double = 1.0, mscaleAllDim: Double = 1.0,
+  of dataType: FloatType.Type = FloatType.self
+) -> Tensor<FloatType> {
+  precondition(headDim % 2 == 0)
+
+  func findCorrectionDim(_ numRotations: Double) -> Double {
+    return Double(headDim) * log(originalMaxPositionEmbeddings / (numRotations * 2.0 * .pi))
+      / (2.0 * log(ropeTheta))
+  }
+
+  func linearRampFactor(_ i: Int, min: Double, max: Double) -> Double {
+    if abs(max - min) < 1e-12 {
+      return i < Int(min) ? 0.0 : 1.0
+    }
+    return Swift.min(Swift.max((Double(i) - min) / (max - min), 0.0), 1.0)
+  }
+
+  let attentionFactor = Ministral3YaRNAttentionFactor(
+    factor: factor, mscale: mscale, mscaleAllDim: mscaleAllDim)
+  let low = Swift.max(floor(findCorrectionDim(betaFast)), 0.0)
+  let high = Swift.min(ceil(findCorrectionDim(betaSlow)), Double(headDim - 1))
+  let halfDim = headDim / 2
+  var invFreq = [Double](repeating: 0, count: halfDim)
+  for k in 0..<halfDim {
+    let posFreq = pow(ropeTheta, Double(k * 2) / Double(headDim))
+    let invFreqExtrapolation = 1.0 / posFreq
+    let invFreqInterpolation = 1.0 / (factor * posFreq)
+    let invFreqExtrapolationFactor = 1.0 - linearRampFactor(k, min: low, max: high)
+    invFreq[k] =
+      invFreqInterpolation * (1.0 - invFreqExtrapolationFactor)
+      + invFreqExtrapolation * invFreqExtrapolationFactor
+  }
+
+  var rotary = Tensor<FloatType>(.CPU, .NHWC(1, sequenceLength, 1, headDim))
+  for i in 0..<sequenceLength {
+    let position = Double(positionOffset + i)
+    for k in 0..<halfDim {
+      let theta = position * invFreq[k]
+      rotary[0, i, 0, k * 2] = FloatType(cos(theta) * attentionFactor)
+      rotary[0, i, 0, k * 2 + 1] = FloatType(sin(theta) * attentionFactor)
+    }
+  }
+  return rotary
 }
 
 func makeErnieImageRotTensor(textLength: Int, height: Int, width: Int)
@@ -624,18 +688,19 @@ let languageModel = textEncoder.language_model
 let textForDit = textOutputs.hidden_states[-2].to(torch.bfloat16)
 let textStateDict = languageModel.state_dict()
 let positionIds = torch.arange(tokenCount, dtype: torch.long).unsqueeze(0).to(torchDevice)
-let dummyHidden = torch.zeros([1, tokenCount, 3_072], dtype: torch.bfloat16).to(torchDevice)
+let dummyHidden = torch.zeros([1, tokenCount, 3_072], dtype: torch.float).to(torchDevice)
 let positionEmbeddings = languageModel.rotary_emb(dummyHidden, positionIds)
 let textCos = try! Tensor<Float>(numpy: positionEmbeddings[0].to(torch.float).cpu().numpy())
 let textSin = try! Tensor<Float>(numpy: positionEmbeddings[1].to(torch.float).cpu().numpy())
 
-let textRotTensor = graph.variable(.CPU, .NHWC(1, tokenCount, 1, 128), of: Float.self)
+var textRotaryReference = Tensor<Float>(.CPU, .NHWC(1, tokenCount, 1, 128))
 for i in 0..<tokenCount {
   for k in 0..<64 {
-    textRotTensor[0, i, 0, k * 2] = textCos[0, i, k]
-    textRotTensor[0, i, 0, k * 2 + 1] = textSin[0, i, k]
+    textRotaryReference[0, i, 0, k * 2] = textCos[0, i, k]
+    textRotaryReference[0, i, 0, k * 2 + 1] = textSin[0, i, k]
   }
 }
+let textRotary = Ministral3YaRNRotaryEmbedding(sequenceLength: tokenCount, of: Float.self)
 
 graph.withNoGrad {
   let tokenIdsTensor = graph.variable(.CPU, format: .NHWC, shape: [tokenCount], of: Int32.self)
@@ -646,18 +711,22 @@ graph.withNoGrad {
   let (textModel, textReader) = MistralTextModel(
     vocabularySize: 131_072, tokenLength: tokenCount, width: 3_072, layers: 26, mlp: 9_216,
     heads: 32, kvHeads: 8, headDim: 128)
-  let textRotTensorGPU = DynamicGraph.Tensor<TextFloatType>(from: textRotTensor).toGPU(0)
+  let textRotTensorGPU = graph.variable(Tensor<TextFloatType>(from: textRotary).toGPU(0))
   textModel.compile(inputs: tokenIdsTensorGPU, textRotTensorGPU)
   textReader(textStateDict)
   let swiftTextOutput = copiedToCPU(
     textModel(inputs: tokenIdsTensorGPU, textRotTensorGPU)[0].as(of: Float.self))
+  print("ERNIE Ministral3 YaRN rotary max abs diff:", maxAbsDiff4D(textRotary, textRotaryReference))
+  print(
+    "ERNIE Ministral3 YaRN rotary max rel diff:",
+    maxRelativeDiff4D(textRotary, textRotaryReference))
   print("ERNIE text encoder token count:", tokenCount)
   print("ERNIE text encoder output shape:", swiftTextOutput.shape)
   print("ERNIE text encoder max abs diff:", maxAbsDiff2D(swiftTextOutput, textFinalOutputReference))
   print(
     "ERNIE text encoder max rel diff:", maxRelativeDiff2D(swiftTextOutput, textFinalOutputReference)
   )
-  if exportModels {
+  if exportModels && exportTextModel {
     graph.openStore(textExportPath) {
       $0.write("text_model", model: textModel)
     }
@@ -703,7 +772,7 @@ if hasErnieImageTransformer {
     print("ERNIE DiT output shape:", swiftDitOutput.shape)
     print("ERNIE DiT max abs diff:", maxAbsDiff4D(swiftDitOutput, ditReference))
     print("ERNIE DiT max rel diff:", maxRelativeDiff4D(swiftDitOutput, ditReference))
-    if exportModels {
+    if exportModels && exportDitModel {
       graph.openStore(ditExportPath) {
         $0.write("dit", model: dit)
       }
