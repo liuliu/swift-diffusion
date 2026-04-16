@@ -106,6 +106,10 @@ let prompt =
   ProcessInfo.processInfo.environment["ERNIE_IMAGE_PROMPT"]
   ?? "A poster on a city wall shows the words ERNIE IMAGE TURBO in large white letters."
 let textReferenceTorchDType: PythonObject = torch.bfloat16
+let ditReferenceDTypeName =
+  ProcessInfo.processInfo.environment["ERNIE_IMAGE_DIT_REFERENCE_DTYPE"] ?? "bfloat16"
+let ditReferenceTorchDType: PythonObject =
+  ditReferenceDTypeName == "float16" ? torch.float16 : torch.bfloat16
 let exportModels = ProcessInfo.processInfo.environment["ERNIE_IMAGE_EXPORT"] == "1"
 let exportTextModel =
   ProcessInfo.processInfo.environment["ERNIE_IMAGE_EXPORT_TEXT"] != "0"
@@ -121,6 +125,10 @@ let torchDevice = torch.device("cuda")
 let isLocalModelPath = Bool(os.path.isdir(modelRoot)) ?? false
 let hasErnieImageTransformer =
   Bool(builtins.hasattr(diffusersModels, "ErnieImageTransformer2DModel")) ?? false
+let ernieImageAttentionScale =
+  Float(ProcessInfo.processInfo.environment["ERNIE_IMAGE_DIT_ATTENTION_SCALE"] ?? "1") ?? 1
+let ernieImageFFNScale =
+  Float(ProcessInfo.processInfo.environment["ERNIE_IMAGE_DIT_FFN_SCALE"] ?? "1") ?? 1
 
 func localOrHubPath(_ subpath: String) -> String {
   if isLocalModelPath {
@@ -225,6 +233,40 @@ func maxRelativeDiff4D(_ lhs: Tensor<Float>, _ rhs: Tensor<Float>) -> Float {
   return maxAbsDiff / max(maxAbsRef, 1e-6)
 }
 
+func hasNaN4D(_ tensor: Tensor<Float>) -> Bool {
+  precondition(tensor.shape.count == 4)
+  for i in 0..<tensor.shape[0] {
+    for j in 0..<tensor.shape[1] {
+      for k in 0..<tensor.shape[2] {
+        for l in 0..<tensor.shape[3] {
+          if Float(tensor[i, j, k, l]).isNaN {
+            return true
+          }
+        }
+      }
+    }
+  }
+  return false
+}
+
+func sampleValues4D(_ tensor: Tensor<Float>, count: Int = 8) -> [Float] {
+  precondition(tensor.shape.count == 4)
+  var values = [Float]()
+  for i in 0..<tensor.shape[0] {
+    for j in 0..<tensor.shape[1] {
+      for k in 0..<tensor.shape[2] {
+        for l in 0..<tensor.shape[3] {
+          values.append(Float(tensor[i, j, k, l]))
+          if values.count >= count {
+            return values
+          }
+        }
+      }
+    }
+  }
+  return values
+}
+
 func diffusersTimestepEmbedding(timestep: Float, embeddingSize: Int, maxPeriod: Int = 10_000)
   -> Tensor<Float>
 {
@@ -301,45 +343,63 @@ func Ministral3YaRNRotaryEmbedding<FloatType: TensorNumeric & BinaryFloatingPoin
   return rotary
 }
 
-func makeErnieImageRotTensor(textLength: Int, height: Int, width: Int)
-  -> DynamicGraph.Tensor<FloatType>
+func makeErnieImageRawRotTensors(textLength: Int, height: Int, width: Int)
+  -> (DynamicGraph.Tensor<FloatType>, DynamicGraph.Tensor<FloatType>)
 {
   let totalTokens = textLength + height * width
-  let rotTensor = graph.variable(.CPU, .NHWC(1, totalTokens, 1, 128), of: Float.self)
-  for i in 0..<textLength {
+  var cosTensor = Tensor<Float>(.CPU, .NHWC(1, totalTokens, 1, 128))
+  var sinTensor = Tensor<Float>(.CPU, .NHWC(1, totalTokens, 1, 128))
+
+  func writeAngles(token: Int, positions: (Double, Double, Double)) {
+    var angles = [Double]()
     for k in 0..<16 {
-      let theta = Double(i) / pow(256.0, Double(k) / 16.0)
-      rotTensor[0, i, 0, k * 2] = Float(cos(theta))
-      rotTensor[0, i, 0, k * 2 + 1] = Float(sin(theta))
+      angles.append(positions.0 / pow(256.0, Double(k * 2) / 32.0))
     }
     for k in 0..<24 {
-      rotTensor[0, i, 0, (k + 16) * 2] = 1
-      rotTensor[0, i, 0, (k + 16) * 2 + 1] = 0
-      rotTensor[0, i, 0, (k + 16 + 24) * 2] = 1
-      rotTensor[0, i, 0, (k + 16 + 24) * 2 + 1] = 0
+      angles.append(positions.1 / pow(256.0, Double(k * 2) / 48.0))
+    }
+    for k in 0..<24 {
+      angles.append(positions.2 / pow(256.0, Double(k * 2) / 48.0))
+    }
+    precondition(angles.count == 64)
+    for k in 0..<64 {
+      let c = Float(cos(angles[k]))
+      let s = Float(sin(angles[k]))
+      cosTensor[0, token, 0, k * 2] = c
+      cosTensor[0, token, 0, k * 2 + 1] = c
+      sinTensor[0, token, 0, k * 2] = s
+      sinTensor[0, token, 0, k * 2 + 1] = s
     }
   }
+
   for y in 0..<height {
     for x in 0..<width {
-      let i = textLength + y * width + x
-      for k in 0..<16 {
-        let theta = Double(textLength) / pow(256.0, Double(k) / 16.0)
-        rotTensor[0, i, 0, k * 2] = Float(cos(theta))
-        rotTensor[0, i, 0, k * 2 + 1] = Float(sin(theta))
-      }
-      for k in 0..<24 {
-        let thetaY = Double(y) / pow(256.0, Double(k) / 24.0)
-        rotTensor[0, i, 0, (k + 16) * 2] = Float(cos(thetaY))
-        rotTensor[0, i, 0, (k + 16) * 2 + 1] = Float(sin(thetaY))
-      }
-      for k in 0..<24 {
-        let thetaX = Double(x) / pow(256.0, Double(k) / 24.0)
-        rotTensor[0, i, 0, (k + 16 + 24) * 2] = Float(cos(thetaX))
-        rotTensor[0, i, 0, (k + 16 + 24) * 2 + 1] = Float(sin(thetaX))
-      }
+      writeAngles(token: y * width + x, positions: (Double(textLength), Double(y), Double(x)))
     }
   }
-  return DynamicGraph.Tensor<FloatType>(from: rotTensor).toGPU(0)
+  for i in 0..<textLength {
+    writeAngles(token: height * width + i, positions: (Double(i), 0, 0))
+  }
+  return (
+    graph.variable(Tensor<FloatType>(from: cosTensor).toGPU(0)),
+    graph.variable(Tensor<FloatType>(from: sinTensor).toGPU(0))
+  )
+}
+
+func ErnieImageApplyRotary(
+  _ x: Model.IO, cos: Model.IO, sin: Model.IO, tokenLength: Int, heads: Int, headDim: Int
+) -> Model.IO {
+  let halfDim = headDim / 2
+  let firstHalf = x.reshaped(
+    [1, tokenLength, heads, halfDim], offset: [0, 0, 0, 0],
+    strides: [tokenLength * heads * headDim, heads * headDim, headDim, 1]
+  ).copied()
+  let secondHalf = x.reshaped(
+    [1, tokenLength, heads, halfDim], offset: [0, 0, 0, halfDim],
+    strides: [tokenLength * heads * headDim, heads * headDim, headDim, 1]
+  ).copied()
+  let rotated = Functional.concat(axis: 3, (-secondHalf).copied(), firstHalf).copied()
+  return x .* cos + rotated .* sin
 }
 
 func TextFeedForward(hiddenSize: Int, intermediateSize: Int, name: String) -> (
@@ -432,7 +492,7 @@ func MistralTextModel(
   let tokens = Input()
   let rot = Input()
   let tokenEmbed = Embedding(
-    TextFloatType.self, vocabularySize: vocabularySize, embeddingSize: width, name: "tok_embeddings"
+    BFloat16.self, vocabularySize: vocabularySize, embeddingSize: width, name: "tok_embeddings"
   )
   var out = tokenEmbed(tokens).to(.Float32)
   var readers = [(PythonObject) -> Void]()
@@ -447,7 +507,7 @@ func MistralTextModel(
   let finalHidden = norm(out).to(.Float32)
   let reader: (PythonObject) -> Void = { state_dict in
     let vocab = state_dict["embed_tokens.weight"].type(torch.float).cpu().numpy()
-    tokenEmbed.parameters.copy(from: Tensor<TextFloatType>(from: try! Tensor<Float>(numpy: vocab)))
+    tokenEmbed.parameters.copy(from: Tensor<BFloat16>(from: try! Tensor<Float>(numpy: vocab)))
     for reader in readers {
       reader(state_dict)
     }
@@ -457,23 +517,35 @@ func MistralTextModel(
   return (Model([tokens, rot], [finalHidden]), reader)
 }
 
-func ErnieImageFeedForward(hiddenSize: Int, intermediateSize: Int, name: String) -> (
+func ErnieImageFeedForward(
+  hiddenSize: Int, intermediateSize: Int, name: String, scaleFactor: Float = 1
+) -> (
   Model, Model, Model, Model
 ) {
   let x = Input()
   let gate = Dense(count: intermediateSize, noBias: true, name: "\(name)_gate_proj")
   let up = Dense(count: intermediateSize, noBias: true, name: "\(name)_up_proj")
   var out = up(x) .* GELU()(gate(x))
+  if scaleFactor > 1 {
+    out = (1 / scaleFactor) * out
+  }
   let down = Dense(count: hiddenSize, noBias: true, name: "\(name)_down_proj")
   out = down(out).to(.Float32)
+  if scaleFactor > 1 {
+    out = scaleFactor * out
+  }
   return (gate, down, up, Model([x], [out]))
 }
 
-func ErnieImageBlock(prefix: String, hiddenSize: Int, k: Int, h: Int, tokenLength: Int) -> (
+func ErnieImageBlock(
+  prefix: String, hiddenSize: Int, k: Int, h: Int, tokenLength: Int, attentionScale: Float = 1,
+  ffnScale: Float = 1
+) -> (
   Model, (PythonObject) -> Void
 ) {
   let x = Input()
-  let rot = Input()
+  let rotCos = Input()
+  let rotSin = Input()
   let shiftMSA = Input()
   let scaleMSA = Input()
   let gateMSA = Input()
@@ -493,21 +565,30 @@ func ErnieImageBlock(prefix: String, hiddenSize: Int, k: Int, h: Int, tokenLengt
   var queries = toqueries(out).reshaped([1, tokenLength, h, k])
   let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_q")
   queries = normQ(queries)
-  let values = tovalues(out).reshaped([1, tokenLength, h, k])
-  queries = Functional.cmul(left: queries, right: rot)
-  keys = Functional.cmul(left: keys, right: rot)
+  var valueIn = out
+  if attentionScale > 1 {
+    valueIn = (1 / attentionScale) * valueIn
+  }
+  let values = tovalues(valueIn).reshaped([1, tokenLength, h, k])
+  queries = ErnieImageApplyRotary(
+    queries, cos: rotCos, sin: rotSin, tokenLength: tokenLength, heads: h, headDim: k)
+  keys = ErnieImageApplyRotary(
+    keys, cos: rotCos, sin: rotSin, tokenLength: tokenLength, heads: h, headDim: k)
   var attentionOut = ScaledDotProductAttention(scale: 1.0 / Float(k).squareRoot())(
     queries, keys, values
   ).reshaped([tokenLength, hiddenSize])
   let attentionOutProj = Dense(count: hiddenSize, noBias: true, name: "o")
   attentionOut = attentionOutProj(attentionOut).to(.Float32)
+  if attentionScale > 1 {
+    attentionOut = attentionScale * attentionOut
+  }
   out = x + gateMSA.to(of: attentionOut) .* attentionOut
 
   let mlpNorm = RMSNorm(epsilon: 1e-6, axis: [1], name: "attention_norm2")
   var mlpIn = mlpNorm(out)
   mlpIn = ((1 + scaleMLP).to(of: mlpIn) .* mlpIn + shiftMLP.to(of: mlpIn)).to(.Float16)
   let (w1, w2, w3, ffn) = ErnieImageFeedForward(
-    hiddenSize: hiddenSize, intermediateSize: 12_288, name: "ffn")
+    hiddenSize: hiddenSize, intermediateSize: 12_288, name: "ffn", scaleFactor: ffnScale)
   let mlpOut = ffn(mlpIn)
   out = out + gateMLP.to(of: mlpOut) .* mlpOut.to(of: out)
 
@@ -516,13 +597,9 @@ func ErnieImageBlock(prefix: String, hiddenSize: Int, k: Int, h: Int, tokenLengt
       .numpy()
     attentionNorm.weight.copy(
       from: Tensor<Float>(from: try! Tensor<Float>(numpy: attentionNormWeight)))
-    let qWeight = state_dict["\(prefix).self_attention.to_q.weight"].type(torch.float).view(
-      h, 2, k / 2, hiddenSize
-    ).transpose(1, 2).cpu().numpy()
+    let qWeight = state_dict["\(prefix).self_attention.to_q.weight"].type(torch.float).cpu().numpy()
     toqueries.weight.copy(from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: qWeight)))
-    let kWeight = state_dict["\(prefix).self_attention.to_k.weight"].type(torch.float).view(
-      h, 2, k / 2, hiddenSize
-    ).transpose(1, 2).cpu().numpy()
+    let kWeight = state_dict["\(prefix).self_attention.to_k.weight"].type(torch.float).cpu().numpy()
     tokeys.weight.copy(from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: kWeight)))
     let vWeight = state_dict["\(prefix).self_attention.to_v.weight"].type(torch.float).cpu().numpy()
     tovalues.weight.copy(from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: vWeight)))
@@ -546,7 +623,7 @@ func ErnieImageBlock(prefix: String, hiddenSize: Int, k: Int, h: Int, tokenLengt
     w2.weight.copy(from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: downWeight)))
   }
   return (
-    Model([x, rot, shiftMSA, scaleMSA, gateMSA, shiftMLP, scaleMLP, gateMLP], [out]),
+    Model([x, rotCos, rotSin, shiftMSA, scaleMSA, gateMSA, shiftMLP, scaleMLP, gateMLP], [out]),
     reader
   )
 }
@@ -554,14 +631,15 @@ func ErnieImageBlock(prefix: String, hiddenSize: Int, k: Int, h: Int, tokenLengt
 func ErnieImageModel(height: Int, width: Int, textLength: Int) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let txt = Input()
-  let rot = Input()
+  let rotCos = Input()
+  let rotSin = Input()
   let t = Input()
 
   let xEmbedder = Convolution(
     groups: 1, filters: 4_096, filterSize: [1, 1],
     hint: Hint(stride: [1, 1], border: Hint.Border(begin: [0, 0], end: [0, 0])),
     name: "x_embedder")
-  var img = xEmbedder(x).permuted(0, 2, 3, 1).reshaped([height * width, 4_096]).to(.Float32)
+  let img = xEmbedder(x).permuted(0, 2, 3, 1).reshaped([height * width, 4_096]).to(.Float32)
   let textProj = Dense(count: 4_096, noBias: true, name: "c_embedder")
   let text = textProj(txt).to(.Float32)
 
@@ -582,8 +660,9 @@ func ErnieImageModel(height: Int, width: Int, textLength: Int) -> (Model, (Pytho
   for i in 0..<36 {
     let (block, reader) = ErnieImageBlock(
       prefix: "layers.\(i)", hiddenSize: 4_096, k: 128, h: 32,
-      tokenLength: height * width + textLength)
-    out = block(out, rot, shiftMSA, scaleMSA, gateMSA, shiftMLP, scaleMLP, gateMLP)
+      tokenLength: height * width + textLength, attentionScale: ernieImageAttentionScale,
+      ffnScale: ernieImageFFNScale)
+    out = block(out, rotCos, rotSin, shiftMSA, scaleMSA, gateMSA, shiftMLP, scaleMLP, gateMLP)
     readers.append(reader)
   }
 
@@ -644,7 +723,7 @@ func ErnieImageModel(height: Int, width: Int, textLength: Int) -> (Model, (Pytho
     let finalBias = state_dict["final_linear.bias"].type(torch.float).cpu().numpy()
     finalLinear.bias.copy(from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: finalBias)))
   }
-  return (Model([x, txt, rot, t], [imageOnly]), reader)
+  return (Model([x, txt, rotCos, rotSin, t], [imageOnly]), reader)
 }
 
 let textEncoder: PythonObject
@@ -663,10 +742,11 @@ var transformer: PythonObject = Python.None
 if hasErnieImageTransformer {
   if isLocalModelPath {
     transformer = diffusersModels.ErnieImageTransformer2DModel.from_pretrained(
-      "\(modelRoot)/transformer", torch_dtype: torch.bfloat16, low_cpu_mem_usage: false)
+      "\(modelRoot)/transformer", torch_dtype: ditReferenceTorchDType, low_cpu_mem_usage: false)
   } else {
     transformer = diffusersModels.ErnieImageTransformer2DModel.from_pretrained(
-      modelRoot, subfolder: "transformer", torch_dtype: torch.bfloat16, low_cpu_mem_usage: false)
+      modelRoot, subfolder: "transformer", torch_dtype: ditReferenceTorchDType,
+      low_cpu_mem_usage: false)
   }
   transformer.eval()
   transformer.to("cuda")
@@ -685,7 +765,7 @@ let textFinalOutputReference = try! Tensor<Float>(
 let textDitConditioningReference = try! Tensor<Float>(
   numpy: textOutputs.hidden_states[-2][0].to(torch.float).cpu().numpy())
 let languageModel = textEncoder.language_model
-let textForDit = textOutputs.hidden_states[-2].to(torch.bfloat16)
+let textForDit = textOutputs.hidden_states[-2].to(ditReferenceTorchDType)
 let textStateDict = languageModel.state_dict()
 let positionIds = torch.arange(tokenCount, dtype: torch.long).unsqueeze(0).to(torchDevice)
 let dummyHidden = torch.zeros([1, tokenCount, 3_072], dtype: torch.float).to(torchDevice)
@@ -736,15 +816,16 @@ graph.withNoGrad {
 
 if hasErnieImageTransformer {
   let ditStateDict = transformer.state_dict()
-  let latentTorch = torch.randn([1, 128, 64, 64]).to(torch.bfloat16).to(torchDevice)
-  let timestepValue: Float = 0.2
-  let timestepTorch = torch.tensor([timestepValue], dtype: torch.bfloat16).to(torchDevice)
+  let latentTorch = torch.randn([1, 128, 64, 64]).to(ditReferenceTorchDType).to(torchDevice)
+  let timestepValue =
+    Float(ProcessInfo.processInfo.environment["ERNIE_IMAGE_DIT_TIMESTEP"] ?? "900")
+    ?? 900
+  let timestepTorch = torch.tensor([timestepValue], dtype: ditReferenceTorchDType).to(torchDevice)
   let textLensTorch = torch.tensor([tokenCount], dtype: torch.long).to(torchDevice)
   let ditReference = try! Tensor<Float>(
     numpy: transformer(
       hidden_states: latentTorch, timestep: timestepTorch, text_bth: textForDit,
-      text_lens: textLensTorch,
-      return_dict: false
+      text_lens: textLensTorch, return_dict: false
     )[0].to(torch.float).cpu().numpy())
 
   graph.withNoGrad {
@@ -755,7 +836,8 @@ if hasErnieImageTransformer {
     let txtTensor = graph.variable(
       Tensor<FloatType>(from: textDitConditioningReference).toGPU(0)
     ).reshaped(.WC(tokenCount, 3_072))
-    let rotTensorGPU = makeErnieImageRotTensor(textLength: tokenCount, height: 64, width: 64)
+    let (rotCosTensorGPU, rotSinTensorGPU) = makeErnieImageRawRotTensors(
+      textLength: tokenCount, height: 64, width: 64)
     let tTensor = graph.variable(
       Tensor<FloatType>(
         from: diffusersTimestepEmbedding(
@@ -763,15 +845,29 @@ if hasErnieImageTransformer {
         )
       ).toGPU(0)
     ).reshaped(.WC(1, 4_096))
-
     let (dit, ditReader) = ErnieImageModel(height: 64, width: 64, textLength: tokenCount)
-    dit.compile(inputs: xTensor, txtTensor, rotTensorGPU, tTensor)
+    dit.compile(inputs: xTensor, txtTensor, rotCosTensorGPU, rotSinTensorGPU, tTensor)
     ditReader(ditStateDict)
     let swiftDitOutput = copiedToCPU(
-      dit(inputs: xTensor, txtTensor, rotTensorGPU, tTensor)[0].as(of: Float.self))
-    print("ERNIE DiT output shape:", swiftDitOutput.shape)
-    print("ERNIE DiT max abs diff:", maxAbsDiff4D(swiftDitOutput, ditReference))
-    print("ERNIE DiT max rel diff:", maxRelativeDiff4D(swiftDitOutput, ditReference))
+      dit(inputs: xTensor, txtTensor, rotCosTensorGPU, rotSinTensorGPU, tTensor)[0].as(
+        of: Float.self))
+    let swiftHasNaN = hasNaN4D(swiftDitOutput)
+    let referenceHasNaN = hasNaN4D(ditReference)
+    print("ERNIE DiT timestep:", timestepValue)
+    print("ERNIE DiT reference dtype:", ditReferenceDTypeName)
+    print("ERNIE DiT attention scale:", ernieImageAttentionScale)
+    print("ERNIE DiT FFN scale:", ernieImageFFNScale)
+    print(
+      "ERNIE DiT final output shape:", swiftDitOutput.shape, "swift hasNaN:", swiftHasNaN,
+      "ref hasNaN:", referenceHasNaN)
+    print("ERNIE DiT final output swift:", sampleValues4D(swiftDitOutput))
+    print("ERNIE DiT final output ref:", sampleValues4D(ditReference))
+    if !swiftHasNaN && !referenceHasNaN {
+      print("ERNIE DiT final output max abs diff:", maxAbsDiff4D(swiftDitOutput, ditReference))
+      print(
+        "ERNIE DiT final output max rel diff:",
+        maxRelativeDiff4D(swiftDitOutput, ditReference))
+    }
     if exportModels && exportDitModel {
       graph.openStore(ditExportPath) {
         $0.write("dit", model: dit)
