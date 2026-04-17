@@ -3,32 +3,27 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/anima_preview_3_f32.ckpt", flags: [.readOnly]
+  "/slow/Data/ltx_2.3_22b_distilled_1.1_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/fast/Data/anima_preview_3_f16.ckpt",
+    "/fast/Data/ltx_2.3_22b_distilled_1.1_q6p.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
       guard let anyTensor = store.read(key) else { continue }
-      /*
       guard anyTensor.dataType != .Float32 else {
         // If it is already in FP32, skip transcode to FP16. Only useful for UMT5 XXL / Wan v2.1 models.
         let tensor = Tensor<Float32>(anyTensor).toCPU()
         $0.write(key, tensor: tensor)
         continue
       }
-      */
       let tensor: AnyTensor
       if anyTensor.dataType == .BFloat16 {
         tensor = Tensor<BFloat16>(from: anyTensor).toCPU()
       } else {
         tensor = Tensor<Float16>(from: anyTensor).toCPU()
       }
-      print("write \(key) \(tensor)")
-      $0.write(key, tensor: tensor)
-      continue
       if key.contains("__stage_c_fixed__") && (key.contains("key") || key.contains("value")) {
         continue
       }
@@ -105,9 +100,9 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
         } else {
-          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
         }
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])

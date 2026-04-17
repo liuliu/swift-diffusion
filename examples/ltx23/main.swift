@@ -293,11 +293,13 @@ func convertLTX2SpatialUpscaler(
 let testDepth = 16
 let testHeight = 16
 let testWidth = 16
+/*
 convertLTX2SpatialUpscaler(
   modelPath: "/fast/Data/ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
   ckptPath: "/home/liu/workspace/swift-diffusion/ltx_2.3_spatial_upscaler_x2_1.1_f32.ckpt",
   testDepth: testDepth, testHeight: testHeight, testWidth: testWidth)
 exit(0)
+*/
 
 let ltx_core_loader_single_gpu_model_builder = Python.import(
   "ltx_core.loader.single_gpu_model_builder")
@@ -1661,8 +1663,8 @@ graph.withNoGrad {
 print("main model: start")
 let mainDType = torch.bfloat16
 let mainFPS = 25.0
-let mainModelPath = "/fast/Data/ltx-2.3-22b-distilled.safetensors"
-let mainCkptPath = "/slow/Data/ltx_2.3_22b_distilled_f16.ckpt"
+let mainModelPath = "/fast/Data/ltx-2.3-22b-distilled-1.1.safetensors"
+let mainCkptPath = "/slow/Data/ltx_2.3_22b_distilled_1.1_f16.ckpt"
 let mainVideoPixelShape = ltx_core_types.VideoPixelShape(
   batch: 1, frames: 121, height: 512, width: 768, fps: mainFPS)
 let mainVideoLatentShape = ltx_core_types.VideoLatentShape.from_pixel_shape(mainVideoPixelShape)
@@ -1758,20 +1760,12 @@ graph.withNoGrad {
       from: rotTensor.reshaped(.NHWC(1, 1, 32, 128))
     )
     .toGPU(1)
-    let rot2TensorGPU = DynamicGraph.Tensor<FloatType>(
-      from: rotTensor.reshaped(.NHWC(1, 1, 32, 128))
-    )
-    .toGPU(1)
     let aRotTensor = graph.variable(.CPU, .HWC(1, 1, 2048), of: Float.self)
     for i in 0..<1024 {
       aRotTensor[0, 0, i * 2] = 1
       aRotTensor[0, 0, i * 2 + 1] = 0
     }
     let rot3TensorGPU = DynamicGraph.Tensor<FloatType>(
-      from: aRotTensor.reshaped(.NHWC(1, 1, 32, 64))
-    )
-    .toGPU(1)
-    let rot4TensorGPU = DynamicGraph.Tensor<FloatType>(
       from: aRotTensor.reshaped(.NHWC(1, 1, 32, 64))
     )
     .toGPU(1)
@@ -1784,8 +1778,7 @@ graph.withNoGrad {
     mainDIT.compile(
       inputs: xTensor, txtTensor, aTensor, aTxtTensor, timestepTensor, promptTimestepTensor,
       rot1TensorGPU,
-      rot2TensorGPU,
-      rot3TensorGPU, rot4TensorGPU, rot5TensorGPU)
+      rot3TensorGPU, rot5TensorGPU)
     let mainExpectedVideo = try! Tensor<Float>(numpy: mainOutput[0].to(torch.float).cpu().numpy())
     let mainExpectedAudio = try! Tensor<Float>(numpy: mainOutput[1].to(torch.float).cpu().numpy())
 
@@ -1795,8 +1788,7 @@ graph.withNoGrad {
     let mainSwiftOutput = mainDIT(
       inputs: xTensor, txtTensor, aTensor, aTxtTensor, timestepTensor, promptTimestepTensor,
       rot1TensorGPU,
-      rot2TensorGPU,
-      rot3TensorGPU, rot4TensorGPU, rot5TensorGPU)
+      rot3TensorGPU, rot5TensorGPU)
     print("main swift dit output shapes:", mainSwiftOutput[0].shape, mainSwiftOutput[1].shape)
     let mainSwiftVideo = mainSwiftOutput[0].as(of: Float16.self).toCPU()
     let mainSwiftAudio = mainSwiftOutput[1].as(of: Float16.self).toCPU()
@@ -2855,9 +2847,7 @@ func LTX2TransformerBlock(
   let cv = Input()
   let ca = Input()
   let rot = Input()
-  let rotC = Input()
   let rotA = Input()
-  let rotAC = Input()
   let rotCX = Input()
   let timesteps = (0..<9).map { _ in Input() }
   let attn1Modulations = (0..<9).map {
@@ -3111,7 +3101,7 @@ func LTX2TransformerBlock(
     audioOutProjection.bias.copy(
       from: Tensor<Float16>(from: try! Tensor<Float>(numpy: audio_ff_net_2_bias)))
   }
-  var inputs: [Input] = [vx, rot, cv, rotC, ax, rotA, ca, rotAC, rotCX]
+  var inputs: [Input] = [vx, rot, cv, ax, rotA, ca, rotCX]
   inputs.append(contentsOf: timesteps + audioTimesteps)
   inputs.append(contentsOf: promptTimesteps + audioPromptTimesteps)
   inputs.append(contentsOf: caScaleShiftTimesteps + [caGateTimesteps])
@@ -3197,9 +3187,7 @@ func LTX2(b: Int, h: Int, w: Int, useContextProjection: Bool = true) -> (
 ) {
   let x = Input()
   let rot = Input()
-  let rotC = Input()
   let rotA = Input()
-  let rotAC = Input()
   let rotCX = Input()
   let xEmbedder = Dense(count: 4096, name: "x_embedder")
   var out = xEmbedder(x).to(.Float32)
@@ -3264,7 +3252,7 @@ func LTX2(b: Int, h: Int, w: Int, useContextProjection: Bool = true) -> (
       prefix: "transformer_blocks.\(i)", k: 128, h: 32, b: 1, t: 1024, hw: 6144, a: 121,
       intermediateSize: 0)
     let blockOut = block(
-      out, rot, txtOut, rotC, aOut, rotA, aTxtOut, rotAC, rotCX,
+      out, rot, txtOut, aOut, rotA, aTxtOut, rotCX,
       txEmbChunks[0], txEmbChunks[1], txEmbChunks[2], txEmbChunks[3], txEmbChunks[4],
       txEmbChunks[5], txEmbChunks[6], txEmbChunks[7], txEmbChunks[8],
       taEmbChunks[0], taEmbChunks[1], taEmbChunks[2], taEmbChunks[3], taEmbChunks[4],
@@ -3421,7 +3409,7 @@ func LTX2(b: Int, h: Int, w: Int, useContextProjection: Bool = true) -> (
     audioProjOut.bias.copy(
       from: Tensor<FloatType>(from: try! Tensor<Float>(numpy: audio_proj_out_bias)))
   }
-  return (reader, Model([x, txt, a, aTxt, t, p, rot, rotC, rotA, rotAC, rotCX], [out, aOut]))
+  return (reader, Model([x, txt, a, aTxt, t, p, rot, rotA, rotCX], [out, aOut]))
 }
 
 // Legacy ltx2.0 one-off DiT export run kept disabled below.
