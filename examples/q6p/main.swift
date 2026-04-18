@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/slow/Data/ltx_2.3_22b_distilled_1.1_f16.ckpt", flags: [.readOnly]
+  "/fast/Data/anima_preview_3_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/fast/Data/ltx_2.3_22b_distilled_1.1_q6p.ckpt",
+    "/fast/Data/anima_preview_3_i8x.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -42,6 +42,7 @@ graph.openStore(
         || key.contains("position_embedding") || key.contains("-shared-")
         || key.contains("_pad_token")  // Z-Image related.
         || key.contains("_registers") || key.contains("_connector") || key.contains("_extractor")  // LTX-2 related.
+        || key.contains("token_embedding")  // Anima related.
       {
         $0.write(key, tensor: tensor)
         continue
@@ -100,9 +101,9 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7])
         } else {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7])
+          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7])
         }
       } else if shape.count == 4 && n > 1 {
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
