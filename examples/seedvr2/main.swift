@@ -1513,18 +1513,75 @@ func SeedVR2DiTAttnProjectOnly(
   )
 }
 
-func seedVR2WindowSlice(_ x: Model.IO, start: Int, length: Int) -> Model.IO {
+struct SeedVR2Window3D {
+  let tStart: Int
+  let tLength: Int
+  let hStart: Int
+  let hLength: Int
+  let wStart: Int
+  let wLength: Int
+
+  var tokenLength: Int { tLength * hLength * wLength }
+}
+
+func seedVR2FlatWindowSlice(_ x: Model.IO, start: Int, length: Int) -> Model.IO {
   x.reshaped(
     [length, 20, 128], offset: [start, 0, 0], strides: [20 * 128, 128, 1]
   ).contiguous().copied()
 }
 
-func seedVR2ConcatAxis0(_ xs: [Model.IO]) -> Model.IO {
+func seedVR2WindowSlice3D(
+  _ x: Model.IO, window: SeedVR2Window3D, frames: Int, height: Int, width: Int
+) -> Model.IO {
+  x.reshaped(
+    [window.tLength, window.hLength, window.wLength, 20, 128],
+    offset: [window.tStart, window.hStart, window.wStart, 0, 0],
+    strides: [height * width * 20 * 128, width * 20 * 128, 20 * 128, 128, 1]
+  ).contiguous().copied().reshaped([window.tokenLength, 20, 128], format: .NHWC).contiguous()
+}
+
+func seedVR2Concat(_ xs: [Model.IO], axis: Int) -> Model.IO {
   precondition(!xs.isEmpty)
   if xs.count == 1 {
     return xs[0].copied()
   }
-  return Concat(axis: 0)(xs.map { $0.copied() }).contiguous()
+  return Concat(axis: axis)(xs.map { $0.copied() }).contiguous()
+}
+
+func seedVR2ReverseWindowOutputs(
+  _ windowOutputs: [Model.IO], windows: [SeedVR2Window3D],
+  frames: Int, height: Int, width: Int
+) -> Model.IO {
+  precondition(windowOutputs.count == windows.count)
+  var windowIndex = 0
+  var widthTiles = [Model.IO]()
+  while windowIndex < windows.count {
+    let wStart = windows[windowIndex].wStart
+    let wLength = windows[windowIndex].wLength
+    var heightTiles = [Model.IO]()
+    while windowIndex < windows.count && windows[windowIndex].wStart == wStart
+      && windows[windowIndex].wLength == wLength
+    {
+      let hStart = windows[windowIndex].hStart
+      let hLength = windows[windowIndex].hLength
+      var timeTiles = [Model.IO]()
+      while windowIndex < windows.count && windows[windowIndex].wStart == wStart
+        && windows[windowIndex].wLength == wLength && windows[windowIndex].hStart == hStart
+        && windows[windowIndex].hLength == hLength
+      {
+        let window = windows[windowIndex]
+        timeTiles.append(
+          windowOutputs[windowIndex].reshaped(
+            [window.tLength, window.hLength, window.wLength, 20, 128]
+          ).contiguous())
+        windowIndex += 1
+      }
+      heightTiles.append(seedVR2Concat(timeTiles, axis: 0))
+    }
+    widthTiles.append(seedVR2Concat(heightTiles, axis: 1))
+  }
+  return seedVR2Concat(widthTiles, axis: 2).reshaped([frames * height * width, 20, 128])
+    .contiguous()
 }
 
 func seedVR2BatchedWindowAttentionSDPA(
@@ -1537,22 +1594,22 @@ func seedVR2BatchedWindowAttentionSDPA(
   precondition(vidK.count == batch && vidV.count == batch)
   precondition(txtQ.count == batch && txtK.count == batch)
   let totalLen = windowLen + txtLen
-  let batchedVidQ = seedVR2ConcatAxis0(vidQ).reshaped(
+  let batchedVidQ = seedVR2Concat(vidQ, axis: 0).reshaped(
     [batch, windowLen, 20, 128], format: .NHWC
   ).contiguous()
-  let batchedVidK = seedVR2ConcatAxis0(vidK).reshaped(
+  let batchedVidK = seedVR2Concat(vidK, axis: 0).reshaped(
     [batch, windowLen, 20, 128], format: .NHWC
   ).contiguous()
-  let batchedVidV = seedVR2ConcatAxis0(vidV).reshaped(
+  let batchedVidV = seedVR2Concat(vidV, axis: 0).reshaped(
     [batch, windowLen, 20, 128], format: .NHWC
   ).contiguous()
-  let batchedTxtQ = seedVR2ConcatAxis0(txtQ).reshaped(
+  let batchedTxtQ = seedVR2Concat(txtQ, axis: 0).reshaped(
     [batch, txtLen, 20, 128], format: .NHWC
   ).contiguous()
-  let batchedTxtK = seedVR2ConcatAxis0(txtK).reshaped(
+  let batchedTxtK = seedVR2Concat(txtK, axis: 0).reshaped(
     [batch, txtLen, 20, 128], format: .NHWC
   ).contiguous()
-  let batchedTxtV = seedVR2ConcatAxis0(vidQ.map { _ in txtV }).reshaped(
+  let batchedTxtV = seedVR2Concat(vidQ.map { _ in txtV }, axis: 0).reshaped(
     [batch, txtLen, 20, 128], format: .NHWC
   ).contiguous()
   let q = Functional.concat(axis: 1, batchedVidQ, batchedTxtQ).to(.BFloat16).contiguous()
@@ -1573,15 +1630,14 @@ func seedVR2BatchedWindowAttentionSDPA(
   return (vidOut, txtOut)
 }
 
-func seedVR2TemporalWindowAttentionSDPA(
+func seedVR2WindowAttentionSDPA(
   vidQ: Model.IO, vidK: Model.IO, vidV: Model.IO,
   txtQ: Model.IO, txtK: Model.IO, txtV: Model.IO,
   vidFreqs: [Model.IO], txtFreqs: [Model.IO],
-  windowStarts: [Int], windowLengths: [Int], txtLen: Int
+  windows: [SeedVR2Window3D], frames: Int, height: Int, width: Int, txtLen: Int
 ) -> (Model.IO, Model.IO) {
-  let windowCount = windowStarts.count
+  let windowCount = windows.count
   precondition(windowCount > 0)
-  precondition(windowLengths.count == windowCount)
   precondition(vidFreqs.count == windowCount && txtFreqs.count == windowCount)
 
   var windowVidQ = [Model.IO]()
@@ -1590,31 +1646,31 @@ func seedVR2TemporalWindowAttentionSDPA(
   var windowTxtQ = [Model.IO]()
   var windowTxtK = [Model.IO]()
   for windowIndex in 0..<windowCount {
-    let start = windowStarts[windowIndex]
-    let length = windowLengths[windowIndex]
+    let window = windows[windowIndex]
     windowVidQ.append(
       seedVR2ApplyRotary3D(
-        seedVR2WindowSlice(vidQ, start: start, length: length),
-        freqs: vidFreqs[windowIndex], seqLen: length, heads: 20))
+        seedVR2WindowSlice3D(vidQ, window: window, frames: frames, height: height, width: width),
+        freqs: vidFreqs[windowIndex], seqLen: window.tokenLength, heads: 20))
     windowVidK.append(
       seedVR2ApplyRotary3D(
-        seedVR2WindowSlice(vidK, start: start, length: length),
-        freqs: vidFreqs[windowIndex], seqLen: length, heads: 20))
-    windowVidV.append(seedVR2WindowSlice(vidV, start: start, length: length))
+        seedVR2WindowSlice3D(vidK, window: window, frames: frames, height: height, width: width),
+        freqs: vidFreqs[windowIndex], seqLen: window.tokenLength, heads: 20))
+    windowVidV.append(
+      seedVR2WindowSlice3D(vidV, window: window, frames: frames, height: height, width: width))
     windowTxtQ.append(
       seedVR2ApplyRotary3D(txtQ, freqs: txtFreqs[windowIndex], seqLen: txtLen, heads: 20))
     windowTxtK.append(
       seedVR2ApplyRotary3D(txtK, freqs: txtFreqs[windowIndex], seqLen: txtLen, heads: 20))
   }
 
-  var groupVidOuts = [Model.IO]()
+  var windowVidOuts = [Model.IO]()
   var groupTxtOuts = [Model.IO]()
   var groupCounts = [Int]()
   var groupStart = 0
   while groupStart < windowCount {
-    let windowLen = windowLengths[groupStart]
+    let windowLen = windows[groupStart].tokenLength
     var groupEnd = groupStart + 1
-    while groupEnd < windowCount && windowLengths[groupEnd] == windowLen {
+    while groupEnd < windowCount && windows[groupEnd].tokenLength == windowLen {
       groupEnd += 1
     }
     let groupRange = groupStart..<groupEnd
@@ -1626,7 +1682,11 @@ func seedVR2TemporalWindowAttentionSDPA(
       txtK: groupRange.map { windowTxtK[$0] },
       txtV: txtV,
       windowLen: windowLen, txtLen: txtLen)
-    groupVidOuts.append(groupVidOut)
+    for groupWindowIndex in 0..<(groupEnd - groupStart) {
+      windowVidOuts.append(
+        seedVR2FlatWindowSlice(
+          groupVidOut, start: groupWindowIndex * windowLen, length: windowLen))
+    }
     groupTxtOuts.append(groupTxtOut)
     groupCounts.append(groupEnd - groupStart)
     groupStart = groupEnd
@@ -1638,17 +1698,17 @@ func seedVR2TemporalWindowAttentionSDPA(
       txtOut + groupTxtOuts[groupIndex] * (Float(groupCounts[groupIndex]) / Float(windowCount))
   }
   return (
-    seedVR2ConcatAxis0(groupVidOuts).contiguous(),
+    seedVR2ReverseWindowOutputs(
+      windowVidOuts, windows: windows, frames: frames, height: height, width: width),
     txtOut.copied()
   )
 }
 
-func SeedVR2DiTTemporalWindowAttnProjectOnly(
-  windowStarts: [Int], windowLengths: [Int], txtLen: Int,
+func SeedVR2DiTWindowAttnProjectOnly(
+  windows: [SeedVR2Window3D], frames: Int, height: Int, width: Int, txtLen: Int,
   lastLayer: Bool = false, bfloat16Weights: Bool = false
 ) -> ((PythonObject, Int) -> Void, Model) {
-  precondition(windowStarts.count == windowLengths.count)
-  precondition(!windowStarts.isEmpty)
+  precondition(!windows.isEmpty)
   let vid = Input()
   let txt = Input()
   let vidAttnMod = Input()
@@ -1659,15 +1719,15 @@ func SeedVR2DiTTemporalWindowAttnProjectOnly(
   let txtQ = Input()
   let txtK = Input()
   let txtV = Input()
-  let windowVidFreqs = windowStarts.map { _ in Input() }
-  let windowTxtFreqs = windowStarts.map { _ in Input() }
+  let windowVidFreqs = windows.map { _ in Input() }
+  let windowTxtFreqs = windows.map { _ in Input() }
 
-  let (vidAttn3D, txtAttn3D) = seedVR2TemporalWindowAttentionSDPA(
+  let (vidAttn3D, txtAttn3D) = seedVR2WindowAttentionSDPA(
     vidQ: vidQ, vidK: vidK, vidV: vidV,
     txtQ: txtQ, txtK: txtK, txtV: txtV,
     vidFreqs: windowVidFreqs, txtFreqs: windowTxtFreqs,
-    windowStarts: windowStarts, windowLengths: windowLengths, txtLen: txtLen)
-  let vidLen = windowLengths.reduce(0) { $0 + $1 }
+    windows: windows, frames: frames, height: height, width: width, txtLen: txtLen)
+  let vidLen = frames * height * width
   let vidAttnFlat = seedVR2FlattenHeads(vidAttn3D, seqLen: vidLen, heads: 20, headDim: 128).copied()
   let txtAttnFlat = seedVR2FlattenHeads(txtAttn3D, seqLen: txtLen, heads: 20, headDim: 128).copied()
   let vidAttnOut = Dense(count: 2560, name: "vid_attn_out")
@@ -1745,36 +1805,71 @@ func seedVR2CeilDiv(_ x: Int, _ y: Int) -> Int {
   (x + y - 1) / y
 }
 
-func seedVR2TemporalWindowSpec(frames: Int, patchArea: Int, shifted: Bool) -> (
-  starts: [Int], lengths: [Int]
-) {
-  let windowFrames = seedVR2CeilDiv(min(frames, 30), 4)
-  var starts = [Int]()
-  var lengths = [Int]()
-  if shifted && windowFrames < frames {
+func seedVR2PythonRoundToInt(_ x: Double) -> Int {
+  let lower = floor(x)
+  let fraction = x - lower
+  if fraction < 0.5 {
+    return Int(lower)
+  }
+  if fraction > 0.5 {
+    return Int(lower + 1)
+  }
+  let lowerInt = Int(lower)
+  return lowerInt % 2 == 0 ? lowerInt : lowerInt + 1
+}
+
+func seedVR2WindowRanges(size: Int, windowSize: Int, shifted: Bool) -> [(start: Int, length: Int)] {
+  if shifted {
+    if windowSize >= size {
+      return [(0, size)]
+    }
     let shift = 0.5
-    let windowCount = Int(ceil((Double(frames) - shift) / Double(windowFrames))) + 1
+    let windowCount = Int(ceil((Double(size) - shift) / Double(windowSize))) + 1
+    var ranges = [(start: Int, length: Int)]()
     for windowIndex in 0..<windowCount {
-      let startFrame = max(Int((Double(windowIndex) - shift) * Double(windowFrames)), 0)
-      let endFrame = min(
-        Int((Double(windowIndex) - shift + 1) * Double(windowFrames)), frames)
-      if endFrame > startFrame {
-        starts.append(startFrame * patchArea)
-        lengths.append((endFrame - startFrame) * patchArea)
+      let start = max(Int((Double(windowIndex) - shift) * Double(windowSize)), 0)
+      let end = min(Int((Double(windowIndex) - shift + 1) * Double(windowSize)), size)
+      if end > start {
+        ranges.append((start, end - start))
       }
     }
-    return (starts, lengths)
+    return ranges
   }
-  let windowCount = seedVR2CeilDiv(frames, windowFrames)
+  var ranges = [(start: Int, length: Int)]()
+  let windowCount = seedVR2CeilDiv(size, windowSize)
   for windowIndex in 0..<windowCount {
-    let startFrame = windowIndex * windowFrames
-    let endFrame = min((windowIndex + 1) * windowFrames, frames)
-    if endFrame > startFrame {
-      starts.append(startFrame * patchArea)
-      lengths.append((endFrame - startFrame) * patchArea)
+    let start = windowIndex * windowSize
+    let end = min((windowIndex + 1) * windowSize, size)
+    if end > start {
+      ranges.append((start, end - start))
     }
   }
-  return (starts, lengths)
+  return ranges
+}
+
+func seedVR2WindowSpec3D(frames: Int, height: Int, width: Int, shifted: Bool) -> [SeedVR2Window3D] {
+  let scale = sqrt(Double(45 * 80) / Double(height * width))
+  let resizedHeight = seedVR2PythonRoundToInt(Double(height) * scale)
+  let resizedWidth = seedVR2PythonRoundToInt(Double(width) * scale)
+  let windowFrames = seedVR2CeilDiv(min(frames, 30), 4)
+  let windowHeight = seedVR2CeilDiv(resizedHeight, 3)
+  let windowWidth = seedVR2CeilDiv(resizedWidth, 3)
+  let timeRanges = seedVR2WindowRanges(size: frames, windowSize: windowFrames, shifted: shifted)
+  let heightRanges = seedVR2WindowRanges(size: height, windowSize: windowHeight, shifted: shifted)
+  let widthRanges = seedVR2WindowRanges(size: width, windowSize: windowWidth, shifted: shifted)
+  var windows = [SeedVR2Window3D]()
+  for widthRange in widthRanges {
+    for heightRange in heightRanges {
+      for timeRange in timeRanges {
+        windows.append(
+          SeedVR2Window3D(
+            tStart: timeRange.start, tLength: timeRange.length,
+            hStart: heightRange.start, hLength: heightRange.length,
+            wStart: widthRange.start, wLength: widthRange.length))
+      }
+    }
+  }
+  return windows
 }
 
 func SeedVR2DiTAttnProjectOnlyLastLayer(
@@ -2799,22 +2894,23 @@ if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
   let ditFrames = envInt("SEEDVR2_DIT_FRAMES", 5)
   let ditLatentHeight = envInt("SEEDVR2_DIT_LATENT_HEIGHT", 6)
   let ditLatentWidth = envInt("SEEDVR2_DIT_LATENT_WIDTH", 6)
-  let ditVidLen = ditFrames * (ditLatentHeight / 2) * (ditLatentWidth / 2)
+  let patchHeight = ditLatentHeight / 2
+  let patchWidth = ditLatentWidth / 2
+  let ditVidLen = ditFrames * patchHeight * patchWidth
   let ditTxtLen = 58
-  let patchArea = (ditLatentHeight / 2) * (ditLatentWidth / 2)
-  let regularWindowSpec = seedVR2TemporalWindowSpec(
-    frames: ditFrames, patchArea: patchArea, shifted: false)
-  let shiftedWindowSpec = seedVR2TemporalWindowSpec(
-    frames: ditFrames, patchArea: patchArea, shifted: true)
-  let regularWindowStarts = regularWindowSpec.starts
-  let regularWindowLengths = regularWindowSpec.lengths
-  let shiftedWindowStarts = shiftedWindowSpec.starts
-  let shiftedWindowLengths = shiftedWindowSpec.lengths
+  let regularWindows = seedVR2WindowSpec3D(
+    frames: ditFrames, height: patchHeight, width: patchWidth, shifted: false)
+  let shiftedWindows = seedVR2WindowSpec3D(
+    frames: ditFrames, height: patchHeight, width: patchWidth, shifted: true)
+  let regularWindowLengths = regularWindows.map { $0.tokenLength }
+  let shiftedWindowLengths = shiftedWindows.map { $0.tokenLength }
   let printEyeball = processInfo.environment["SEEDVR2_PRINT_EYEBALL"] == "1"
 
   print(
     "SeedVR2 dit.window.full shape frames/latent:",
     ditFrames, ditLatentHeight, ditLatentWidth)
+  print("SeedVR2 dit.window.full regular window count:", regularWindows.count)
+  print("SeedVR2 dit.window.full shifted window count:", shiftedWindows.count)
   print("SeedVR2 dit.window.full regular window lengths:", regularWindowLengths)
   print("SeedVR2 dit.window.full shifted window lengths:", shiftedWindowLengths)
 
@@ -2912,8 +3008,9 @@ if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
       inputs: loadDeviceTensor(regularProbe, "vid_attn_in"),
       loadDeviceTensor(regularProbe, "txt_attn_in"))
 
-    let (regularAttnReader, regularAttn) = SeedVR2DiTTemporalWindowAttnProjectOnly(
-      windowStarts: regularWindowStarts, windowLengths: regularWindowLengths, txtLen: ditTxtLen)
+    let (regularAttnReader, regularAttn) = SeedVR2DiTWindowAttnProjectOnly(
+      windows: regularWindows, frames: ditFrames, height: patchHeight, width: patchWidth,
+      txtLen: ditTxtLen)
     regularAttn.compile(
       inputs: [
         compileVid, compileTxt, layer0VidAttnMod, layer0TxtAttnMod,
@@ -2922,8 +3019,9 @@ if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
         loadDeviceTensor(regularProbe, "txt_k"), loadDeviceTensor(regularProbe, "txt_v"),
       ] + regularVidFreqs + regularTxtFreqs)
 
-    let (shiftedAttnReader, shiftedAttn) = SeedVR2DiTTemporalWindowAttnProjectOnly(
-      windowStarts: shiftedWindowStarts, windowLengths: shiftedWindowLengths, txtLen: ditTxtLen)
+    let (shiftedAttnReader, shiftedAttn) = SeedVR2DiTWindowAttnProjectOnly(
+      windows: shiftedWindows, frames: ditFrames, height: patchHeight, width: patchWidth,
+      txtLen: ditTxtLen)
     shiftedAttn.compile(
       inputs: [
         compileVid, compileTxt, layer0VidAttnMod, layer0TxtAttnMod,
@@ -2932,8 +3030,9 @@ if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
         loadDeviceTensor(shiftedProbe, "txt_k"), loadDeviceTensor(shiftedProbe, "txt_v"),
       ] + shiftedVidFreqs + shiftedTxtFreqs)
 
-    let (shiftedAttnLastReader, shiftedAttnLast) = SeedVR2DiTTemporalWindowAttnProjectOnly(
-      windowStarts: shiftedWindowStarts, windowLengths: shiftedWindowLengths, txtLen: ditTxtLen,
+    let (shiftedAttnLastReader, shiftedAttnLast) = SeedVR2DiTWindowAttnProjectOnly(
+      windows: shiftedWindows, frames: ditFrames, height: patchHeight, width: patchWidth,
+      txtLen: ditTxtLen,
       lastLayer: true)
     shiftedAttnLast.compile(
       inputs: [
