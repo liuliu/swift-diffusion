@@ -19,6 +19,14 @@ func envInt(_ name: String, _ defaultValue: Int) -> Int {
   return defaultValue
 }
 
+func envFlag(_ name: String) -> Bool {
+  ProcessInfo.processInfo.environment[name] == "1"
+}
+
+func envString(_ name: String, _ defaultValue: String) -> String {
+  ProcessInfo.processInfo.environment[name] ?? defaultValue
+}
+
 let sys = Python.import("sys")
 let osPath = Python.import("os.path")
 let site = Python.import("site")
@@ -26,6 +34,11 @@ let site = Python.import("site")
 let repoRoot = "/home/liu/workspace/swift-diffusion"
 let seedVRRoot = "/home/liu/workspace/SeedVR"
 let seedVRExampleRoot = "\(repoRoot)/examples/seedvr2"
+let seedVR2CheckpointRoot = "\(seedVRRoot)/SeedVR2-3B"
+let seedVR2VAEExportPath = envString(
+  "SEEDVR2_VAE_CKPT", "\(repoRoot)/seedvr2_3b_vae_f32.ckpt")
+let seedVR2DiTExportPath = envString(
+  "SEEDVR2_DIT_CKPT", "\(repoRoot)/seedvr2_3b_dit_f32.ckpt")
 
 let userSitePackages = site.getusersitepackages()
 if (Bool(osPath.isdir(userSitePackages)) ?? false)
@@ -1389,130 +1402,6 @@ func seedVR2OutputModTensor(emb: Tensor<Float>, stateDict: PythonObject, offset:
   return mod
 }
 
-func SeedVR2RotaryProbe(seqLen: Int) -> Model {
-  let q = Input()
-  let k = Input()
-  let freqs = Input()
-  let qOut = seedVR2ApplyRotary3D(q, freqs: freqs, seqLen: seqLen, heads: 20)
-  let kOut = seedVR2ApplyRotary3D(k, freqs: freqs, seqLen: seqLen, heads: 20)
-  return Model([q, k, freqs], [qOut, kOut])
-}
-
-func seedVR2FullAttentionSDPA(
-  vidQ: Model.IO, vidK: Model.IO, vidV: Model.IO,
-  txtQ: Model.IO, txtK: Model.IO, txtV: Model.IO,
-  vidLen: Int, txtLen: Int
-) -> (Model.IO, Model.IO) {
-  let totalLen = vidLen + txtLen
-  let q = Functional.concat(axis: 0, vidQ.copied(), txtQ.copied()).reshaped(
-    [1, totalLen, 20, 128], format: .NHWC
-  ).to(.BFloat16)
-    .contiguous()
-  let k = Functional.concat(axis: 0, vidK.copied(), txtK.copied()).reshaped(
-    [1, totalLen, 20, 128], format: .NHWC
-  ).to(.BFloat16)
-    .contiguous()
-  let v = Functional.concat(axis: 0, vidV.copied(), txtV.copied()).reshaped(
-    [1, totalLen, 20, 128], format: .NHWC
-  ).to(.BFloat16)
-    .contiguous()
-  let out = ScaledDotProductAttention(scale: 1.0 / Float(128).squareRoot(), flags: [.Float16])(
-    q, k, v
-  ).to(
-    .Float32
-  ).reshaped([totalLen, 20, 128], format: .NHWC).contiguous()
-  let vidOut = out.reshaped(
-    [vidLen, 20, 128], offset: [0, 0, 0], strides: [20 * 128, 128, 1]
-  ).contiguous().copied()
-  let txtOut = out.reshaped(
-    [txtLen, 20, 128], offset: [vidLen, 0, 0], strides: [20 * 128, 128, 1]
-  ).contiguous().copied()
-  return (vidOut, txtOut)
-}
-
-func SeedVR2DiTAttnProjectOnly(
-  vidLen: Int, txtLen: Int, bfloat16Weights: Bool = false
-) -> ((PythonObject, Int) -> Void, Model) {
-  let vid = Input()
-  let txt = Input()
-  let vidAttnMod = Input()
-  let txtAttnMod = Input()
-  let ropeVidQ = Input()
-  let ropeVidK = Input()
-  let vidV = Input()
-  let ropeTxtQ = Input()
-  let ropeTxtK = Input()
-  let txtV = Input()
-
-  let (vidAttn3D, txtAttn3D) = seedVR2FullAttentionSDPA(
-    vidQ: ropeVidQ, vidK: ropeVidK, vidV: vidV,
-    txtQ: ropeTxtQ, txtK: ropeTxtK, txtV: txtV,
-    vidLen: vidLen, txtLen: txtLen)
-  let vidAttnFlat = seedVR2FlattenHeads(vidAttn3D, seqLen: vidLen, heads: 20, headDim: 128).copied()
-  let txtAttnFlat = seedVR2FlattenHeads(txtAttn3D, seqLen: txtLen, heads: 20, headDim: 128).copied()
-  let vidAttnOut = Dense(count: 2560, name: "vid_attn_out")
-  let txtAttnOut = Dense(count: 2560, name: "txt_attn_out")
-  let vidAttnProjected = vidAttnOut(vidAttnFlat).copied()
-  let txtAttnProjected = txtAttnOut(txtAttnFlat).copied()
-  let vidAfterAttn = vid + vidAttnProjected .* seedVR2ModRow(vidAttnMod, index: 2, width: 2560)
-  let txtAfterAttn = txt + txtAttnProjected .* seedVR2ModRow(txtAttnMod, index: 2, width: 2560)
-
-  let reader: (PythonObject, Int) -> Void = { stateDict, layerIndex in
-    let prefix = "blocks.\(layerIndex)"
-    let sharedWeights =
-      (Bool(stateDict.__contains__("\(prefix).attn.proj_out.vid.weight")) ?? false) == false
-    if sharedWeights {
-      copyParameter(
-        vidAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.all.weight"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        txtAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.all.weight"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        vidAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.all.bias"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        txtAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.all.bias"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-    } else {
-      copyParameter(
-        vidAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.vid.weight"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        txtAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.txt.weight"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        vidAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.vid.bias"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        txtAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.txt.bias"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-    }
-  }
-  return (
-    reader,
-    Model(
-      [vid, txt, vidAttnMod, txtAttnMod, ropeVidQ, ropeVidK, vidV, ropeTxtQ, ropeTxtK, txtV],
-      [vidAfterAttn, txtAfterAttn, vidAttnProjected, txtAttnProjected, vidAttn3D, txtAttn3D])
-  )
-}
-
 struct SeedVR2Window3D {
   let tStart: Int
   let tLength: Int
@@ -1870,88 +1759,6 @@ func seedVR2WindowSpec3D(frames: Int, height: Int, width: Int, shifted: Bool) ->
     }
   }
   return windows
-}
-
-func SeedVR2DiTAttnProjectOnlyLastLayer(
-  vidLen: Int, txtLen: Int, bfloat16Weights: Bool = false
-) -> ((PythonObject, Int) -> Void, Model) {
-  let vid = Input()
-  let txt = Input()
-  let vidAttnMod = Input()
-  let ropeVidQ = Input()
-  let ropeVidK = Input()
-  let vidV = Input()
-  let ropeTxtQ = Input()
-  let ropeTxtK = Input()
-  let txtV = Input()
-
-  let (vidAttn3D, txtAttn3D) = seedVR2FullAttentionSDPA(
-    vidQ: ropeVidQ, vidK: ropeVidK, vidV: vidV,
-    txtQ: ropeTxtQ, txtK: ropeTxtK, txtV: txtV,
-    vidLen: vidLen, txtLen: txtLen)
-  let vidAttnFlat = seedVR2FlattenHeads(vidAttn3D, seqLen: vidLen, heads: 20, headDim: 128).copied()
-  let txtAttnFlat = seedVR2FlattenHeads(txtAttn3D, seqLen: txtLen, heads: 20, headDim: 128).copied()
-  let vidAttnOut = Dense(count: 2560, name: "vid_attn_out")
-  let txtAttnOut = Dense(count: 2560, name: "txt_attn_out")
-  let vidAttnProjected = vidAttnOut(vidAttnFlat).copied()
-  let txtAttnProjected = txtAttnOut(txtAttnFlat).copied()
-  let vidAfterAttn = vid + vidAttnProjected .* seedVR2ModRow(vidAttnMod, index: 2, width: 2560)
-  let txtAfterAttn = txt + txtAttnProjected
-
-  let reader: (PythonObject, Int) -> Void = { stateDict, layerIndex in
-    let prefix = "blocks.\(layerIndex)"
-    let sharedWeights =
-      (Bool(stateDict.__contains__("\(prefix).attn.proj_out.vid.weight")) ?? false) == false
-    if sharedWeights {
-      copyParameter(
-        vidAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.all.weight"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        txtAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.all.weight"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        vidAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.all.bias"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        txtAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.all.bias"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-    } else {
-      copyParameter(
-        vidAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.vid.weight"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        txtAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.txt.weight"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        vidAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.vid.bias"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-      copyParameter(
-        txtAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(prefix).attn.proj_out.txt.bias"].to(torch.float).cpu().numpy()),
-        asBFloat16: bfloat16Weights)
-    }
-  }
-  return (
-    reader,
-    Model(
-      [vid, txt, vidAttnMod, ropeVidQ, ropeVidK, vidV, ropeTxtQ, ropeTxtK, txtV],
-      [vidAfterAttn, txtAfterAttn, vidAttnProjected, txtAttnProjected, vidAttn3D, txtAttn3D])
-  )
 }
 
 func SeedVR2DiTMlpOnly(
@@ -2699,23 +2506,22 @@ func SeedVR2MomentsToLatent(depth: Int, height: Int, width: Int) -> Model {
   return Model([x], [latent])
 }
 
-let vaeReference = seedvr2Reference.SeedVR2Reference(
-  repo_root: seedVRRoot,
-  checkpoint_root: "\(seedVRRoot)/SeedVR2-3B",
-  device: hasCUDA ? "cuda" : "cpu",
-  load_dit: false,
-  load_vae: true)
+if envFlag("SEEDVR2_RUN_VAE") || envFlag("SEEDVR2_EXPORT_VAE") {
+  let vaeReference = seedvr2Reference.SeedVR2Reference(
+    repo_root: seedVRRoot,
+    checkpoint_root: seedVR2CheckpointRoot,
+    device: hasCUDA ? "cuda" : "cpu",
+    load_dit: false,
+    load_vae: true)
+  logStep("SeedVR2 vae state_dict start")
+  let vaeStateDict = vaeReference.runner.vae.state_dict()
+  logStep("SeedVR2 vae encoder_probe start")
+  let vaeEncoderProbe = vaeReference.make_encoder_probe(depth: 5, height: 96, width: 160, seed: 42)
+  logStep("SeedVR2 vae decoder_probe start")
+  let vaeDecoderProbe = vaeReference.make_decoder_probe(depth: 2, height: 12, width: 20, seed: 42)
+  logStep("SeedVR2 vae mode_probe start")
+  let vaeModeProbe = vaeReference.make_vae_mode_probe(frames: 5, height: 96, width: 160, seed: 42)
 
-logStep("SeedVR2 vae state_dict start")
-let vaeStateDict = vaeReference.runner.vae.state_dict()
-logStep("SeedVR2 vae encoder_probe start")
-let vaeEncoderProbe = vaeReference.make_encoder_probe(depth: 5, height: 96, width: 160, seed: 42)
-logStep("SeedVR2 vae decoder_probe start")
-let vaeDecoderProbe = vaeReference.make_decoder_probe(depth: 2, height: 12, width: 20, seed: 42)
-logStep("SeedVR2 vae mode_probe start")
-let vaeModeProbe = vaeReference.make_vae_mode_probe(frames: 5, height: 96, width: 160, seed: 42)
-
-if processInfo.environment["SEEDVR2_RUN_VAE"] == "1" {
   let graph = DynamicGraph()
   graph.maxConcurrency = .limit(1)
   graph.withNoGrad {
@@ -2879,18 +2685,54 @@ if processInfo.environment["SEEDVR2_RUN_VAE"] == "1" {
       "index", decodedRelDetails.4)
 
     printParity("SeedVR2 vae full", swiftModeDecoded, torchModeDecoded)
+
+    if envFlag("SEEDVR2_EXPORT_VAE") {
+      logStep("SeedVR2 vae export compile")
+      let decoderInput = placeOnDevice(
+        graph.variable(.CPU, format: .NCHW, shape: [1, 16, 2, 12, 20], of: Float.self))
+      let (decoderReader, decoder) = SeedVR2Decoder3D(
+        startDepth: 2, startHeight: 12, startWidth: 20)
+      decoder.compile(inputs: decoderInput)
+      decoderReader(vaeStateDict)
+
+      let encoderInput = placeOnDevice(
+        graph.variable(.CPU, format: .NCHW, shape: [1, 3, 5, 96, 160], of: Float.self))
+      let (encoderReader, encoder) = SeedVR2Encoder3D(
+        startDepth: 5, startHeight: 96, startWidth: 160)
+      encoder.compile(inputs: encoderInput)
+      encoderReader(vaeStateDict)
+
+      graph.openStore(seedVR2VAEExportPath) {
+        $0.write("decoder", model: decoder)
+        $0.write("encoder", model: encoder)
+      }
+      print("Wrote \(seedVR2VAEExportPath)")
+    }
   }
   exit(0)
 }
 
-let ditReference = seedvr2Reference.SeedVR2Reference(
-  repo_root: seedVRRoot,
-  checkpoint_root: "\(seedVRRoot)/SeedVR2-3B",
-  device: hasCUDA ? "cuda" : "cpu",
-  load_dit: true,
-  load_vae: false)
+func seedVR2TextEmbeddingTensor(_ reference: PythonObject) -> Tensor<Float> {
+  let negative = reference.negative_text_embeddings().to(torch.float)
+  let positive = reference.positive_text_embeddings().to(torch.float)
+  return try! Tensor<Float>(numpy: torch.stack([negative, positive], dim: 0).cpu().numpy())
+}
 
-if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
+func seedVR2WriteDiTExport(reference: PythonObject, dit: Model) {
+  graph.openStore(seedVR2DiTExportPath) {
+    $0.write("text_embedding", tensor: seedVR2TextEmbeddingTensor(reference))
+    $0.write("dit", model: dit)
+  }
+  print("Wrote \(seedVR2DiTExportPath)")
+}
+
+if envFlag("SEEDVR2_RUN_DIT_WINDOW_FULL") {
+  let ditReference = seedvr2Reference.SeedVR2Reference(
+    repo_root: seedVRRoot,
+    checkpoint_root: seedVR2CheckpointRoot,
+    device: hasCUDA ? "cuda" : "cpu",
+    load_dit: true,
+    load_vae: false)
   let ditFrames = envInt("SEEDVR2_DIT_FRAMES", 5)
   let ditLatentHeight = envInt("SEEDVR2_DIT_LATENT_HEIGHT", 6)
   let ditLatentWidth = envInt("SEEDVR2_DIT_LATENT_WIDTH", 6)
@@ -2946,7 +2788,7 @@ if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
       }
     }
 
-    func temporalAttnRestInputs(
+    func windowAttnRestInputs(
       txt: DynamicGraph.Tensor<Float>,
       vidAttnMod: DynamicGraph.Tensor<Float>, txtAttnMod: DynamicGraph.Tensor<Float>,
       qkv: [DynamicGraph.AnyTensor],
@@ -3135,7 +2977,7 @@ if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
         shiftedAttnLastReader(ditStateDict, layerIndex)
         layerAttnOutputs = shiftedAttnLast(
           inputs: chainVid,
-          temporalAttnRestInputs(
+          windowAttnRestInputs(
             txt: chainTxt, vidAttnMod: layerVidAttnMod,
             txtAttnMod: layerTxtAttnMod, qkv: qkvOutputs, vidFreqs: shiftedVidFreqs,
             txtFreqs: shiftedTxtFreqs))
@@ -3143,7 +2985,7 @@ if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
         regularAttnReader(ditStateDict, layerIndex)
         layerAttnOutputs = regularAttn(
           inputs: chainVid,
-          temporalAttnRestInputs(
+          windowAttnRestInputs(
             txt: chainTxt, vidAttnMod: layerVidAttnMod,
             txtAttnMod: layerTxtAttnMod, qkv: qkvOutputs, vidFreqs: regularVidFreqs,
             txtFreqs: regularTxtFreqs))
@@ -3151,7 +2993,7 @@ if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
         shiftedAttnReader(ditStateDict, layerIndex)
         layerAttnOutputs = shiftedAttn(
           inputs: chainVid,
-          temporalAttnRestInputs(
+          windowAttnRestInputs(
             txt: chainTxt, vidAttnMod: layerVidAttnMod,
             txtAttnMod: layerTxtAttnMod, qkv: qkvOutputs, vidFreqs: shiftedVidFreqs,
             txtFreqs: shiftedTxtFreqs))
@@ -3250,303 +3092,6 @@ if processInfo.environment["SEEDVR2_RUN_DIT_WINDOW_FULL"] == "1" {
       maxGlobalRelativeDiff2DTensor(swiftFullOutput, torchFullOutput))
     if printEyeball {
       printTensor2DEyeball("SeedVR2 dit.window.full output", swiftFullOutput, torchFullOutput)
-    }
-  }
-  exit(0)
-}
-
-if processInfo.environment["SEEDVR2_RUN_DIT_SINGLE_WINDOW"] != "0" {
-  let ditFrames = 1
-  let ditLatentHeight = 6
-  let ditLatentWidth = 6
-  let ditVidLen = ditFrames * (ditLatentHeight / 2) * (ditLatentWidth / 2)
-  let ditTxtLen = 58
-  let printEyeball = processInfo.environment["SEEDVR2_PRINT_EYEBALL"] == "1"
-
-  logStep("SeedVR2 dit.single state_dict start")
-  let ditStateDict = ditReference.runner.dit.state_dict()
-  logStep("SeedVR2 dit.single rope_probe start")
-  let ditSingleProbe = ditReference.make_dit_block_probe(
-    layer_idx: 0, frames: ditFrames, latent_height: ditLatentHeight, latent_width: ditLatentWidth,
-    timestep: 500.0,
-    disable_rope: false)
-  logStep("SeedVR2 dit.single official_probe start")
-  let ditSingleOfficialProbe = ditReference.make_dit_body_probe_official(
-    frames: ditFrames, latent_height: ditLatentHeight, latent_width: ditLatentWidth, timestep: 500.0
-  )
-
-  graph.withNoGrad {
-    func loadTensor(_ probe: PythonObject, _ key: String) -> Tensor<Float> {
-      try! Tensor<Float>(numpy: probe[key].to(torch.float).cpu().numpy())
-    }
-
-    let embCPU = loadTensor(ditSingleOfficialProbe, "emb")
-    let compileVid = rematerializeOnDevice(
-      graph, loadTensor(ditSingleOfficialProbe, "layer0_vid_input"))
-    let compileTxt = rematerializeOnDevice(
-      graph, loadTensor(ditSingleOfficialProbe, "layer0_txt_input"))
-    let vidFreqs = placeOnDevice(graph.variable(loadTensor(ditSingleProbe, "window0_vid_freqs")))
-    let txtFreqs = placeOnDevice(graph.variable(loadTensor(ditSingleProbe, "window0_txt_freqs")))
-
-    let layer0VidAttnMod = rematerializeOnDevice(
-      graph,
-      seedVR2BlockModTensor(
-        emb: embCPU, stateDict: ditStateDict, blockIndex: 0, branch: "vid", layer: "attn"))
-    let layer0TxtAttnMod = rematerializeOnDevice(
-      graph,
-      seedVR2BlockModTensor(
-        emb: embCPU, stateDict: ditStateDict, blockIndex: 0, branch: "txt", layer: "attn"))
-    let layer0VidMlpMod = rematerializeOnDevice(
-      graph,
-      seedVR2BlockModTensor(
-        emb: embCPU, stateDict: ditStateDict, blockIndex: 0, branch: "vid", layer: "mlp"))
-    let layer0TxtMlpMod = rematerializeOnDevice(
-      graph,
-      seedVR2BlockModTensor(
-        emb: embCPU, stateDict: ditStateDict, blockIndex: 0, branch: "txt", layer: "mlp"))
-
-    logStep("SeedVR2 dit.single compile body")
-    let attnInProbe = SeedVR2DiTAttnInProbe(vidLen: ditVidLen, txtLen: ditTxtLen)
-    attnInProbe.compile(inputs: compileVid, compileTxt, layer0VidAttnMod, layer0TxtAttnMod)
-    let attnInProbeLast = SeedVR2DiTAttnInProbeLastLayer(vidLen: ditVidLen, txtLen: ditTxtLen)
-    attnInProbeLast.compile(inputs: compileVid, compileTxt, layer0VidAttnMod)
-
-    let (singleQKVFromAttnReader, singleQKVFromAttn) = SeedVR2DiTQKVFromAttnInputsProbe(
-      vidLen: ditVidLen, txtLen: ditTxtLen)
-    singleQKVFromAttn.compile(
-      inputs:
-        rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "vid_attn_in")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "txt_attn_in")))
-
-    let vidRotaryProbe = SeedVR2RotaryProbe(seqLen: ditVidLen)
-    vidRotaryProbe.compile(
-      inputs:
-        rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "vid_q")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "vid_k")),
-      vidFreqs)
-    let txtRotaryProbe = SeedVR2RotaryProbe(seqLen: ditTxtLen)
-    txtRotaryProbe.compile(
-      inputs:
-        rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "txt_q")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "txt_k")),
-      txtFreqs)
-
-    let (attnProjectReader, attnProject) = SeedVR2DiTAttnProjectOnly(
-      vidLen: ditVidLen, txtLen: ditTxtLen)
-    attnProject.compile(
-      inputs:
-        compileVid, compileTxt, layer0VidAttnMod, layer0TxtAttnMod,
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_vid_q_rope")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_vid_k_rope")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_vid_v")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_txt_q_rope")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_txt_k_rope")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_txt_v")))
-    let (attnProjectLastReader, attnProjectLast) = SeedVR2DiTAttnProjectOnlyLastLayer(
-      vidLen: ditVidLen, txtLen: ditTxtLen)
-    attnProjectLast.compile(
-      inputs:
-        compileVid, compileTxt, layer0VidAttnMod,
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_vid_q_rope")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_vid_k_rope")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_vid_v")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_txt_q_rope")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_txt_k_rope")),
-      rematerializeOnDevice(graph, loadTensor(ditSingleProbe, "window0_txt_v")))
-
-    let (mlpReader, mlp) = SeedVR2DiTMlpOnly(vidLen: ditVidLen, txtLen: ditTxtLen)
-    mlp.compile(inputs: compileVid, compileTxt, layer0VidMlpMod, layer0TxtMlpMod)
-    let (mlpLastReader, mlpLast) = SeedVR2DiTMlpOnlyLastLayer(
-      vidLen: ditVidLen, txtLen: ditTxtLen)
-    mlpLast.compile(inputs: compileVid, compileTxt, layer0VidMlpMod)
-
-    logStep("SeedVR2 dit.single compile input/output")
-    let rawVidInput = rematerializeOnDevice(graph, loadTensor(ditSingleOfficialProbe, "vid_input"))
-    let rawTxtInput = rematerializeOnDevice(graph, loadTensor(ditSingleOfficialProbe, "txt_input"))
-    let timeInput = placeOnDevice(
-      graph.variable(
-        seedVR2TimeEmbedding(timestep: 500.0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)))
-
-    let (txtInReader, txtInModel) = SeedVR2DiTTextIn()
-    txtInModel.compile(inputs: rawTxtInput)
-    let (patchInReader, patchInModel) = SeedVR2DiTPatchIn(
-      frames: ditFrames, latentHeight: ditLatentHeight, latentWidth: ditLatentWidth)
-    patchInModel.compile(inputs: rawVidInput)
-    let (embReader, embModel) = SeedVR2DiTTimeEmbedding()
-    embModel.compile(inputs: timeInput)
-    let (outputHeadReader, outputHead) = SeedVR2DiTOutputHead(
-      frames: ditFrames, latentHeight: ditLatentHeight, latentWidth: ditLatentWidth)
-    outputHead.compile(
-      inputs:
-        compileVid,
-      rematerializeOnDevice(
-        graph, seedVR2OutputModTensor(emb: embCPU, stateDict: ditStateDict, offset: 0)))
-
-    txtInReader(ditStateDict)
-    patchInReader(ditStateDict)
-    embReader(ditStateDict)
-    outputHeadReader(ditStateDict)
-
-    let fullTxtInput = txtInModel(inputs: rawTxtInput)[0].as(of: Float.self).copied()
-    let fullVidInput = patchInModel(inputs: rawVidInput)[0].as(of: Float.self).copied()
-    let fullEmb = embModel(inputs: timeInput)[0].as(of: Float.self).copied()
-    let fullEmbCPU = copiedToCPU(fullEmb)
-    print(
-      "SeedVR2 dit.single init vid max abs diff:",
-      maxAbsDiff2DTensor(
-        copiedToCPU(fullVidInput), loadTensor(ditSingleOfficialProbe, "layer0_vid_input")))
-    print(
-      "SeedVR2 dit.single init txt max abs diff:",
-      maxAbsDiff2DTensor(
-        copiedToCPU(fullTxtInput), loadTensor(ditSingleOfficialProbe, "layer0_txt_input")))
-    print(
-      "SeedVR2 dit.single init emb max abs diff:",
-      maxAbsDiff2DTensor(fullEmbCPU, embCPU))
-
-    let summaryLayers: Set<Int> = [0, 1, 9, 30, 31]
-    var chainVid = fullVidInput
-    var chainTxt = fullTxtInput
-    var worstChainedVidLayer = 0
-    var worstChainedTxtLayer = 0
-    var worstChainedVid: Float = 0
-    var worstChainedTxt: Float = 0
-
-    for layerIndex in 0..<32 {
-      let layerVidAttnMod = rematerializeOnDevice(
-        graph,
-        seedVR2BlockModTensor(
-          emb: fullEmbCPU, stateDict: ditStateDict, blockIndex: layerIndex, branch: "vid",
-          layer: "attn"))
-      let layerTxtAttnMod = rematerializeOnDevice(
-        graph,
-        seedVR2BlockModTensor(
-          emb: fullEmbCPU, stateDict: ditStateDict, blockIndex: layerIndex, branch: "txt",
-          layer: "attn"))
-      let layerVidMlpMod = rematerializeOnDevice(
-        graph,
-        seedVR2BlockModTensor(
-          emb: fullEmbCPU, stateDict: ditStateDict, blockIndex: layerIndex, branch: "vid",
-          layer: "mlp"))
-      let layerTxtMlpMod = rematerializeOnDevice(
-        graph,
-        seedVR2BlockModTensor(
-          emb: fullEmbCPU, stateDict: ditStateDict, blockIndex: layerIndex, branch: "txt",
-          layer: "mlp"))
-
-      let layerAttnInOutputs: [DynamicGraph.AnyTensor]
-      if layerIndex == 31 {
-        layerAttnInOutputs = attnInProbeLast(inputs: chainVid, chainTxt, layerVidAttnMod)
-      } else {
-        layerAttnInOutputs = attnInProbe(
-          inputs: chainVid, chainTxt, layerVidAttnMod, layerTxtAttnMod)
-      }
-      singleQKVFromAttnReader(ditStateDict, layerIndex)
-      let layerQKVOutputs = singleQKVFromAttn(inputs: layerAttnInOutputs[0], layerAttnInOutputs[1])
-      let layerVidRotaryOutputs = vidRotaryProbe(
-        inputs: layerQKVOutputs[0], layerQKVOutputs[1], vidFreqs)
-      let layerTxtRotaryOutputs = txtRotaryProbe(
-        inputs: layerQKVOutputs[3], layerQKVOutputs[4], txtFreqs)
-
-      let layerAttnOutputs: [DynamicGraph.AnyTensor]
-      if layerIndex == 31 {
-        attnProjectLastReader(ditStateDict, layerIndex)
-        layerAttnOutputs = attnProjectLast(
-          inputs:
-            chainVid, chainTxt, layerVidAttnMod,
-          layerVidRotaryOutputs[0], layerVidRotaryOutputs[1], layerQKVOutputs[2],
-          layerTxtRotaryOutputs[0], layerTxtRotaryOutputs[1], layerQKVOutputs[5])
-      } else {
-        attnProjectReader(ditStateDict, layerIndex)
-        layerAttnOutputs = attnProject(
-          inputs:
-            chainVid, chainTxt, layerVidAttnMod, layerTxtAttnMod,
-          layerVidRotaryOutputs[0], layerVidRotaryOutputs[1], layerQKVOutputs[2],
-          layerTxtRotaryOutputs[0], layerTxtRotaryOutputs[1], layerQKVOutputs[5])
-      }
-
-      let layerOutputs: [DynamicGraph.AnyTensor]
-      if layerIndex == 31 {
-        mlpLastReader(ditStateDict, layerIndex)
-        layerOutputs = mlpLast(inputs: layerAttnOutputs[0], layerAttnOutputs[1], layerVidMlpMod)
-      } else {
-        mlpReader(ditStateDict, layerIndex)
-        layerOutputs = mlp(
-          inputs: layerAttnOutputs[0], layerAttnOutputs[1], layerVidMlpMod, layerTxtMlpMod)
-      }
-      chainVid = layerOutputs[0].as(of: Float.self).copied()
-      chainTxt = layerOutputs[1].as(of: Float.self).copied()
-
-      let layerVidDiff = maxAbsDiff2DTensor(
-        copiedToCPU(chainVid),
-        loadTensor(ditSingleOfficialProbe, "layer\(layerIndex)_vid_before_out"))
-      let layerTxtDiff = maxAbsDiff2DTensor(
-        copiedToCPU(chainTxt),
-        loadTensor(ditSingleOfficialProbe, "layer\(layerIndex)_txt_before_out"))
-      if layerVidDiff > worstChainedVid {
-        worstChainedVid = layerVidDiff
-        worstChainedVidLayer = layerIndex
-      }
-      if layerTxtDiff > worstChainedTxt {
-        worstChainedTxt = layerTxtDiff
-        worstChainedTxtLayer = layerIndex
-      }
-      if summaryLayers.contains(layerIndex) {
-        print("SeedVR2 dit.single layer\(layerIndex) vid max abs diff:", layerVidDiff)
-        print("SeedVR2 dit.single layer\(layerIndex) txt max abs diff:", layerTxtDiff)
-      }
-    }
-
-    print(
-      "SeedVR2 dit.single body worst vid max abs diff:",
-      worstChainedVid, "layer:", worstChainedVidLayer)
-    print(
-      "SeedVR2 dit.single body worst txt max abs diff:",
-      worstChainedTxt, "layer:", worstChainedTxtLayer)
-
-    let swiftBodyVid = copiedToCPU(chainVid)
-    let swiftBodyTxt = copiedToCPU(chainTxt)
-    let torchBodyVid = loadTensor(ditSingleOfficialProbe, "vid_before_out")
-    let torchBodyTxt = loadTensor(ditSingleOfficialProbe, "txt_before_out")
-    print(
-      "SeedVR2 dit.single body vid max abs diff:", maxAbsDiff2DTensor(swiftBodyVid, torchBodyVid))
-    print(
-      "SeedVR2 dit.single body vid global max rel diff:",
-      maxGlobalRelativeDiff2DTensor(swiftBodyVid, torchBodyVid))
-    print(
-      "SeedVR2 dit.single body txt max abs diff:", maxAbsDiff2DTensor(swiftBodyTxt, torchBodyTxt))
-    print(
-      "SeedVR2 dit.single body txt global max rel diff:",
-      maxGlobalRelativeDiff2DTensor(swiftBodyTxt, torchBodyTxt))
-    if printEyeball {
-      printTensor2DEyeball("SeedVR2 dit.single body vid", swiftBodyVid, torchBodyVid)
-      printTensor2DEyeball("SeedVR2 dit.single body txt", swiftBodyTxt, torchBodyTxt)
-    }
-
-    let torchAfterNorm = loadTensor(ditSingleOfficialProbe, "vid_after_norm")
-    let torchAfterAda = loadTensor(ditSingleOfficialProbe, "vid_after_ada")
-    let torchFullOutput = loadTensor(ditSingleOfficialProbe, "output")
-    let tailOutputs = outputHead(
-      inputs:
-        chainVid,
-      rematerializeOnDevice(
-        graph, seedVR2OutputModTensor(emb: fullEmbCPU, stateDict: ditStateDict, offset: 0)))
-    let swiftAfterNorm = copiedToCPU(tailOutputs[0].as(of: Float.self))
-    let swiftAfterAda = copiedToCPU(tailOutputs[1].as(of: Float.self))
-    let swiftFullOutput = copiedToCPU(tailOutputs[2].as(of: Float.self))
-    print(
-      "SeedVR2 dit.single tail after_norm max abs diff:",
-      maxAbsDiff2DTensor(swiftAfterNorm, torchAfterNorm))
-    print(
-      "SeedVR2 dit.single tail after_ada max abs diff:",
-      maxAbsDiff2DTensor(swiftAfterAda, torchAfterAda))
-    print(
-      "SeedVR2 dit.single full output max abs diff:",
-      maxAbsDiff2DTensor(swiftFullOutput, torchFullOutput))
-    print(
-      "SeedVR2 dit.single full output global max rel diff:",
-      maxGlobalRelativeDiff2DTensor(swiftFullOutput, torchFullOutput))
-    if printEyeball {
-      printTensor2DEyeball("SeedVR2 dit.single full output", swiftFullOutput, torchFullOutput)
     }
   }
   exit(0)
