@@ -616,27 +616,6 @@ func seedVR2ZeroDependency2D(_ x: Model.IO) -> Model.IO {
   x.reduced(.sum, axis: [0, 1]) * 1e-30
 }
 
-func seedVR2RotaryParameters(name: String, tensors: [Tensor<Float>]) -> (() -> Void, [Model.IO]) {
-  var parameters = [Model.Parameters]()
-  var outputs = [Model.IO]()
-  for (index, tensor) in tensors.enumerated() {
-    precondition(tensor.shape.count == 4)
-    let parameter = Parameter<Float>(
-      .GPU(swiftDevice), .NHWC(tensor.shape[0], tensor.shape[1], tensor.shape[2], tensor.shape[3]),
-      trainable: false, name: "\(name)_\(index)")
-    parameters.append(parameter.weight)
-    outputs.append(
-      parameter.reshaped(
-        [tensor.shape[0], tensor.shape[1], tensor.shape[2], tensor.shape[3]], format: .NHWC))
-  }
-  let reader = {
-    for (parameter, tensor) in zip(parameters, tensors) {
-      parameter.copy(from: tensor)
-    }
-  }
-  return (reader, outputs)
-}
-
 func seedVR2ApplyRotary3D(
   _ x: Model.IO, rot: Model.IO, seqLen: Int, heads: Int, headDim: Int = 128, rotDim: Int = 126
 ) -> Model.IO {
@@ -1414,9 +1393,7 @@ func seedVR2DiTOutputIO(
 }
 
 func SeedVR2DiT(
-  config: SeedVR2DiTConfig, frames: Int, latentHeight: Int, latentWidth: Int, txtLen: Int,
-  regularVidRotary: [Tensor<Float>], regularTxtRotary: [Tensor<Float>],
-  shiftedVidRotary: [Tensor<Float>], shiftedTxtRotary: [Tensor<Float>]
+  config: SeedVR2DiTConfig, frames: Int, latentHeight: Int, latentWidth: Int, txtLen: Int
 ) -> ((PythonObject) -> Void, Model) {
   let vid = Input()
   let txt = Input()
@@ -1427,14 +1404,10 @@ func SeedVR2DiT(
     frames: frames, height: patchHeight, width: patchWidth, shifted: false)
   let shiftedWindows = seedVR2WindowSpec3D(
     frames: frames, height: patchHeight, width: patchWidth, shifted: true)
-  let (regularVidFreqReader, regularVidFreqs) = seedVR2RotaryParameters(
-    name: "regular_vid_freqs", tensors: regularVidRotary)
-  let (regularTxtFreqReader, regularTxtFreqs) = seedVR2RotaryParameters(
-    name: "regular_txt_freqs", tensors: regularTxtRotary)
-  let (shiftedVidFreqReader, shiftedVidFreqs) = seedVR2RotaryParameters(
-    name: "shifted_vid_freqs", tensors: shiftedVidRotary)
-  let (shiftedTxtFreqReader, shiftedTxtFreqs) = seedVR2RotaryParameters(
-    name: "shifted_txt_freqs", tensors: shiftedTxtRotary)
+  let regularVidFreqs = regularWindows.map { _ in Input() }
+  let regularTxtFreqs = regularWindows.map { _ in Input() }
+  let shiftedVidFreqs = shiftedWindows.map { _ in Input() }
+  let shiftedTxtFreqs = shiftedWindows.map { _ in Input() }
 
   let (txtInReader, txtIn) = SeedVR2DiTTextIn(hiddenSize: config.hiddenSize)
   let (patchInReader, patchIn) = SeedVR2DiTPatchIn(
@@ -1467,10 +1440,6 @@ func SeedVR2DiT(
   readers.append(outReader)
 
   let reader: (PythonObject) -> Void = { stateDict in
-    regularVidFreqReader()
-    regularTxtFreqReader()
-    shiftedVidFreqReader()
-    shiftedTxtFreqReader()
     for reader in readers {
       reader(stateDict)
     }
@@ -1478,7 +1447,12 @@ func SeedVR2DiT(
   let outWithDependencies =
     out + seedVR2ZeroDependency2D(vid) + seedVR2ZeroDependency2D(txt)
     + seedVR2ZeroDependency2D(timestep) + seedVR2ZeroDependency2D(txtOut)
-  return (reader, Model([vid, txt, timestep], [outWithDependencies.copied()]))
+  return (
+    reader,
+    Model(
+      [vid, txt, timestep] + regularVidFreqs + regularTxtFreqs + shiftedVidFreqs + shiftedTxtFreqs,
+      [outWithDependencies.copied()])
+  )
 }
 
 func SeedVR2DecoderConvIn(depth: Int, height: Int, width: Int) -> (
@@ -2065,18 +2039,29 @@ if envFlag("SEEDVR2_RUN_DIT") || envFlag("SEEDVR2_RUN_DIT_WINDOW_FULL")
     let timeInput = placeOnDevice(
       graph.variable(
         seedVR2TimeEmbedding(timestep: 500.0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)))
+    let regularVidFreqInputs = regularVidFreqs.map { rematerializeOnDevice(graph, $0) }
+    let regularTxtFreqInputs = regularTxtFreqs.map { rematerializeOnDevice(graph, $0) }
+    let shiftedVidFreqInputs = shiftedVidFreqs.map { rematerializeOnDevice(graph, $0) }
+    let shiftedTxtFreqInputs = shiftedTxtFreqs.map { rematerializeOnDevice(graph, $0) }
+    let rotaryInputs =
+      regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
+    let ditInputs: [DynamicGraph_Any] =
+      [
+        rawVidInput as DynamicGraph_Any, rawTxtInput as DynamicGraph_Any,
+        timeInput as DynamicGraph_Any,
+      ]
+      + rotaryInputs.map { $0 as DynamicGraph_Any }
+    let ditRestInputs = Array(ditInputs.dropFirst())
 
     logStep("SeedVR2 dit compile")
     let (ditReader, dit) = SeedVR2DiT(
       config: seedVR2Config, frames: ditFrames, latentHeight: ditLatentHeight,
-      latentWidth: ditLatentWidth, txtLen: ditTxtLen, regularVidRotary: regularVidFreqs,
-      regularTxtRotary: regularTxtFreqs, shiftedVidRotary: shiftedVidFreqs,
-      shiftedTxtRotary: shiftedTxtFreqs)
-    dit.compile(inputs: rawVidInput, rawTxtInput, timeInput)
+      latentWidth: ditLatentWidth, txtLen: ditTxtLen)
+    dit.compile(inputs: ditInputs)
     logStep("SeedVR2 dit load")
     ditReader(ditStateDict)
     logStep("SeedVR2 dit forward")
-    let ditOutputs = dit(inputs: rawVidInput, rawTxtInput, timeInput)
+    let ditOutputs = dit(inputs: rawVidInput, ditRestInputs)
     let swiftFullOutput = copiedToCPU(ditOutputs[0].as(of: Float.self))
     let torchFullOutput = loadTensor(officialProbe, "output")
     print(
