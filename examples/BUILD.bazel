@@ -1256,6 +1256,7 @@ swift_binary(
         "//:diffusion",
         "@PythonKit",
         "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
         "@s4nnc//nnc",
         "@s4nnc//nnc:nnc_python",
     ],

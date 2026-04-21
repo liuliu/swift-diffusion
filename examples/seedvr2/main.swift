@@ -3,6 +3,7 @@ import Foundation
 import Glibc
 import NNC
 import NNCPythonConversion
+import PNG
 import PythonKit
 
 typealias FloatType = Float
@@ -88,9 +89,9 @@ func seedVR2DiTConfig() -> SeedVR2DiTConfig {
 
 let seedVR2Config = seedVR2DiTConfig()
 let seedVR2VAEExportPath = envString(
-  "SEEDVR2_VAE_CKPT", "\(repoRoot)/seedvr2_\(seedVR2Config.name.lowercased())_vae_f32.ckpt")
+  "SEEDVR2_VAE_CKPT", "/fast/Data/seedvr2_3b_vae_f32.ckpt")
 let seedVR2DiTExportPath = envString(
-  "SEEDVR2_DIT_CKPT", "\(repoRoot)/seedvr2_\(seedVR2Config.name.lowercased())_dit_f32.ckpt")
+  "SEEDVR2_DIT_CKPT", "/fast/Data/seedvr2_\(seedVR2Config.name.lowercased())_dit_f32.ckpt")
 
 let userSitePackages = site.getusersitepackages()
 if (Bool(osPath.isdir(userSitePackages)) ?? false)
@@ -238,6 +239,17 @@ func seedVR2RotaryTensor(from freqs: Tensor<Float>) -> Tensor<Float> {
     }
   }
   return rot
+}
+
+func seedVR2LoadWindowFreqs(
+  _ probe: PythonObject, kind: String, count: Int
+) -> [Tensor<Float>] {
+  var freqs = [Tensor<Float>]()
+  for index in 0..<count {
+    let torchTensor = probe["window\(index)_\(kind)_freqs"].to(torch.float)
+    freqs.append(seedVR2RotaryTensor(from: try! Tensor<Float>(numpy: torchTensor.cpu().numpy())))
+  }
+  return freqs
 }
 
 func maxAbsDiff2DTensor(_ lhs: Tensor<Float>, _ rhs: Tensor<Float>) -> Float {
@@ -507,15 +519,19 @@ func SeedVR2Upsample3D(
         upHeight * upWidth, upWidth, 1,
       ]
     ).contiguous()
-    let rest = out.reshaped(
-      [1, channels, upDepthRaw - 2, upHeight, upWidth],
-      offset: [0, 0, 2, 0, 0],
-      strides: [
-        channels * upDepthRaw * upHeight * upWidth, upDepthRaw * upHeight * upWidth,
-        upHeight * upWidth, upWidth, 1,
-      ]
-    ).contiguous()
-    out = Functional.concat(axis: 2, first, rest)
+    if depth == 1 {
+      out = first
+    } else {
+      let rest = out.reshaped(
+        [1, channels, upDepthRaw - 2, upHeight, upWidth],
+        offset: [0, 0, 2, 0, 0],
+        strides: [
+          channels * upDepthRaw * upHeight * upWidth, upDepthRaw * upHeight * upWidth,
+          upHeight * upWidth, upWidth, 1,
+        ]
+      ).contiguous()
+      out = Functional.concat(axis: 2, first, rest)
+    }
   }
   let upDepth = temporalUp ? 1 + (depth - 1) * temporalRatio : upDepthRaw
   let conv = Convolution(
@@ -1803,34 +1819,6 @@ func SeedVR2Encoder3D(startDepth: Int, startHeight: Int, startWidth: Int) -> (
   return (reader, Model([x], [out.copied()]))
 }
 
-func SeedVR2VAE3D(startDepth: Int, startHeight: Int, startWidth: Int) -> (
-  (PythonObject) -> Void, Model
-) {
-  let x = Input()
-  let (encoderReader, encoder) = SeedVR2Encoder3D(
-    startDepth: startDepth, startHeight: startHeight, startWidth: startWidth)
-  let moments = encoder(x)
-  let latentDepth1 = (startDepth + 1) / 2
-  let latentDepth = (latentDepth1 + 1) / 2
-  let latentHeight = startHeight / 8
-  let latentWidth = startWidth / 8
-  let latent = moments.reshaped(
-    [1, 16, latentDepth, latentHeight, latentWidth],
-    strides: [
-      32 * latentDepth * latentHeight * latentWidth, latentDepth * latentHeight * latentWidth,
-      latentHeight * latentWidth, latentWidth, 1,
-    ]
-  ).contiguous()
-  let (decoderReader, decoder) = SeedVR2Decoder3D(
-    startDepth: latentDepth, startHeight: latentHeight, startWidth: latentWidth)
-  let out = decoder(latent)
-  let reader: (PythonObject) -> Void = { stateDict in
-    encoderReader(stateDict)
-    decoderReader(stateDict)
-  }
-  return (reader, Model([x], [out.copied()]))
-}
-
 func SeedVR2MomentsToLatent(depth: Int, height: Int, width: Int) -> Model {
   let x = Input()
   let latent = x.reshaped(
@@ -1851,12 +1839,15 @@ if envFlag("SEEDVR2_RUN_VAE") || envFlag("SEEDVR2_EXPORT_VAE") {
     load_vae: true)
   logStep("SeedVR2 vae state_dict start")
   let vaeStateDict = vaeReference.runner.vae.state_dict()
-  logStep("SeedVR2 vae encoder_probe start")
-  let vaeEncoderProbe = vaeReference.make_encoder_probe(depth: 5, height: 96, width: 160, seed: 42)
-  logStep("SeedVR2 vae decoder_probe start")
-  let vaeDecoderProbe = vaeReference.make_decoder_probe(depth: 2, height: 12, width: 20, seed: 42)
-  logStep("SeedVR2 vae mode_probe start")
-  let vaeModeProbe = vaeReference.make_vae_mode_probe(frames: 5, height: 96, width: 160, seed: 42)
+  logStep("SeedVR2 vae encoder reference start")
+  let vaeEncoderReference = vaeReference.make_encoder_probe(
+    depth: 5, height: 96, width: 160, seed: 42)
+  logStep("SeedVR2 vae decoder reference start")
+  let vaeDecoderReference = vaeReference.make_decoder_probe(
+    depth: 2, height: 12, width: 20, seed: 42)
+  logStep("SeedVR2 vae mode reference start")
+  let vaeModeReference = vaeReference.make_vae_mode_probe(
+    frames: 5, height: 96, width: 160, seed: 42)
 
   let graph = DynamicGraph()
   graph.maxConcurrency = .limit(1)
@@ -1880,30 +1871,30 @@ if envFlag("SEEDVR2_RUN_VAE") || envFlag("SEEDVR2_EXPORT_VAE") {
     }
 
     logStep("SeedVR2 vae validation start")
-    let encoderInput = loadInput(vaeEncoderProbe, "input")
+    let encoderInput = loadInput(vaeEncoderReference, "input")
     let (encoderReader, encoder) = SeedVR2Encoder3D(
       startDepth: 5, startHeight: 96, startWidth: 160)
     encoder.compile(inputs: encoderInput)
     encoderReader(vaeStateDict)
     let swiftEncoderOutput = materialize(encoder(inputs: encoderInput)[0].as(of: Float.self))
-    let torchEncoderOutput = loadTensor(vaeEncoderProbe, "output")
+    let torchEncoderOutput = loadTensor(vaeEncoderReference, "output")
     printParity("SeedVR2 vae.encoder", swiftEncoderOutput, torchEncoderOutput)
 
-    let decoderInput = loadInput(vaeDecoderProbe, "input")
+    let decoderInput = loadInput(vaeDecoderReference, "input")
     let (decoderReader, decoder) = SeedVR2Decoder3D(
       startDepth: 2, startHeight: 12, startWidth: 20)
     decoder.compile(inputs: decoderInput)
     decoderReader(vaeStateDict)
     let swiftDecoderOutput = materialize(decoder(inputs: decoderInput)[0].as(of: Float.self))
-    let torchDecoderOutput = loadTensor(vaeDecoderProbe, "output")
+    let torchDecoderOutput = loadTensor(vaeDecoderReference, "output")
     printParity("SeedVR2 vae.decoder", swiftDecoderOutput, torchDecoderOutput)
 
-    let vaeModeInput = loadInput(vaeModeProbe, "input")
+    let vaeModeInput = loadInput(vaeModeReference, "input")
     let swiftModeMoments = materialize(encoder(inputs: vaeModeInput)[0].as(of: Float.self))
-    let torchModeMoments = loadTensor(vaeModeProbe, "moments")
+    let torchModeMoments = loadTensor(vaeModeReference, "moments")
     printParity("SeedVR2 vae.mode moments", swiftModeMoments, torchModeMoments)
 
-    let torchModeLatent = loadTensor(vaeModeProbe, "latent")
+    let torchModeLatent = loadTensor(vaeModeReference, "latent")
     let momentsToLatentInput = rematerializeOnDevice(graph, swiftModeMoments)
     let momentsToLatent = SeedVR2MomentsToLatent(depth: 2, height: 12, width: 20)
     momentsToLatent.compile(inputs: momentsToLatentInput)
@@ -1911,7 +1902,7 @@ if envFlag("SEEDVR2_RUN_VAE") || envFlag("SEEDVR2_EXPORT_VAE") {
       momentsToLatent(inputs: momentsToLatentInput)[0].as(of: Float.self))
     printParity("SeedVR2 vae.mode latent", swiftModeLatent, torchModeLatent)
 
-    let torchModeDecoded = loadTensor(vaeModeProbe, "output")
+    let torchModeDecoded = loadTensor(vaeModeReference, "output")
     let swiftModeDecoded = materialize(
       decoder(inputs: rematerializeOnDevice(graph, swiftModeLatent))[0].as(of: Float.self))
     printParity("SeedVR2 vae.mode decoded", swiftModeDecoded, torchModeDecoded)
@@ -1944,18 +1935,233 @@ if envFlag("SEEDVR2_RUN_VAE") || envFlag("SEEDVR2_EXPORT_VAE") {
   exit(0)
 }
 
-func seedVR2TextEmbeddingTensor(_ reference: PythonObject) -> Tensor<Float> {
-  let negative = reference.negative_text_embeddings().to(torch.float)
+func seedVR2PositiveEmbeddingTensor(_ reference: PythonObject) -> Tensor<Float> {
   let positive = reference.positive_text_embeddings().to(torch.float)
-  return try! Tensor<Float>(numpy: torch.stack([negative, positive], dim: 0).cpu().numpy())
+  return try! Tensor<Float>(numpy: positive.cpu().numpy())
+}
+
+func seedVR2NegativeEmbeddingTensor(_ reference: PythonObject) -> Tensor<Float> {
+  let negative = reference.negative_text_embeddings().to(torch.float)
+  return try! Tensor<Float>(numpy: negative.cpu().numpy())
 }
 
 func seedVR2WriteDiTExport(reference: PythonObject, dit: Model) {
   graph.openStore(seedVR2DiTExportPath) {
-    $0.write("text_embedding", tensor: seedVR2TextEmbeddingTensor(reference))
+    $0.write("positive_embedding", tensor: seedVR2PositiveEmbeddingTensor(reference))
+    $0.write("negative_embedding", tensor: seedVR2NegativeEmbeddingTensor(reference))
     $0.write("dit", model: dit)
   }
   print("Wrote \(seedVR2DiTExportPath)")
+}
+
+func seedVR2LoadImageTensor(path: String, height: Int, width: Int) -> Tensor<Float> {
+  let imageModule = Python.import("PIL.Image")
+  let image = imageModule.open(path).convert("RGB").resize(PythonObject(tupleOf: width, height))
+  let array = ((numpy.array(image).astype(numpy.float32) / 127.5) - 1.0).transpose([2, 0, 1])
+    .reshape([1, 3, 1, height, width])
+  return try! Tensor<Float>(numpy: array)
+}
+
+func seedVR2Byte(_ value: Float) -> UInt8 {
+  UInt8(min(max(Int((value + 1) * 127.5 + 0.5), 0), 255))
+}
+
+func seedVR2SaveImageTensor(_ tensor: Tensor<Float>, path: String) {
+  precondition(tensor.shape.count == 5)
+  precondition(tensor.shape[0] == 1)
+  precondition(tensor.shape[1] == 3)
+  let height = tensor.shape[3]
+  let width = tensor.shape[4]
+  var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: width * height)
+  for y in 0..<height {
+    for x in 0..<width {
+      let offset = y * width + x
+      rgba[offset].r = seedVR2Byte(Float(tensor[0, 0, 0, y, x]))
+      rgba[offset].g = seedVR2Byte(Float(tensor[0, 1, 0, y, x]))
+      rgba[offset].b = seedVR2Byte(Float(tensor[0, 2, 0, y, x]))
+    }
+  }
+  let image = PNG.Data.Rectangular(
+    packing: rgba, size: (width, height),
+    layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
+  try! image.compress(path: path, level: 4)
+}
+
+func seedVR2BuildRawDiTInput(
+  noise: Tensor<Float>, conditionLatent: Tensor<Float>, depth: Int, height: Int, width: Int
+) -> Tensor<Float> {
+  precondition(conditionLatent.shape.count == 5)
+  precondition(conditionLatent.shape[0] == 1)
+  precondition(conditionLatent.shape[1] >= 16)
+  precondition(conditionLatent.shape[2] == depth)
+  precondition(conditionLatent.shape[3] == height)
+  precondition(conditionLatent.shape[4] == width)
+  let tokenCount = depth * height * width
+  precondition(noise.shape == [tokenCount, 16])
+  var input = Tensor<Float>(.CPU, .NC(tokenCount, 33))
+  var token = 0
+  for t in 0..<depth {
+    for h in 0..<height {
+      for w in 0..<width {
+        for c in 0..<16 {
+          input[token, c] = noise[token, c]
+          input[token, 16 + c] = conditionLatent[0, c, t, h, w]
+        }
+        input[token, 32] = 1
+        token += 1
+      }
+    }
+  }
+  return input
+}
+
+func seedVR2BuildDecoderLatent(
+  noise: Tensor<Float>, prediction: Tensor<Float>, depth: Int, height: Int, width: Int,
+  scalingFactor: Float
+) -> Tensor<Float> {
+  let tokenCount = depth * height * width
+  precondition(noise.shape == [tokenCount, 16])
+  precondition(prediction.shape == [tokenCount, 16])
+  var latent = Tensor<Float>(.CPU, format: .NCHW, shape: [1, 16, depth, height, width])
+  var token = 0
+  for t in 0..<depth {
+    for h in 0..<height {
+      for w in 0..<width {
+        for c in 0..<16 {
+          latent[0, c, t, h, w] = (noise[token, c] - prediction[token, c]) / scalingFactor
+        }
+        token += 1
+      }
+    }
+  }
+  return latent
+}
+
+if envFlag("SEEDVR2_RUN_UPSCALE") {
+  precondition(seedVR2Config.name == "3B", "SeedVR2 upscale smoke path currently targets 3B.")
+  let inputPath = envString("SEEDVR2_UPSCALE_INPUT", "\(repoRoot)/generated.png")
+  let outputPath = envString(
+    "SEEDVR2_UPSCALE_OUTPUT", "\(repoRoot)/seedvr2_\(seedVR2Config.name.lowercased())_upscale.png")
+  let imageHeight = envInt("SEEDVR2_UPSCALE_HEIGHT", 256)
+  let imageWidth = envInt("SEEDVR2_UPSCALE_WIDTH", 256)
+  precondition(imageHeight % 16 == 0 && imageWidth % 16 == 0)
+  let latentDepth = 1
+  let latentHeight = imageHeight / 8
+  let latentWidth = imageWidth / 8
+  let patchHeight = latentHeight / 2
+  let patchWidth = latentWidth / 2
+  let scalingFactor: Float = 0.9152
+  let seed = envInt("SEEDVR2_UPSCALE_SEED", 666)
+
+  print("SeedVR2 upscale input:", inputPath)
+  print("SeedVR2 upscale output:", outputPath)
+  print("SeedVR2 upscale size:", imageHeight, imageWidth)
+
+  let positiveEmbedding = try! graph.openStore(seedVR2DiTExportPath, flags: [.readOnly]) {
+    Tensor<Float>(from: $0.read("positive_embedding")!)
+  }.get()
+  let txtLen = positiveEmbedding.shape[0]
+  let regularWindows = seedVR2WindowSpec3D(
+    frames: latentDepth, height: patchHeight, width: patchWidth, shifted: false)
+  let shiftedWindows = seedVR2WindowSpec3D(
+    frames: latentDepth, height: patchHeight, width: patchWidth, shifted: true)
+
+  let rotaryReference = seedvr2Reference.SeedVR2Reference(
+    repo_root: seedVRRoot,
+    checkpoint_root: seedVR2Config.checkpointRoot,
+    config_dir: seedVR2Config.configDir,
+    dit_checkpoint: seedVR2Config.ditCheckpoint,
+    device: "cpu",
+    load_dit: false,
+    load_vae: false)
+  let regularProbe = rotaryReference.make_dit_rotary_probe(
+    frames: latentDepth, patch_height: patchHeight, patch_width: patchWidth, txt_len: txtLen,
+    shifted: false)
+  let shiftedProbe = rotaryReference.make_dit_rotary_probe(
+    frames: latentDepth, patch_height: patchHeight, patch_width: patchWidth, txt_len: txtLen,
+    shifted: true)
+
+  torch.manual_seed(seed)
+  let noise = try! Tensor<Float>(
+    numpy: torch.randn([latentDepth * latentHeight * latentWidth, 16], dtype: torch.float32).cpu()
+      .numpy())
+  let imageTensor = seedVR2LoadImageTensor(path: inputPath, height: imageHeight, width: imageWidth)
+
+  graph.withNoGrad {
+    logStep("SeedVR2 upscale encoder compile/load")
+    let encoderInput = placeOnDevice(graph.variable(imageTensor))
+    let (_, encoder) = SeedVR2Encoder3D(
+      startDepth: 1, startHeight: imageHeight, startWidth: imageWidth)
+    encoder.compile(inputs: encoderInput)
+    graph.openStore(seedVR2VAEExportPath, flags: [.readOnly]) {
+      $0.read("encoder", model: encoder)
+    }
+    logStep("SeedVR2 upscale encode")
+    let conditionLatent = (encoder(inputs: encoderInput)[0].as(of: Float.self) * scalingFactor)
+      .copied()
+    let conditionLatentCPU = copiedToCPU(conditionLatent)
+
+    let rawVidInputCPU = seedVR2BuildRawDiTInput(
+      noise: noise, conditionLatent: conditionLatentCPU, depth: latentDepth, height: latentHeight,
+      width: latentWidth)
+    let rawVidInput = placeOnDevice(graph.variable(rawVidInputCPU))
+    let rawTxtInput = placeOnDevice(graph.variable(positiveEmbedding))
+    let timeInput = placeOnDevice(
+      graph.variable(
+        seedVR2TimeEmbedding(timestep: 1000.0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
+    )
+    let regularVidFreqInputs = seedVR2LoadWindowFreqs(
+      regularProbe, kind: "vid", count: regularWindows.count
+    ).map { rematerializeOnDevice(graph, $0) }
+    let regularTxtFreqInputs = seedVR2LoadWindowFreqs(
+      regularProbe, kind: "txt", count: regularWindows.count
+    ).map { rematerializeOnDevice(graph, $0) }
+    let shiftedVidFreqInputs = seedVR2LoadWindowFreqs(
+      shiftedProbe, kind: "vid", count: shiftedWindows.count
+    ).map { rematerializeOnDevice(graph, $0) }
+    let shiftedTxtFreqInputs = seedVR2LoadWindowFreqs(
+      shiftedProbe, kind: "txt", count: shiftedWindows.count
+    ).map { rematerializeOnDevice(graph, $0) }
+    let rotaryInputs =
+      regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
+    let ditInputs: [DynamicGraph_Any] =
+      [
+        rawVidInput as DynamicGraph_Any, rawTxtInput as DynamicGraph_Any,
+        timeInput as DynamicGraph_Any,
+      ]
+      + rotaryInputs.map { $0 as DynamicGraph_Any }
+
+    logStep("SeedVR2 upscale dit compile/load")
+    let (_, dit) = SeedVR2DiT(
+      config: seedVR2Config, frames: latentDepth, latentHeight: latentHeight,
+      latentWidth: latentWidth, txtLen: txtLen)
+    dit.compile(inputs: ditInputs)
+    graph.openStore(seedVR2DiTExportPath, flags: [.readOnly]) {
+      $0.read("dit", model: dit)
+    }
+
+    logStep("SeedVR2 upscale dit forward")
+    let prediction = dit(inputs: rawVidInput, Array(ditInputs.dropFirst()))[0].as(of: Float.self)
+    let predictionCPU = copiedToCPU(prediction)
+    let decoderLatent = seedVR2BuildDecoderLatent(
+      noise: noise, prediction: predictionCPU, depth: latentDepth, height: latentHeight,
+      width: latentWidth, scalingFactor: scalingFactor)
+
+    logStep("SeedVR2 upscale decoder compile/load")
+    let decoderInput = placeOnDevice(graph.variable(decoderLatent))
+    let (_, decoder) = SeedVR2Decoder3D(
+      startDepth: latentDepth, startHeight: latentHeight, startWidth: latentWidth)
+    decoder.compile(inputs: decoderInput)
+    graph.openStore(seedVR2VAEExportPath, flags: [.readOnly]) {
+      $0.read("decoder", model: decoder)
+    }
+
+    logStep("SeedVR2 upscale decode")
+    let decoded = decoder(inputs: decoderInput)[0].as(of: Float.self)
+    seedVR2SaveImageTensor(copiedToCPU(decoded), path: outputPath)
+    print("Wrote \(outputPath)")
+  }
+  exit(0)
 }
 
 if envFlag("SEEDVR2_RUN_DIT") || envFlag("SEEDVR2_RUN_DIT_WINDOW_FULL")
