@@ -1697,6 +1697,18 @@ func SeedVR2Decoder3D(startDepth: Int, startHeight: Int, startWidth: Int) -> (
   return (reader, Model([x], [out.copied()]))
 }
 
+func SeedVR2Decoder3DNHWC(startDepth: Int, startHeight: Int, startWidth: Int) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let (reader, decoder) = SeedVR2Decoder3D(
+    startDepth: startDepth, startHeight: startHeight, startWidth: startWidth)
+  let nchw = x.permuted(0, 4, 1, 2, 3).contiguous().copied().reshaped(
+    [1, 16, startDepth, startHeight, startWidth], format: .NCHW)
+  let out = decoder(nchw).permuted(0, 2, 3, 4, 1).contiguous().copied()
+  return (reader, Model([x], [out.copied()]))
+}
+
 func SeedVR2EncoderConvIn(depth: Int, height: Int, width: Int) -> (
   (PythonObject) -> Void, Model
 ) {
@@ -1900,6 +1912,18 @@ func SeedVR2Encoder3D(startDepth: Int, startHeight: Int, startWidth: Int) -> (
   return (reader, Model([x], [out.copied()]))
 }
 
+func SeedVR2Encoder3DNHWC(startDepth: Int, startHeight: Int, startWidth: Int) -> (
+  (PythonObject) -> Void, Model
+) {
+  let x = Input()
+  let (reader, encoder) = SeedVR2Encoder3D(
+    startDepth: startDepth, startHeight: startHeight, startWidth: startWidth)
+  let nchw = x.permuted(0, 4, 1, 2, 3).contiguous().copied().reshaped(
+    [1, 3, startDepth, startHeight, startWidth], format: .NCHW)
+  let out = encoder(nchw).permuted(0, 2, 3, 4, 1).contiguous().copied()
+  return (reader, Model([x], [out.copied()]))
+}
+
 func SeedVR2MomentsToLatent(depth: Int, height: Int, width: Int) -> Model {
   let x = Input()
   let latent = x.reshaped(
@@ -1961,6 +1985,16 @@ if envFlag("SEEDVR2_RUN_VAE") || envFlag("SEEDVR2_EXPORT_VAE") {
     let torchEncoderOutput = loadTensor(vaeEncoderReference, "output")
     printParity("SeedVR2 vae.encoder", swiftEncoderOutput, torchEncoderOutput)
 
+    let encoderNHWCInput = encoderInput.permuted(0, 2, 3, 4, 1).contiguous()
+    let (encoderNHWCReader, encoderNHWC) = SeedVR2Encoder3DNHWC(
+      startDepth: 5, startHeight: 96, startWidth: 160)
+    encoderNHWC.compile(inputs: encoderNHWCInput)
+    encoderNHWCReader(vaeStateDict)
+    let swiftEncoderNHWCOutput = materialize(
+      encoderNHWC(inputs: encoderNHWCInput)[0].as(of: Float.self).permuted(0, 4, 1, 2, 3)
+        .contiguous())
+    printParity("SeedVR2 vae.encoder nhwc", swiftEncoderNHWCOutput, torchEncoderOutput)
+
     let decoderInput = loadInput(vaeDecoderReference, "input")
     let (decoderReader, decoder) = SeedVR2Decoder3D(
       startDepth: 2, startHeight: 12, startWidth: 20)
@@ -1969,6 +2003,16 @@ if envFlag("SEEDVR2_RUN_VAE") || envFlag("SEEDVR2_EXPORT_VAE") {
     let swiftDecoderOutput = materialize(decoder(inputs: decoderInput)[0].as(of: Float.self))
     let torchDecoderOutput = loadTensor(vaeDecoderReference, "output")
     printParity("SeedVR2 vae.decoder", swiftDecoderOutput, torchDecoderOutput)
+
+    let decoderNHWCInput = decoderInput.permuted(0, 2, 3, 4, 1).contiguous()
+    let (decoderNHWCReader, decoderNHWC) = SeedVR2Decoder3DNHWC(
+      startDepth: 2, startHeight: 12, startWidth: 20)
+    decoderNHWC.compile(inputs: decoderNHWCInput)
+    decoderNHWCReader(vaeStateDict)
+    let swiftDecoderNHWCOutput = materialize(
+      decoderNHWC(inputs: decoderNHWCInput)[0].as(of: Float.self).permuted(0, 4, 1, 2, 3)
+        .contiguous())
+    printParity("SeedVR2 vae.decoder nhwc", swiftDecoderNHWCOutput, torchDecoderOutput)
 
     let vaeModeInput = loadInput(vaeModeReference, "input")
     let swiftModeMoments = materialize(encoder(inputs: vaeModeInput)[0].as(of: Float.self))
@@ -1993,15 +2037,15 @@ if envFlag("SEEDVR2_RUN_VAE") || envFlag("SEEDVR2_EXPORT_VAE") {
     if envFlag("SEEDVR2_EXPORT_VAE") {
       logStep("SeedVR2 vae export compile")
       let decoderInput = placeOnDevice(
-        graph.variable(.CPU, format: .NCHW, shape: [1, 16, 2, 12, 20], of: Float.self))
-      let (decoderReader, decoder) = SeedVR2Decoder3D(
+        graph.variable(.CPU, format: .NHWC, shape: [1, 2, 12, 20, 16], of: Float.self))
+      let (decoderReader, decoder) = SeedVR2Decoder3DNHWC(
         startDepth: 2, startHeight: 12, startWidth: 20)
       decoder.compile(inputs: decoderInput)
       decoderReader(vaeStateDict)
 
       let encoderInput = placeOnDevice(
-        graph.variable(.CPU, format: .NCHW, shape: [1, 3, 5, 96, 160], of: Float.self))
-      let (encoderReader, encoder) = SeedVR2Encoder3D(
+        graph.variable(.CPU, format: .NHWC, shape: [1, 5, 96, 160, 3], of: Float.self))
+      let (encoderReader, encoder) = SeedVR2Encoder3DNHWC(
         startDepth: 5, startHeight: 96, startWidth: 160)
       encoder.compile(inputs: encoderInput)
       encoderReader(vaeStateDict)
@@ -2053,16 +2097,16 @@ func seedVR2Byte(_ value: Float) -> UInt8 {
 func seedVR2SaveImageTensor(_ tensor: Tensor<Float>, path: String) {
   precondition(tensor.shape.count == 5)
   precondition(tensor.shape[0] == 1)
-  precondition(tensor.shape[1] == 3)
-  let height = tensor.shape[3]
-  let width = tensor.shape[4]
+  precondition(tensor.shape[4] == 3)
+  let height = tensor.shape[2]
+  let width = tensor.shape[3]
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: width * height)
   for y in 0..<height {
     for x in 0..<width {
       let offset = y * width + x
-      rgba[offset].r = seedVR2Byte(Float(tensor[0, 0, 0, y, x]))
-      rgba[offset].g = seedVR2Byte(Float(tensor[0, 1, 0, y, x]))
-      rgba[offset].b = seedVR2Byte(Float(tensor[0, 2, 0, y, x]))
+      rgba[offset].r = seedVR2Byte(Float(tensor[0, 0, y, x, 0]))
+      rgba[offset].g = seedVR2Byte(Float(tensor[0, 0, y, x, 1]))
+      rgba[offset].b = seedVR2Byte(Float(tensor[0, 0, y, x, 2]))
     }
   }
   let image = PNG.Data.Rectangular(
@@ -2093,10 +2137,10 @@ func seedVR2BuildRawDiTInput(
 ) -> Tensor<Float> {
   precondition(conditionLatent.shape.count == 5)
   precondition(conditionLatent.shape[0] == 1)
-  precondition(conditionLatent.shape[1] >= 16)
-  precondition(conditionLatent.shape[2] == depth)
-  precondition(conditionLatent.shape[3] == height)
-  precondition(conditionLatent.shape[4] == width)
+  precondition(conditionLatent.shape[1] == depth)
+  precondition(conditionLatent.shape[2] == height)
+  precondition(conditionLatent.shape[3] == width)
+  precondition(conditionLatent.shape[4] >= 16)
   let tokenCount = depth * height * width
   precondition(noise.shape == [tokenCount, 16])
   var input = Tensor<Float>(.CPU, .NC(tokenCount, 33))
@@ -2106,7 +2150,7 @@ func seedVR2BuildRawDiTInput(
       for w in 0..<width {
         for c in 0..<16 {
           input[token, c] = noise[token, c]
-          input[token, 16 + c] = conditionLatent[0, c, t, h, w]
+          input[token, 16 + c] = conditionLatent[0, t, h, w, c]
         }
         input[token, 32] = 1
         token += 1
@@ -2123,13 +2167,13 @@ func seedVR2BuildDecoderLatent(
   let tokenCount = depth * height * width
   precondition(noise.shape == [tokenCount, 16])
   precondition(prediction.shape == [tokenCount, 16])
-  var latent = Tensor<Float>(.CPU, format: .NCHW, shape: [1, 16, depth, height, width])
+  var latent = Tensor<Float>(.CPU, format: .NHWC, shape: [1, depth, height, width, 16])
   var token = 0
   for t in 0..<depth {
     for h in 0..<height {
       for w in 0..<width {
         for c in 0..<16 {
-          latent[0, c, t, h, w] = (noise[token, c] - prediction[token, c]) / scalingFactor
+          latent[0, t, h, w, c] = (noise[token, c] - prediction[token, c]) / scalingFactor
         }
         token += 1
       }
@@ -2192,7 +2236,8 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
   graph.withNoGrad {
     logStep("SeedVR2 upscale encoder compile/load Float16")
     let encoderInput = placeOnDevice(graph.variable(Tensor<Float16>(from: imageTensor)))
-    let (_, encoder) = SeedVR2Encoder3D(
+      .permuted(0, 2, 3, 4, 1).contiguous()
+    let (_, encoder) = SeedVR2Encoder3DNHWC(
       startDepth: 1, startHeight: imageHeight, startWidth: imageWidth)
     encoder.compile(inputs: encoderInput)
     graph.openStore(seedVR2VAEExportPath, flags: [.readOnly]) {
@@ -2253,7 +2298,7 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
 
     logStep("SeedVR2 upscale decoder compile/load Float16")
     let decoderInput = placeOnDevice(graph.variable(Tensor<Float16>(from: decoderLatent)))
-    let (_, decoder) = SeedVR2Decoder3D(
+    let (_, decoder) = SeedVR2Decoder3DNHWC(
       startDepth: latentDepth, startHeight: latentHeight, startWidth: latentWidth)
     decoder.compile(inputs: decoderInput)
     graph.openStore(seedVR2VAEExportPath, flags: [.readOnly]) {
