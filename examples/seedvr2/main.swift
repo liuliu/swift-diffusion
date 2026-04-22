@@ -229,20 +229,120 @@ func maxGlobalRelativeDiff5D(_ swiftTensor: Tensor<Float>, _ torchTensor: Tensor
   return maxDiff / maxMagnitude
 }
 
+func maxAbsDiff4DTensor(_ lhs: Tensor<Float>, _ rhs: Tensor<Float>) -> Float {
+  precondition(lhs.shape.count == 4)
+  precondition(lhs.shape == rhs.shape)
+  var maxDiff: Float = 0
+  for i in 0..<lhs.shape[0] {
+    for j in 0..<lhs.shape[1] {
+      for k in 0..<lhs.shape[2] {
+        for l in 0..<lhs.shape[3] {
+          maxDiff = max(maxDiff, abs(Float(lhs[i, j, k, l]) - Float(rhs[i, j, k, l])))
+        }
+      }
+    }
+  }
+  return maxDiff
+}
+
+func maxGlobalRelativeDiff4DTensor(_ lhs: Tensor<Float>, _ rhs: Tensor<Float>) -> Float {
+  precondition(lhs.shape.count == 4)
+  precondition(lhs.shape == rhs.shape)
+  var maxDiff: Float = 0
+  var maxMagnitude: Float = 0
+  for i in 0..<lhs.shape[0] {
+    for j in 0..<lhs.shape[1] {
+      for k in 0..<lhs.shape[2] {
+        for l in 0..<lhs.shape[3] {
+          let left = Float(lhs[i, j, k, l])
+          let right = Float(rhs[i, j, k, l])
+          maxDiff = max(maxDiff, abs(left - right))
+          maxMagnitude = max(maxMagnitude, abs(left), abs(right))
+        }
+      }
+    }
+  }
+  return maxDiff / max(maxMagnitude, 1e-6)
+}
+
 func seedVR2RotaryTensor(from freqs: Tensor<Float>) -> Tensor<Float> {
   precondition(freqs.shape.count == 2)
   let seqLen = freqs.shape[0]
   let rotDim = freqs.shape[1]
   precondition(rotDim % 2 == 0)
-  var rot = Tensor<Float>(.CPU, .NHWC(1, seqLen, rotDim / 2, 2))
+  var rot = Tensor<Float>(.CPU, .NHWC(1, seqLen, 1, rotDim))
   for i in 0..<seqLen {
     for j in 0..<(rotDim / 2) {
       let angle = Float(freqs[i, j * 2])
-      rot[0, i, j, 0] = cosf(angle)
-      rot[0, i, j, 1] = sinf(angle)
+      rot[0, i, 0, j * 2] = cosf(angle)
+      rot[0, i, 0, j * 2 + 1] = sinf(angle)
     }
   }
   return rot
+}
+
+func seedVR2FillMMRotaryAxis(
+  _ rot: inout Tensor<Float>, token: Int, axis: Int, position: Int, rotaryDim: Int
+) {
+  precondition(rotaryDim % 6 == 0)
+  let axisDim = rotaryDim / 3
+  let axisOffset = axis * axisDim
+  for k in 0..<(axisDim / 2) {
+    let theta = Double(position) * 1.0 / pow(10_000, Double(k) * 2 / Double(axisDim))
+    let sintheta = sin(theta)
+    let costheta = cos(theta)
+    rot[0, token, 0, axisOffset + k * 2] = Float(costheta)
+    rot[0, token, 0, axisOffset + k * 2 + 1] = Float(sintheta)
+  }
+}
+
+func seedVR2MMRotary3DWindowTensors(
+  windows: [SeedVR2Window3D], txtLen: Int, rotaryDim: Int
+) -> (vid: [Tensor<Float>], txt: [Tensor<Float>]) {
+  var vid = [Tensor<Float>]()
+  var txt = [Tensor<Float>]()
+  for window in windows {
+    var vidRot = Tensor<Float>(.CPU, .NHWC(1, window.tokenLength, 1, rotaryDim))
+    var token = 0
+    for t in 0..<window.tLength {
+      for h in 0..<window.hLength {
+        for w in 0..<window.wLength {
+          seedVR2FillMMRotaryAxis(
+            &vidRot, token: token, axis: 0, position: txtLen + t, rotaryDim: rotaryDim)
+          seedVR2FillMMRotaryAxis(
+            &vidRot, token: token, axis: 1, position: h, rotaryDim: rotaryDim)
+          seedVR2FillMMRotaryAxis(
+            &vidRot, token: token, axis: 2, position: w, rotaryDim: rotaryDim)
+          token += 1
+        }
+      }
+    }
+    vid.append(vidRot)
+
+    var txtRot = Tensor<Float>(.CPU, .NHWC(1, txtLen, 1, rotaryDim))
+    for textIndex in 0..<txtLen {
+      for axis in 0..<3 {
+        seedVR2FillMMRotaryAxis(
+          &txtRot, token: textIndex, axis: axis, position: textIndex, rotaryDim: rotaryDim)
+      }
+    }
+    txt.append(txtRot)
+  }
+  return (vid, txt)
+}
+
+func seedVR2PrintRotaryParity(
+  _ name: String, swift: [Tensor<Float>], reference: [Tensor<Float>]
+) {
+  precondition(swift.count == reference.count)
+  var maxAbs: Float = 0
+  var maxRel: Float = 0
+  for index in 0..<swift.count {
+    maxAbs = max(maxAbs, maxAbsDiff4DTensor(swift[index], reference[index]))
+    maxRel = max(maxRel, maxGlobalRelativeDiff4DTensor(swift[index], reference[index]))
+  }
+  print("\(name) rotary max abs diff:", maxAbs)
+  print("\(name) rotary global max rel diff:", maxRel)
 }
 
 func seedVR2LoadWindowFreqs(
@@ -677,18 +777,18 @@ func seedVR2FlattenHeads(_ x: Model.IO, seqLen: Int, heads: Int, headDim: Int) -
 func seedVR2ApplyRotary3D(
   _ x: Model.IO, rot: Model.IO, seqLen: Int, heads: Int, headDim: Int = 128, rotDim: Int = 126
 ) -> Model.IO {
-  let xHeadFirst = x.permuted(1, 0, 2).contiguous().copied()
-  let xRot = xHeadFirst.reshaped(
-    [heads, seqLen, rotDim / 2, 2], offset: [0, 0, 0, 0],
-    strides: [seqLen * headDim, headDim, 2, 1]
+  let x = x.contiguous().copied()
+  let xRot = x.reshaped(
+    [seqLen, heads, rotDim], offset: [0, 0, 0],
+    strides: [heads * headDim, headDim, 1]
+  ).contiguous().reshaped([1, seqLen, heads, rotDim])
+  let xPass = x.reshaped(
+    [seqLen, heads, headDim - rotDim], offset: [0, 0, rotDim],
+    strides: [heads * headDim, headDim, 1]
   ).contiguous()
-  let xPass = xHeadFirst.reshaped(
-    [heads, seqLen, headDim - rotDim], offset: [0, 0, rotDim],
-    strides: [seqLen * headDim, headDim, 1]
-  ).contiguous()
-  let rotated = Functional.cmul(left: xRot, right: rot).reshaped([heads, seqLen, rotDim])
+  let rotated = Functional.cmul(left: xRot, right: rot).reshaped([seqLen, heads, rotDim])
     .contiguous()
-  return Functional.concat(axis: 2, rotated, xPass).permuted(1, 0, 2).contiguous()
+  return Functional.concat(axis: 2, rotated, xPass).contiguous()
 }
 
 func seedVR2StateTensorNC(_ stateDict: PythonObject, _ key: String, width: Int) -> Tensor<Float> {
@@ -2212,20 +2312,10 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
   let shiftedWindows = seedVR2WindowSpec3D(
     frames: latentDepth, height: patchHeight, width: patchWidth, shifted: true)
 
-  let rotaryReference = seedvr2Reference.SeedVR2Reference(
-    repo_root: seedVRRoot,
-    checkpoint_root: seedVR2Config.checkpointRoot,
-    config_dir: seedVR2Config.configDir,
-    dit_checkpoint: seedVR2Config.ditCheckpoint,
-    device: "cpu",
-    load_dit: false,
-    load_vae: false)
-  let regularProbe = rotaryReference.make_dit_rotary_probe(
-    frames: latentDepth, patch_height: patchHeight, patch_width: patchWidth, txt_len: txtLen,
-    shifted: false)
-  let shiftedProbe = rotaryReference.make_dit_rotary_probe(
-    frames: latentDepth, patch_height: patchHeight, patch_width: patchWidth, txt_len: txtLen,
-    shifted: true)
+  let regularRotary = seedVR2MMRotary3DWindowTensors(
+    windows: regularWindows, txtLen: txtLen, rotaryDim: seedVR2Config.rotaryDim)
+  let shiftedRotary = seedVR2MMRotary3DWindowTensors(
+    windows: shiftedWindows, txtLen: txtLen, rotaryDim: seedVR2Config.rotaryDim)
 
   torch.manual_seed(seed)
   let noise = try! Tensor<Float>(
@@ -2258,18 +2348,10 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
           from: seedVR2TimeEmbedding(
             timestep: 1000.0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)))
     )
-    let regularVidFreqInputs = seedVR2LoadWindowFreqs(
-      regularProbe, kind: "vid", count: regularWindows.count
-    ).map { rematerializeOnDeviceFloat16(graph, $0) }
-    let regularTxtFreqInputs = seedVR2LoadWindowFreqs(
-      regularProbe, kind: "txt", count: regularWindows.count
-    ).map { rematerializeOnDeviceFloat16(graph, $0) }
-    let shiftedVidFreqInputs = seedVR2LoadWindowFreqs(
-      shiftedProbe, kind: "vid", count: shiftedWindows.count
-    ).map { rematerializeOnDeviceFloat16(graph, $0) }
-    let shiftedTxtFreqInputs = seedVR2LoadWindowFreqs(
-      shiftedProbe, kind: "txt", count: shiftedWindows.count
-    ).map { rematerializeOnDeviceFloat16(graph, $0) }
+    let regularVidFreqInputs = regularRotary.vid.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let regularTxtFreqInputs = regularRotary.txt.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let shiftedVidFreqInputs = shiftedRotary.vid.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let shiftedTxtFreqInputs = shiftedRotary.txt.map { rematerializeOnDeviceFloat16(graph, $0) }
     let rotaryInputs =
       regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
     let ditInputs: [DynamicGraph_Any] =
@@ -2381,24 +2463,36 @@ if envFlag("SEEDVR2_RUN_DIT") || envFlag("SEEDVR2_RUN_DIT_WINDOW_FULL")
       return freqs
     }
 
-    let regularVidFreqs = loadWindowFreqs(
+    let regularReferenceVidFreqs = loadWindowFreqs(
       regularProbe, kind: "vid", count: regularWindows.count)
-    let regularTxtFreqs = loadWindowFreqs(
+    let regularReferenceTxtFreqs = loadWindowFreqs(
       regularProbe, kind: "txt", count: regularWindows.count)
-    let shiftedVidFreqs = loadWindowFreqs(
+    let shiftedReferenceVidFreqs = loadWindowFreqs(
       shiftedProbe, kind: "vid", count: shiftedWindows.count)
-    let shiftedTxtFreqs = loadWindowFreqs(
+    let shiftedReferenceTxtFreqs = loadWindowFreqs(
       shiftedProbe, kind: "txt", count: shiftedWindows.count)
+    let regularRotary = seedVR2MMRotary3DWindowTensors(
+      windows: regularWindows, txtLen: ditTxtLen, rotaryDim: seedVR2Config.rotaryDim)
+    let shiftedRotary = seedVR2MMRotary3DWindowTensors(
+      windows: shiftedWindows, txtLen: ditTxtLen, rotaryDim: seedVR2Config.rotaryDim)
+    seedVR2PrintRotaryParity(
+      "SeedVR2 dit regular vid", swift: regularRotary.vid, reference: regularReferenceVidFreqs)
+    seedVR2PrintRotaryParity(
+      "SeedVR2 dit regular txt", swift: regularRotary.txt, reference: regularReferenceTxtFreqs)
+    seedVR2PrintRotaryParity(
+      "SeedVR2 dit shifted vid", swift: shiftedRotary.vid, reference: shiftedReferenceVidFreqs)
+    seedVR2PrintRotaryParity(
+      "SeedVR2 dit shifted txt", swift: shiftedRotary.txt, reference: shiftedReferenceTxtFreqs)
 
     let rawVidInput = loadDeviceTensor(officialProbe, "vid_input")
     let rawTxtInput = loadDeviceTensor(officialProbe, "txt_input")
     let timeInput = placeOnDevice(
       graph.variable(
         seedVR2TimeEmbedding(timestep: 500.0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)))
-    let regularVidFreqInputs = regularVidFreqs.map { rematerializeOnDeviceFloat16(graph, $0) }
-    let regularTxtFreqInputs = regularTxtFreqs.map { rematerializeOnDeviceFloat16(graph, $0) }
-    let shiftedVidFreqInputs = shiftedVidFreqs.map { rematerializeOnDeviceFloat16(graph, $0) }
-    let shiftedTxtFreqInputs = shiftedTxtFreqs.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let regularVidFreqInputs = regularRotary.vid.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let regularTxtFreqInputs = regularRotary.txt.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let shiftedVidFreqInputs = shiftedRotary.vid.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let shiftedTxtFreqInputs = shiftedRotary.txt.map { rematerializeOnDeviceFloat16(graph, $0) }
     let rotaryInputs =
       regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
     let ditInputs: [DynamicGraph_Any] =
