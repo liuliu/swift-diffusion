@@ -149,7 +149,7 @@ func placeOnDevice(_ tensor: DynamicGraph.Tensor<Float>) -> DynamicGraph.Tensor<
   return tensor
 }
 
-func placeOnDevice(_ tensor: DynamicGraph.Tensor<BFloat16>) -> DynamicGraph.Tensor<BFloat16> {
+func placeOnDevice(_ tensor: DynamicGraph.Tensor<Float16>) -> DynamicGraph.Tensor<Float16> {
   if hasCUDA {
     return tensor.toGPU(swiftDevice)
   }
@@ -160,16 +160,20 @@ func copiedToCPU(_ tensor: DynamicGraph.Tensor<Float>) -> Tensor<Float> {
   tensor.as(of: Float.self).rawValue.toCPU()
 }
 
-func rematerializeOnDevice(_ graph: DynamicGraph, _ tensor: DynamicGraph.Tensor<Float>)
-  -> DynamicGraph.Tensor<Float>
-{
-  placeOnDevice(graph.variable(tensor.rawValue.toCPU()))
+func copiedToCPU(_ tensor: DynamicGraph.Tensor<Float16>) -> Tensor<Float> {
+  Tensor<Float>(from: tensor.as(of: Float16.self).rawValue.toCPU())
 }
 
 func rematerializeOnDevice(_ graph: DynamicGraph, _ tensor: Tensor<Float>)
   -> DynamicGraph.Tensor<Float>
 {
   placeOnDevice(graph.variable(tensor))
+}
+
+func rematerializeOnDeviceFloat16(_ graph: DynamicGraph, _ tensor: Tensor<Float>)
+  -> DynamicGraph.Tensor<Float16>
+{
+  placeOnDevice(graph.variable(Tensor<Float16>(from: tensor)))
 }
 
 func maxAbsDiff5D(_ swiftTensor: Tensor<Float>, _ torchTensor: Tensor<Float>) -> Float {
@@ -292,8 +296,50 @@ func maxGlobalRelativeDiff2DTensor(_ lhs: Tensor<Float>, _ rhs: Tensor<Float>) -
   return maxDiff / max(maxRef, 1e-6)
 }
 
-func copyParameter(_ parameter: Model.Parameters, from tensor: Tensor<Float>) {
-  parameter.copy(from: tensor)
+func seedVR2FiniteSummary(_ name: String, _ tensor: Tensor<Float>) {
+  var finiteCount = 0
+  var nonFiniteCount = 0
+  var minValue = Float.greatestFiniteMagnitude
+  var maxValue = -Float.greatestFiniteMagnitude
+
+  func record(_ value: Float) {
+    if value.isFinite {
+      finiteCount += 1
+      minValue = min(minValue, value)
+      maxValue = max(maxValue, value)
+    } else {
+      nonFiniteCount += 1
+    }
+  }
+
+  if tensor.shape.count == 2 {
+    for i in 0..<tensor.shape[0] {
+      for j in 0..<tensor.shape[1] {
+        record(tensor[i, j])
+      }
+    }
+  } else {
+    precondition(tensor.shape.count == 5)
+    for n in 0..<tensor.shape[0] {
+      for c in 0..<tensor.shape[1] {
+        for d in 0..<tensor.shape[2] {
+          for h in 0..<tensor.shape[3] {
+            for w in 0..<tensor.shape[4] {
+              record(tensor[n, c, d, h, w])
+            }
+          }
+        }
+      }
+    }
+  }
+
+  print(
+    "\(name) finite:", finiteCount, "non-finite:", nonFiniteCount, "min:",
+    finiteCount > 0 ? minValue : .nan, "max:", finiteCount > 0 ? maxValue : .nan)
+}
+
+func copyParameterFloat16(_ parameter: Model.Parameters, from tensor: Tensor<Float>) {
+  parameter.copy(from: Tensor<Float16>(from: tensor))
 }
 
 func seedVR2TimeEmbedding(timestep: Float, batchSize: Int, embeddingSize: Int, maxPeriod: Int)
@@ -628,10 +674,6 @@ func seedVR2FlattenHeads(_ x: Model.IO, seqLen: Int, heads: Int, headDim: Int) -
   x.contiguous().reshaped([seqLen, heads * headDim])
 }
 
-func seedVR2ZeroDependency2D(_ x: Model.IO) -> Model.IO {
-  x.reduced(.sum, axis: [0, 1]) * 1e-30
-}
-
 func seedVR2ApplyRotary3D(
   _ x: Model.IO, rot: Model.IO, seqLen: Int, heads: Int, headDim: Int = 128, rotDim: Int = 126
 ) -> Model.IO {
@@ -790,13 +832,12 @@ func seedVR2ReverseWindowOutputs(
 func seedVR2BatchedWindowAttentionSDPA(
   vidQ: [Model.IO], vidK: [Model.IO], vidV: [Model.IO],
   txtQ: [Model.IO], txtK: [Model.IO], txtV: Model.IO,
-  windowLen: Int, txtLen: Int, heads: Int, headDim: Int
-) -> (Model.IO, Model.IO) {
+  windowLen: Int, txtLen: Int, heads: Int, headDim: Int, returnText: Bool = true
+) -> (Model.IO, Model.IO?) {
   let batch = vidQ.count
   precondition(batch > 0)
   precondition(vidK.count == batch && vidV.count == batch)
   precondition(txtQ.count == batch && txtK.count == batch)
-  let totalLen = windowLen + txtLen
   let batchedVidQ = seedVR2Concat(vidQ, axis: 0).reshaped(
     [batch, windowLen, heads, headDim]
   ).contiguous()
@@ -815,20 +856,24 @@ func seedVR2BatchedWindowAttentionSDPA(
   let batchedTxtV = seedVR2Concat(vidQ.map { _ in txtV }, axis: 0).reshaped(
     [batch, txtLen, heads, headDim]
   ).contiguous()
-  let q = Functional.concat(axis: 1, batchedVidQ, batchedTxtQ).to(.BFloat16).contiguous()
-  let k = Functional.concat(axis: 1, batchedVidK, batchedTxtK).to(.BFloat16).contiguous()
-  let v = Functional.concat(axis: 1, batchedVidV, batchedTxtV).to(.BFloat16).contiguous()
+  let q = Functional.concat(axis: 1, batchedVidQ, batchedTxtQ).contiguous()
+  let k = Functional.concat(axis: 1, batchedVidK, batchedTxtK).contiguous()
+  let v = Functional.concat(axis: 1, batchedVidV, batchedTxtV).contiguous()
   let out = ScaledDotProductAttention(scale: 1.0 / Float(headDim).squareRoot(), flags: [.Float16])(
     q, k, v
-  ).to(.Float32).contiguous()
+  ).contiguous()
+  let queryLen = windowLen + txtLen
   let vidOut = out.reshaped(
     [batch, windowLen, heads, headDim], offset: [0, 0, 0, 0],
-    strides: [totalLen * heads * headDim, heads * headDim, headDim, 1]
+    strides: [queryLen * heads * headDim, heads * headDim, headDim, 1]
   ).contiguous().copied().reshaped([batch * windowLen, heads, headDim])
     .contiguous()
+  guard returnText else {
+    return (vidOut, nil)
+  }
   let txtOut = out.reshaped(
     [batch, txtLen, heads, headDim], offset: [0, windowLen, 0, 0],
-    strides: [totalLen * heads * headDim, heads * headDim, headDim, 1]
+    strides: [queryLen * heads * headDim, heads * headDim, headDim, 1]
   ).contiguous().copied().reduced(.mean, axis: [0]).copied()
   return (vidOut, txtOut)
 }
@@ -838,8 +883,8 @@ func seedVR2WindowAttentionSDPA(
   txtQ: Model.IO, txtK: Model.IO, txtV: Model.IO,
   vidFreqs: [Model.IO], txtFreqs: [Model.IO],
   windows: [SeedVR2Window3D], frames: Int, height: Int, width: Int, txtLen: Int,
-  heads: Int, headDim: Int, rotaryDim: Int
-) -> (Model.IO, Model.IO) {
+  heads: Int, headDim: Int, rotaryDim: Int, returnText: Bool = true
+) -> (Model.IO, Model.IO?) {
   let windowCount = windows.count
   precondition(windowCount > 0)
   precondition(vidFreqs.count == windowCount && txtFreqs.count == windowCount)
@@ -897,28 +942,38 @@ func seedVR2WindowAttentionSDPA(
       txtQ: groupRange.map { windowTxtQ[$0] },
       txtK: groupRange.map { windowTxtK[$0] },
       txtV: txtV,
-      windowLen: windowLen, txtLen: txtLen, heads: heads, headDim: headDim)
+      windowLen: windowLen, txtLen: txtLen, heads: heads, headDim: headDim,
+      returnText: returnText)
     for groupWindowIndex in 0..<(groupEnd - groupStart) {
       windowVidOuts.append(
         seedVR2FlatWindowSlice(
           groupVidOut, start: groupWindowIndex * windowLen, length: windowLen, heads: heads,
           headDim: headDim))
     }
-    groupTxtOuts.append(groupTxtOut)
-    groupCounts.append(groupEnd - groupStart)
+    if let groupTxtOut = groupTxtOut {
+      groupTxtOuts.append(groupTxtOut)
+      groupCounts.append(groupEnd - groupStart)
+    }
     groupStart = groupEnd
   }
 
-  var txtOut = groupTxtOuts[0] * (Float(groupCounts[0]) / Float(windowCount))
-  for groupIndex in 1..<groupTxtOuts.count {
-    txtOut =
-      txtOut + groupTxtOuts[groupIndex] * (Float(groupCounts[groupIndex]) / Float(windowCount))
+  let txtOut: Model.IO?
+  if returnText {
+    var reducedTxtOut = groupTxtOuts[0] * (Float(groupCounts[0]) / Float(windowCount))
+    for groupIndex in 1..<groupTxtOuts.count {
+      reducedTxtOut =
+        reducedTxtOut + groupTxtOuts[groupIndex]
+        * (Float(groupCounts[groupIndex]) / Float(windowCount))
+    }
+    txtOut = reducedTxtOut.copied()
+  } else {
+    txtOut = nil
   }
   return (
     seedVR2ReverseWindowOutputs(
       windowVidOuts, windows: windows, frames: frames, height: height, width: width, heads: heads,
       headDim: headDim),
-    txtOut.copied()
+    txtOut
   )
 }
 
@@ -1056,49 +1111,62 @@ func SeedVR2DiTBlock(
   let txtNormQ = RMSNorm(epsilon: 1e-5, axis: [2], name: "txt_norm_q")
   let txtNormK = RMSNorm(epsilon: 1e-5, axis: [2], name: "txt_norm_k")
 
-  let vidQ = vidNormQ(vidQProj(vidAttnIn.copied()).reshaped([vidLen, heads, headDim])).copied()
-  let vidK = vidNormK(vidKProj(vidAttnIn.copied()).reshaped([vidLen, heads, headDim])).copied()
-  let vidV = vidVProj(vidAttnIn.copied()).reshaped([vidLen, heads, headDim]).copied()
-  let txtQ = txtNormQ(txtQProj(txtAttnIn.copied()).reshaped([txtLen, heads, headDim])).copied()
-  let txtK = txtNormK(txtKProj(txtAttnIn.copied()).reshaped([txtLen, heads, headDim])).copied()
-  let txtV = txtVProj(txtAttnIn.copied()).reshaped([txtLen, heads, headDim]).copied()
+  let vidAttnProjIn = vidAttnIn.to(.Float16).copied()
+  let txtAttnProjIn = txtAttnIn.to(.Float16).copied()
+  let vidQ = vidNormQ(vidQProj(vidAttnProjIn).reshaped([vidLen, heads, headDim])).copied()
+  let vidK = vidNormK(vidKProj(vidAttnProjIn).reshaped([vidLen, heads, headDim])).copied()
+  let vidV = vidVProj(vidAttnProjIn).reshaped([vidLen, heads, headDim]).copied()
+  let txtQ = txtNormQ(txtQProj(txtAttnProjIn).reshaped([txtLen, heads, headDim])).copied()
+  let txtK = txtNormK(txtKProj(txtAttnProjIn).reshaped([txtLen, heads, headDim])).copied()
+  let txtV = txtVProj(txtAttnProjIn).reshaped([txtLen, heads, headDim]).copied()
 
   let (vidAttn3D, txtAttn3D) = seedVR2WindowAttentionSDPA(
     vidQ: vidQ, vidK: vidK, vidV: vidV, txtQ: txtQ, txtK: txtK, txtV: txtV,
     vidFreqs: windowVidFreqs, txtFreqs: windowTxtFreqs, windows: windows, frames: frames,
     height: height, width: width, txtLen: txtLen, heads: heads, headDim: headDim,
-    rotaryDim: config.rotaryDim)
+    rotaryDim: config.rotaryDim, returnText: !lastLayer)
   let vidAttnFlat = seedVR2FlattenHeads(vidAttn3D, seqLen: vidLen, heads: heads, headDim: headDim)
     .copied()
-  let txtAttnFlat = seedVR2FlattenHeads(txtAttn3D, seqLen: txtLen, heads: heads, headDim: headDim)
-    .copied()
   let vidAttnOut = Dense(count: hiddenSize, name: "vid_attn_out")
-  let txtAttnOut = Dense(count: hiddenSize, name: "txt_attn_out")
-  let vidAttnProjected = vidAttnOut(vidAttnFlat).copied()
-  let txtAttnProjected = txtAttnOut(txtAttnFlat).copied()
+  let vidAttnProjected = vidAttnOut(vidAttnFlat).to(.Float32).copied()
+  let txtAttnOut: Model?
+  let txtAfterAttn: Model.IO?
+  if let txtAttn3D = txtAttn3D {
+    let txtAttnFlat = seedVR2FlattenHeads(
+      txtAttn3D, seqLen: txtLen, heads: heads, headDim: headDim
+    ).copied()
+    let projection = Dense(count: hiddenSize, name: "txt_attn_out")
+    let txtAttnProjected = projection(txtAttnFlat).to(.Float32).copied()
+    txtAfterAttn = (txt + txtAttnProjected .* txtAttnGate!).copied()
+    txtAttnOut = projection
+  } else {
+    txtAfterAttn = nil
+    txtAttnOut = nil
+  }
   let vidAfterAttn = (vid + vidAttnProjected .* vidAttnMod[2]).copied()
-  let txtAfterAttn =
-    (lastLayer ? txt + txtAttnProjected : txt + txtAttnProjected .* txtAttnGate!).copied()
 
   let vidMlpNorm = RMSNorm(epsilon: 1e-5, axis: [1], elementwiseAffine: false, name: "vid_mlp_norm")
   let txtMlpNorm = RMSNorm(epsilon: 1e-5, axis: [1], elementwiseAffine: false, name: "txt_mlp_norm")
   let vidMlpIn = (vidMlpNorm(vidAfterAttn) .* vidMlpMod[1] + vidMlpMod[0]).copied()
-  let txtMlpIn: Model.IO? =
-    lastLayer ? nil : (txtMlpNorm(txtAfterAttn) .* txtMlpMod![1] + txtMlpMod![0]).copied()
+  let txtMlpIn: Model.IO?
+  if let txtAfterAttn = txtAfterAttn, let txtMlpMod = txtMlpMod {
+    txtMlpIn = (txtMlpNorm(txtAfterAttn) .* txtMlpMod[1] + txtMlpMod[0]).copied()
+  } else {
+    txtMlpIn = nil
+  }
 
   let vidFinal: Model.IO
-  let txtFinal: Model.IO
+  let txtFinal: Model.IO?
   switch config.mlpKind {
   case .swiglu:
     let vidMlpGate = Dense(count: config.mlpHiddenSize, noBias: true, name: "vid_mlp_gate")
     let vidMlpInProj = Dense(count: config.mlpHiddenSize, noBias: true, name: "vid_mlp_in")
-    let vidMlpOutProj = Dense(
-      count: hiddenSize, noBias: true, flags: lastLayer ? [.Float32] : [], name: "vid_mlp_out")
-    let vidGate = vidMlpGate(vidMlpIn.copied()).copied()
-    let vidInner = vidMlpInProj(vidMlpIn.copied()).copied()
-    let vidMlpOut = vidMlpOutProj(
-      ((vidGate.to(.Float32) .* vidGate.to(.Float32).sigmoid()) .* vidInner.to(.Float32)).copied()
-    ).copied()
+    let vidMlpOutProj = Dense(count: hiddenSize, noBias: true, name: "vid_mlp_out")
+    let vidMlpProjIn = vidMlpIn.to(.Float16).copied()
+    let vidGate = vidMlpGate(vidMlpProjIn).copied()
+    let vidInner = vidMlpInProj(vidMlpProjIn).copied()
+    let vidMlpOut = vidMlpOutProj(((vidGate .* vidGate.sigmoid()) .* vidInner).copied())
+      .to(.Float32).copied()
     vidFinal = (vidAfterAttn + vidMlpOut .* vidMlpMod[2]).to(of: vidAfterAttn)
 
     let txtMlpGate: Model?
@@ -1108,17 +1176,17 @@ func SeedVR2DiTBlock(
       let gate = Dense(count: config.mlpHiddenSize, noBias: true, name: "txt_mlp_gate")
       let inProj = Dense(count: config.mlpHiddenSize, noBias: true, name: "txt_mlp_in")
       let outProj = Dense(count: hiddenSize, noBias: true, name: "txt_mlp_out")
-      let txtGate = gate(txtMlpIn.copied()).copied()
-      let txtInner = inProj(txtMlpIn.copied()).copied()
-      let txtMlpOut = outProj(
-        ((txtGate.to(.Float32) .* txtGate.to(.Float32).sigmoid()) .* txtInner.to(.Float32)).copied()
-      ).copied()
-      txtFinal = (txtAfterAttn + txtMlpOut .* txtMlpMod[2]).to(of: txtAfterAttn)
+      let txtMlpProjIn = txtMlpIn.to(.Float16).copied()
+      let txtGate = gate(txtMlpProjIn).copied()
+      let txtInner = inProj(txtMlpProjIn).copied()
+      let txtMlpOut = outProj(((txtGate .* txtGate.sigmoid()) .* txtInner).copied())
+        .to(.Float32).copied()
+      txtFinal = (txtAfterAttn! + txtMlpOut .* txtMlpMod[2]).to(of: txtAfterAttn!)
       txtMlpGate = gate
       txtMlpInProj = inProj
       txtMlpOutProj = outProj
     } else {
-      txtFinal = (txtAfterAttn + txtAfterAttn).to(of: txtAfterAttn)
+      txtFinal = nil
       txtMlpGate = nil
       txtMlpInProj = nil
       txtMlpOutProj = nil
@@ -1133,42 +1201,42 @@ func SeedVR2DiTBlock(
         let vWeight = try! Tensor<Float>(numpy: allQKV[(2 * hiddenSize)..., ...].numpy())
         let allNormQ = seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.all.weight")
         let allNormK = seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.all.weight")
-        copyParameter(vidQProj.weight, from: qWeight)
-        copyParameter(vidKProj.weight, from: kWeight)
-        copyParameter(vidVProj.weight, from: vWeight)
-        copyParameter(txtQProj.weight, from: qWeight)
-        copyParameter(txtKProj.weight, from: kWeight)
-        copyParameter(txtVProj.weight, from: vWeight)
-        copyParameter(vidNormQ.weight, from: allNormQ)
-        copyParameter(vidNormK.weight, from: allNormK)
-        copyParameter(txtNormQ.weight, from: allNormQ)
-        copyParameter(txtNormK.weight, from: allNormK)
+        copyParameterFloat16(vidQProj.weight, from: qWeight)
+        copyParameterFloat16(vidKProj.weight, from: kWeight)
+        copyParameterFloat16(vidVProj.weight, from: vWeight)
+        copyParameterFloat16(txtQProj.weight, from: qWeight)
+        copyParameterFloat16(txtKProj.weight, from: kWeight)
+        copyParameterFloat16(txtVProj.weight, from: vWeight)
+        copyParameterFloat16(vidNormQ.weight, from: allNormQ)
+        copyParameterFloat16(vidNormK.weight, from: allNormK)
+        copyParameterFloat16(txtNormQ.weight, from: allNormQ)
+        copyParameterFloat16(txtNormK.weight, from: allNormK)
       } else {
         let vidQKV = stateDict["\(prefix).attn.proj_qkv.vid.weight"].to(torch.float).cpu()
         let txtQKV = stateDict["\(prefix).attn.proj_qkv.txt.weight"].to(torch.float).cpu()
-        copyParameter(
+        copyParameterFloat16(
           vidQProj.weight, from: try! Tensor<Float>(numpy: vidQKV[..<hiddenSize, ...].numpy()))
-        copyParameter(
+        copyParameterFloat16(
           vidKProj.weight,
           from: try! Tensor<Float>(numpy: vidQKV[hiddenSize..<(2 * hiddenSize), ...].numpy()))
-        copyParameter(
+        copyParameterFloat16(
           vidVProj.weight, from: try! Tensor<Float>(numpy: vidQKV[(2 * hiddenSize)..., ...].numpy())
         )
-        copyParameter(
+        copyParameterFloat16(
           txtQProj.weight, from: try! Tensor<Float>(numpy: txtQKV[..<hiddenSize, ...].numpy()))
-        copyParameter(
+        copyParameterFloat16(
           txtKProj.weight,
           from: try! Tensor<Float>(numpy: txtQKV[hiddenSize..<(2 * hiddenSize), ...].numpy()))
-        copyParameter(
+        copyParameterFloat16(
           txtVProj.weight, from: try! Tensor<Float>(numpy: txtQKV[(2 * hiddenSize)..., ...].numpy())
         )
-        copyParameter(
+        copyParameterFloat16(
           vidNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.vid.weight"))
-        copyParameter(
+        copyParameterFloat16(
           vidNormK.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.vid.weight"))
-        copyParameter(
+        copyParameterFloat16(
           txtNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.txt.weight"))
-        copyParameter(
+        copyParameterFloat16(
           txtNormK.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.txt.weight"))
       }
 
@@ -1176,33 +1244,35 @@ func SeedVR2DiTBlock(
         sharedWeights ? "\(prefix).attn.proj_out.all" : "\(prefix).attn.proj_out.vid"
       let txtProjPrefix =
         sharedWeights ? "\(prefix).attn.proj_out.all" : "\(prefix).attn.proj_out.txt"
-      copyParameter(
+      copyParameterFloat16(
         vidAttnOut.weight,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidProjPrefix).weight"].to(torch.float).cpu().numpy()))
-      copyParameter(
+      copyParameterFloat16(
         vidAttnOut.bias,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidProjPrefix).bias"].to(torch.float).cpu().numpy()))
-      copyParameter(
-        txtAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(txtProjPrefix).weight"].to(torch.float).cpu().numpy()))
-      copyParameter(
-        txtAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(txtProjPrefix).bias"].to(torch.float).cpu().numpy()))
+      if let txtAttnOut = txtAttnOut {
+        copyParameterFloat16(
+          txtAttnOut.weight,
+          from: try! Tensor<Float>(
+            numpy: stateDict["\(txtProjPrefix).weight"].to(torch.float).cpu().numpy()))
+        copyParameterFloat16(
+          txtAttnOut.bias,
+          from: try! Tensor<Float>(
+            numpy: stateDict["\(txtProjPrefix).bias"].to(torch.float).cpu().numpy()))
+      }
 
       let vidMlpPrefix = sharedWeights ? "\(prefix).mlp.all" : "\(prefix).mlp.vid"
-      copyParameter(
+      copyParameterFloat16(
         vidMlpGate.weight,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidMlpPrefix).proj_in_gate.weight"].to(torch.float).cpu().numpy()))
-      copyParameter(
+      copyParameterFloat16(
         vidMlpInProj.weight,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidMlpPrefix).proj_in.weight"].to(torch.float).cpu().numpy()))
-      copyParameter(
+      copyParameterFloat16(
         vidMlpOutProj.weight,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidMlpPrefix).proj_out.weight"].to(torch.float).cpu().numpy()))
@@ -1210,15 +1280,15 @@ func SeedVR2DiTBlock(
         let txtMlpOutProj = txtMlpOutProj
       {
         let txtMlpPrefix = sharedWeights ? "\(prefix).mlp.all" : "\(prefix).mlp.txt"
-        copyParameter(
+        copyParameterFloat16(
           txtMlpGate.weight,
           from: try! Tensor<Float>(
             numpy: stateDict["\(txtMlpPrefix).proj_in_gate.weight"].to(torch.float).cpu().numpy()))
-        copyParameter(
+        copyParameterFloat16(
           txtMlpInProj.weight,
           from: try! Tensor<Float>(
             numpy: stateDict["\(txtMlpPrefix).proj_in.weight"].to(torch.float).cpu().numpy()))
-        copyParameter(
+        copyParameterFloat16(
           txtMlpOutProj.weight,
           from: try! Tensor<Float>(
             numpy: stateDict["\(txtMlpPrefix).proj_out.weight"].to(torch.float).cpu().numpy()))
@@ -1226,10 +1296,10 @@ func SeedVR2DiTBlock(
     }
   case .gelu:
     let vidMlpInProj = Dense(count: config.mlpHiddenSize, name: "vid_mlp_in")
-    let vidMlpOutProj = Dense(
-      count: hiddenSize, flags: lastLayer ? [.Float32] : [], name: "vid_mlp_out")
-    let vidMlpOut = vidMlpOutProj(vidMlpInProj(vidMlpIn.copied()).GELU(approximate: .tanh))
-      .copied()
+    let vidMlpOutProj = Dense(count: hiddenSize, name: "vid_mlp_out")
+    let vidMlpOut = vidMlpOutProj(
+      vidMlpInProj(vidMlpIn.to(.Float16).copied()).GELU(approximate: .tanh)
+    ).to(.Float32).copied()
     vidFinal = (vidAfterAttn + vidMlpOut .* vidMlpMod[2]).to(of: vidAfterAttn)
 
     let txtMlpInProj: Model?
@@ -1237,12 +1307,14 @@ func SeedVR2DiTBlock(
     if let txtMlpIn = txtMlpIn, let txtMlpMod = txtMlpMod {
       let inProj = Dense(count: config.mlpHiddenSize, name: "txt_mlp_in")
       let outProj = Dense(count: hiddenSize, name: "txt_mlp_out")
-      let txtMlpOut = outProj(inProj(txtMlpIn.copied()).GELU(approximate: .tanh)).copied()
-      txtFinal = (txtAfterAttn + txtMlpOut .* txtMlpMod[2]).to(of: txtAfterAttn)
+      let txtMlpOut = outProj(
+        inProj(txtMlpIn.to(.Float16).copied()).GELU(approximate: .tanh)
+      ).to(.Float32).copied()
+      txtFinal = (txtAfterAttn! + txtMlpOut .* txtMlpMod[2]).to(of: txtAfterAttn!)
       txtMlpInProj = inProj
       txtMlpOutProj = outProj
     } else {
-      txtFinal = (txtAfterAttn + txtAfterAttn).to(of: txtAfterAttn)
+      txtFinal = nil
       txtMlpInProj = nil
       txtMlpOutProj = nil
     }
@@ -1256,42 +1328,42 @@ func SeedVR2DiTBlock(
         let vWeight = try! Tensor<Float>(numpy: allQKV[(2 * hiddenSize)..., ...].numpy())
         let allNormQ = seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.all.weight")
         let allNormK = seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.all.weight")
-        copyParameter(vidQProj.weight, from: qWeight)
-        copyParameter(vidKProj.weight, from: kWeight)
-        copyParameter(vidVProj.weight, from: vWeight)
-        copyParameter(txtQProj.weight, from: qWeight)
-        copyParameter(txtKProj.weight, from: kWeight)
-        copyParameter(txtVProj.weight, from: vWeight)
-        copyParameter(vidNormQ.weight, from: allNormQ)
-        copyParameter(vidNormK.weight, from: allNormK)
-        copyParameter(txtNormQ.weight, from: allNormQ)
-        copyParameter(txtNormK.weight, from: allNormK)
+        copyParameterFloat16(vidQProj.weight, from: qWeight)
+        copyParameterFloat16(vidKProj.weight, from: kWeight)
+        copyParameterFloat16(vidVProj.weight, from: vWeight)
+        copyParameterFloat16(txtQProj.weight, from: qWeight)
+        copyParameterFloat16(txtKProj.weight, from: kWeight)
+        copyParameterFloat16(txtVProj.weight, from: vWeight)
+        copyParameterFloat16(vidNormQ.weight, from: allNormQ)
+        copyParameterFloat16(vidNormK.weight, from: allNormK)
+        copyParameterFloat16(txtNormQ.weight, from: allNormQ)
+        copyParameterFloat16(txtNormK.weight, from: allNormK)
       } else {
         let vidQKV = stateDict["\(prefix).attn.proj_qkv.vid.weight"].to(torch.float).cpu()
         let txtQKV = stateDict["\(prefix).attn.proj_qkv.txt.weight"].to(torch.float).cpu()
-        copyParameter(
+        copyParameterFloat16(
           vidQProj.weight, from: try! Tensor<Float>(numpy: vidQKV[..<hiddenSize, ...].numpy()))
-        copyParameter(
+        copyParameterFloat16(
           vidKProj.weight,
           from: try! Tensor<Float>(numpy: vidQKV[hiddenSize..<(2 * hiddenSize), ...].numpy()))
-        copyParameter(
+        copyParameterFloat16(
           vidVProj.weight, from: try! Tensor<Float>(numpy: vidQKV[(2 * hiddenSize)..., ...].numpy())
         )
-        copyParameter(
+        copyParameterFloat16(
           txtQProj.weight, from: try! Tensor<Float>(numpy: txtQKV[..<hiddenSize, ...].numpy()))
-        copyParameter(
+        copyParameterFloat16(
           txtKProj.weight,
           from: try! Tensor<Float>(numpy: txtQKV[hiddenSize..<(2 * hiddenSize), ...].numpy()))
-        copyParameter(
+        copyParameterFloat16(
           txtVProj.weight, from: try! Tensor<Float>(numpy: txtQKV[(2 * hiddenSize)..., ...].numpy())
         )
-        copyParameter(
+        copyParameterFloat16(
           vidNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.vid.weight"))
-        copyParameter(
+        copyParameterFloat16(
           vidNormK.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.vid.weight"))
-        copyParameter(
+        copyParameterFloat16(
           txtNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.txt.weight"))
-        copyParameter(
+        copyParameterFloat16(
           txtNormK.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.txt.weight"))
       }
 
@@ -1299,55 +1371,57 @@ func SeedVR2DiTBlock(
         sharedWeights ? "\(prefix).attn.proj_out.all" : "\(prefix).attn.proj_out.vid"
       let txtProjPrefix =
         sharedWeights ? "\(prefix).attn.proj_out.all" : "\(prefix).attn.proj_out.txt"
-      copyParameter(
+      copyParameterFloat16(
         vidAttnOut.weight,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidProjPrefix).weight"].to(torch.float).cpu().numpy()))
-      copyParameter(
+      copyParameterFloat16(
         vidAttnOut.bias,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidProjPrefix).bias"].to(torch.float).cpu().numpy()))
-      copyParameter(
-        txtAttnOut.weight,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(txtProjPrefix).weight"].to(torch.float).cpu().numpy()))
-      copyParameter(
-        txtAttnOut.bias,
-        from: try! Tensor<Float>(
-          numpy: stateDict["\(txtProjPrefix).bias"].to(torch.float).cpu().numpy()))
+      if let txtAttnOut = txtAttnOut {
+        copyParameterFloat16(
+          txtAttnOut.weight,
+          from: try! Tensor<Float>(
+            numpy: stateDict["\(txtProjPrefix).weight"].to(torch.float).cpu().numpy()))
+        copyParameterFloat16(
+          txtAttnOut.bias,
+          from: try! Tensor<Float>(
+            numpy: stateDict["\(txtProjPrefix).bias"].to(torch.float).cpu().numpy()))
+      }
 
       let vidMlpPrefix = sharedWeights ? "\(prefix).mlp.all" : "\(prefix).mlp.vid"
-      copyParameter(
+      copyParameterFloat16(
         vidMlpInProj.weight,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidMlpPrefix).proj_in.weight"].to(torch.float).cpu().numpy()))
-      copyParameter(
+      copyParameterFloat16(
         vidMlpInProj.bias,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidMlpPrefix).proj_in.bias"].to(torch.float).cpu().numpy()))
-      copyParameter(
+      copyParameterFloat16(
         vidMlpOutProj.weight,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidMlpPrefix).proj_out.weight"].to(torch.float).cpu().numpy()))
-      copyParameter(
+      copyParameterFloat16(
         vidMlpOutProj.bias,
         from: try! Tensor<Float>(
           numpy: stateDict["\(vidMlpPrefix).proj_out.bias"].to(torch.float).cpu().numpy()))
       if let txtMlpInProj = txtMlpInProj, let txtMlpOutProj = txtMlpOutProj {
         let txtMlpPrefix = sharedWeights ? "\(prefix).mlp.all" : "\(prefix).mlp.txt"
-        copyParameter(
+        copyParameterFloat16(
           txtMlpInProj.weight,
           from: try! Tensor<Float>(
             numpy: stateDict["\(txtMlpPrefix).proj_in.weight"].to(torch.float).cpu().numpy()))
-        copyParameter(
+        copyParameterFloat16(
           txtMlpInProj.bias,
           from: try! Tensor<Float>(
             numpy: stateDict["\(txtMlpPrefix).proj_in.bias"].to(torch.float).cpu().numpy()))
-        copyParameter(
+        copyParameterFloat16(
           txtMlpOutProj.weight,
           from: try! Tensor<Float>(
             numpy: stateDict["\(txtMlpPrefix).proj_out.weight"].to(torch.float).cpu().numpy()))
-        copyParameter(
+        copyParameterFloat16(
           txtMlpOutProj.bias,
           from: try! Tensor<Float>(
             numpy: stateDict["\(txtMlpPrefix).proj_out.bias"].to(torch.float).cpu().numpy()))
@@ -1360,7 +1434,8 @@ func SeedVR2DiTBlock(
       reader(stateDict)
     }
   }
-  return (reader, Model([vid, txt, emb] + windowVidFreqs + windowTxtFreqs, [vidFinal, txtFinal]))
+  let outputs = lastLayer ? [vidFinal] : [vidFinal, txtFinal!]
+  return (reader, Model([vid, txt, emb] + windowVidFreqs + windowTxtFreqs, outputs))
 }
 
 func seedVR2DiTOutputIO(
@@ -1373,8 +1448,9 @@ func seedVR2DiTOutputIO(
     let (modReader, mod) = seedVR2DiTOutputMod(emb: emb, hiddenSize: config.hiddenSize)
     let norm = RMSNorm(epsilon: 1e-5, axis: [1], name: "norm_out")
     let proj = Dense(count: 64, name: "linear")
-    let afterAda = norm(x) .* mod[1] + mod[0]
-    var out = proj(afterAda).reshaped([frames, patchHeight, patchWidth, 2, 2, 16], format: .NHWC)
+    let afterAda = (norm(x) .* mod[1] + mod[0]).to(.Float16)
+    var out = proj(afterAda).to(.Float32).reshaped(
+      [frames, patchHeight, patchWidth, 2, 2, 16], format: .NHWC)
     out = out.permuted(0, 1, 3, 2, 4, 5).contiguous().reshaped([
       frames * latentHeight * latentWidth, 16,
     ])
@@ -1384,26 +1460,32 @@ func seedVR2DiTOutputIO(
         from: try! Tensor<Float>(
           numpy: stateDict["vid_out_norm.weight"].to(torch.float).cpu().numpy()))
       proj.weight.copy(
-        from: try! Tensor<Float>(
-          numpy: stateDict["vid_out.proj.weight"].to(torch.float).cpu().numpy()))
+        from: Tensor<Float16>(
+          from: try! Tensor<Float>(
+            numpy: stateDict["vid_out.proj.weight"].to(torch.float).cpu().numpy())))
       proj.bias.copy(
-        from: try! Tensor<Float>(
-          numpy: stateDict["vid_out.proj.bias"].to(torch.float).cpu().numpy()))
+        from: Tensor<Float16>(
+          from: try! Tensor<Float>(
+            numpy: stateDict["vid_out.proj.bias"].to(torch.float).cpu().numpy())))
     }
     return (reader, out.copied())
   }
 
   let proj = Dense(count: 64, name: "linear")
-  var out = proj(x).reshaped([frames, patchHeight, patchWidth, 2, 2, 16], format: .NHWC)
+  var out = proj(x.to(.Float16)).to(.Float32).reshaped(
+    [frames, patchHeight, patchWidth, 2, 2, 16], format: .NHWC)
   out = out.permuted(0, 1, 3, 2, 4, 5).contiguous().reshaped([
     frames * latentHeight * latentWidth, 16,
   ])
   let reader: (PythonObject) -> Void = { stateDict in
     proj.weight.copy(
-      from: try! Tensor<Float>(
-        numpy: stateDict["vid_out.proj.weight"].to(torch.float).cpu().numpy()))
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(
+          numpy: stateDict["vid_out.proj.weight"].to(torch.float).cpu().numpy())))
     proj.bias.copy(
-      from: try! Tensor<Float>(numpy: stateDict["vid_out.proj.bias"].to(torch.float).cpu().numpy()))
+      from: Tensor<Float16>(
+        from: try! Tensor<Float>(
+          numpy: stateDict["vid_out.proj.bias"].to(torch.float).cpu().numpy())))
   }
   return (reader, out.copied())
 }
@@ -1430,9 +1512,9 @@ func SeedVR2DiT(
     hiddenSize: config.hiddenSize, frames: frames, latentHeight: latentHeight,
     latentWidth: latentWidth)
   let (embReader, embIn) = SeedVR2DiTTimeEmbedding(hiddenSize: config.hiddenSize)
-  var txtOut = txtIn(txt).copied()
-  var vidOut = patchIn(vid).copied()
-  let emb = embIn(timestep).copied()
+  var txtOut = txtIn(txt).to(.Float32).copied()
+  var vidOut = patchIn(vid).to(.Float32).copied()
+  let emb = embIn(timestep).to(.Float32).copied()
 
   var readers: [(PythonObject) -> Void] = [txtInReader, patchInReader, embReader]
   for layerIndex in 0..<config.layers {
@@ -1446,7 +1528,9 @@ func SeedVR2DiT(
       useShifted ? (shiftedVidFreqs + shiftedTxtFreqs) : (regularVidFreqs + regularTxtFreqs)
     let blockOut = block([vidOut, txtOut, emb] + blockFreqs)
     vidOut = blockOut[0].copied()
-    txtOut = blockOut[1].copied()
+    if !lastLayer {
+      txtOut = blockOut[1].copied()
+    }
     readers.append(blockReader)
   }
 
@@ -1460,14 +1544,11 @@ func SeedVR2DiT(
       reader(stateDict)
     }
   }
-  let outWithDependencies =
-    out + seedVR2ZeroDependency2D(vid) + seedVR2ZeroDependency2D(txt)
-    + seedVR2ZeroDependency2D(timestep) + seedVR2ZeroDependency2D(txtOut)
   return (
     reader,
     Model(
       [vid, txt, timestep] + regularVidFreqs + regularTxtFreqs + shiftedVidFreqs + shiftedTxtFreqs,
-      [outWithDependencies.copied()])
+      [out.copied()])
   )
 }
 
@@ -1963,7 +2044,10 @@ func seedVR2LoadImageTensor(path: String, height: Int, width: Int) -> Tensor<Flo
 }
 
 func seedVR2Byte(_ value: Float) -> UInt8 {
-  UInt8(min(max(Int((value + 1) * 127.5 + 0.5), 0), 255))
+  if !value.isFinite {
+    return 0
+  }
+  return UInt8(min(max(Int((value + 1) * 127.5 + 0.5), 0), 255))
 }
 
 func seedVR2SaveImageTensor(_ tensor: Tensor<Float>, path: String) {
@@ -1985,6 +2069,23 @@ func seedVR2SaveImageTensor(_ tensor: Tensor<Float>, path: String) {
     packing: rgba, size: (width, height),
     layout: PNG.Layout(format: .rgb8(palette: [], fill: nil, key: nil)))
   try! image.compress(path: path, level: 4)
+}
+
+func seedVR2ScaleTensor5D(_ tensor: Tensor<Float>, by scale: Float) -> Tensor<Float> {
+  precondition(tensor.shape.count == 5)
+  var out = tensor
+  for n in 0..<tensor.shape[0] {
+    for c in 0..<tensor.shape[1] {
+      for d in 0..<tensor.shape[2] {
+        for h in 0..<tensor.shape[3] {
+          for w in 0..<tensor.shape[4] {
+            out[n, c, d, h, w] = tensor[n, c, d, h, w] * scale
+          }
+        }
+      }
+    }
+  }
+  return out
 }
 
 func seedVR2BuildRawDiTInput(
@@ -2056,6 +2157,7 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
   print("SeedVR2 upscale input:", inputPath)
   print("SeedVR2 upscale output:", outputPath)
   print("SeedVR2 upscale size:", imageHeight, imageWidth)
+  print("SeedVR2 upscale precision: VAE Float16, DiT mixed Float16/Float32")
 
   let positiveEmbedding = try! graph.openStore(seedVR2DiTExportPath, flags: [.readOnly]) {
     Tensor<Float>(from: $0.read("positive_embedding")!)
@@ -2088,40 +2190,41 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
   let imageTensor = seedVR2LoadImageTensor(path: inputPath, height: imageHeight, width: imageWidth)
 
   graph.withNoGrad {
-    logStep("SeedVR2 upscale encoder compile/load")
-    let encoderInput = placeOnDevice(graph.variable(imageTensor))
+    logStep("SeedVR2 upscale encoder compile/load Float16")
+    let encoderInput = placeOnDevice(graph.variable(Tensor<Float16>(from: imageTensor)))
     let (_, encoder) = SeedVR2Encoder3D(
       startDepth: 1, startHeight: imageHeight, startWidth: imageWidth)
     encoder.compile(inputs: encoderInput)
     graph.openStore(seedVR2VAEExportPath, flags: [.readOnly]) {
       $0.read("encoder", model: encoder)
     }
-    logStep("SeedVR2 upscale encode")
-    let conditionLatent = (encoder(inputs: encoderInput)[0].as(of: Float.self) * scalingFactor)
-      .copied()
-    let conditionLatentCPU = copiedToCPU(conditionLatent)
+    logStep("SeedVR2 upscale encode Float16")
+    let conditionLatentCPU = seedVR2ScaleTensor5D(
+      copiedToCPU(encoder(inputs: encoderInput)[0].as(of: Float16.self)), by: scalingFactor)
 
     let rawVidInputCPU = seedVR2BuildRawDiTInput(
       noise: noise, conditionLatent: conditionLatentCPU, depth: latentDepth, height: latentHeight,
       width: latentWidth)
-    let rawVidInput = placeOnDevice(graph.variable(rawVidInputCPU))
-    let rawTxtInput = placeOnDevice(graph.variable(positiveEmbedding))
+    let rawVidInput = placeOnDevice(graph.variable(Tensor<Float16>(from: rawVidInputCPU)))
+    let rawTxtInput = placeOnDevice(graph.variable(Tensor<Float16>(from: positiveEmbedding)))
     let timeInput = placeOnDevice(
       graph.variable(
-        seedVR2TimeEmbedding(timestep: 1000.0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000))
+        Tensor<Float16>(
+          from: seedVR2TimeEmbedding(
+            timestep: 1000.0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)))
     )
     let regularVidFreqInputs = seedVR2LoadWindowFreqs(
       regularProbe, kind: "vid", count: regularWindows.count
-    ).map { rematerializeOnDevice(graph, $0) }
+    ).map { rematerializeOnDeviceFloat16(graph, $0) }
     let regularTxtFreqInputs = seedVR2LoadWindowFreqs(
       regularProbe, kind: "txt", count: regularWindows.count
-    ).map { rematerializeOnDevice(graph, $0) }
+    ).map { rematerializeOnDeviceFloat16(graph, $0) }
     let shiftedVidFreqInputs = seedVR2LoadWindowFreqs(
       shiftedProbe, kind: "vid", count: shiftedWindows.count
-    ).map { rematerializeOnDevice(graph, $0) }
+    ).map { rematerializeOnDeviceFloat16(graph, $0) }
     let shiftedTxtFreqInputs = seedVR2LoadWindowFreqs(
       shiftedProbe, kind: "txt", count: shiftedWindows.count
-    ).map { rematerializeOnDevice(graph, $0) }
+    ).map { rematerializeOnDeviceFloat16(graph, $0) }
     let rotaryInputs =
       regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
     let ditInputs: [DynamicGraph_Any] =
@@ -2131,7 +2234,7 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
       ]
       + rotaryInputs.map { $0 as DynamicGraph_Any }
 
-    logStep("SeedVR2 upscale dit compile/load")
+    logStep("SeedVR2 upscale dit compile/load mixed")
     let (_, dit) = SeedVR2DiT(
       config: seedVR2Config, frames: latentDepth, latentHeight: latentHeight,
       latentWidth: latentWidth, txtLen: txtLen)
@@ -2140,15 +2243,16 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
       $0.read("dit", model: dit)
     }
 
-    logStep("SeedVR2 upscale dit forward")
+    logStep("SeedVR2 upscale dit forward mixed")
     let prediction = dit(inputs: rawVidInput, Array(ditInputs.dropFirst()))[0].as(of: Float.self)
     let predictionCPU = copiedToCPU(prediction)
+    seedVR2FiniteSummary("SeedVR2 upscale prediction", predictionCPU)
     let decoderLatent = seedVR2BuildDecoderLatent(
       noise: noise, prediction: predictionCPU, depth: latentDepth, height: latentHeight,
       width: latentWidth, scalingFactor: scalingFactor)
 
-    logStep("SeedVR2 upscale decoder compile/load")
-    let decoderInput = placeOnDevice(graph.variable(decoderLatent))
+    logStep("SeedVR2 upscale decoder compile/load Float16")
+    let decoderInput = placeOnDevice(graph.variable(Tensor<Float16>(from: decoderLatent)))
     let (_, decoder) = SeedVR2Decoder3D(
       startDepth: latentDepth, startHeight: latentHeight, startWidth: latentWidth)
     decoder.compile(inputs: decoderInput)
@@ -2156,9 +2260,10 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
       $0.read("decoder", model: decoder)
     }
 
-    logStep("SeedVR2 upscale decode")
-    let decoded = decoder(inputs: decoderInput)[0].as(of: Float.self)
-    seedVR2SaveImageTensor(copiedToCPU(decoded), path: outputPath)
+    logStep("SeedVR2 upscale decode Float16")
+    let decoded = copiedToCPU(decoder(inputs: decoderInput)[0].as(of: Float16.self))
+    seedVR2FiniteSummary("SeedVR2 upscale decoded", decoded)
+    seedVR2SaveImageTensor(decoded, path: outputPath)
     print("Wrote \(outputPath)")
   }
   exit(0)
@@ -2245,10 +2350,10 @@ if envFlag("SEEDVR2_RUN_DIT") || envFlag("SEEDVR2_RUN_DIT_WINDOW_FULL")
     let timeInput = placeOnDevice(
       graph.variable(
         seedVR2TimeEmbedding(timestep: 500.0, batchSize: 1, embeddingSize: 256, maxPeriod: 10_000)))
-    let regularVidFreqInputs = regularVidFreqs.map { rematerializeOnDevice(graph, $0) }
-    let regularTxtFreqInputs = regularTxtFreqs.map { rematerializeOnDevice(graph, $0) }
-    let shiftedVidFreqInputs = shiftedVidFreqs.map { rematerializeOnDevice(graph, $0) }
-    let shiftedTxtFreqInputs = shiftedTxtFreqs.map { rematerializeOnDevice(graph, $0) }
+    let regularVidFreqInputs = regularVidFreqs.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let regularTxtFreqInputs = regularTxtFreqs.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let shiftedVidFreqInputs = shiftedVidFreqs.map { rematerializeOnDeviceFloat16(graph, $0) }
+    let shiftedTxtFreqInputs = shiftedTxtFreqs.map { rematerializeOnDeviceFloat16(graph, $0) }
     let rotaryInputs =
       regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
     let ditInputs: [DynamicGraph_Any] =
