@@ -41,6 +41,11 @@ enum SeedVR2MLPKind {
   case gelu
 }
 
+enum SeedVR2RotaryKind {
+  case mmrope3d
+  case pixelVideoOnly
+}
+
 struct SeedVR2DiTConfig {
   let name: String
   let configDir: String
@@ -53,6 +58,7 @@ struct SeedVR2DiTConfig {
   let sharedWeightStartLayer: Int?
   let lastLayerVidOnly: Bool
   let outputNormAda: Bool
+  let rotaryKind: SeedVR2RotaryKind
   let rotaryDim: Int
   let mlpHiddenSize: Int
   let mlpKind: SeedVR2MLPKind
@@ -75,15 +81,15 @@ func seedVR2DiTConfig() -> SeedVR2DiTConfig {
     return SeedVR2DiTConfig(
       name: "7B", configDir: "configs_7b", checkpointRoot: "\(seedVRRoot)/SeedVR2-7B",
       ditCheckpoint: checkpoint, hiddenSize: 3072, heads: 24, headDim: 128, layers: 36,
-      sharedWeightStartLayer: nil, lastLayerVidOnly: false, outputNormAda: false, rotaryDim: 60,
-      mlpHiddenSize: 12288, mlpKind: .gelu)
+      sharedWeightStartLayer: nil, lastLayerVidOnly: false, outputNormAda: false,
+      rotaryKind: .pixelVideoOnly, rotaryDim: 60, mlpHiddenSize: 12288, mlpKind: .gelu)
   default:
     let checkpoint = envString("SEEDVR2_DIT_CHECKPOINT", "seedvr2_ema_3b.pth")
     return SeedVR2DiTConfig(
       name: "3B", configDir: "configs_3b", checkpointRoot: "\(seedVRRoot)/SeedVR2-3B",
       ditCheckpoint: checkpoint, hiddenSize: 2560, heads: 20, headDim: 128, layers: 32,
-      sharedWeightStartLayer: 10, lastLayerVidOnly: true, outputNormAda: true, rotaryDim: 126,
-      mlpHiddenSize: 6912, mlpKind: .swiglu)
+      sharedWeightStartLayer: 10, lastLayerVidOnly: true, outputNormAda: true,
+      rotaryKind: .mmrope3d, rotaryDim: 126, mlpHiddenSize: 6912, mlpKind: .swiglu)
   }
 }
 
@@ -329,6 +335,86 @@ func seedVR2MMRotary3DWindowTensors(
     txt.append(txtRot)
   }
   return (vid, txt)
+}
+
+func seedVR2FillIdentityRotary(_ rot: inout Tensor<Float>, token: Int, rotaryDim: Int) {
+  for k in 0..<(rotaryDim / 2) {
+    rot[0, token, 0, k * 2] = 1
+    rot[0, token, 0, k * 2 + 1] = 0
+  }
+}
+
+func seedVR2PixelRotaryPosition(_ index: Int, length: Int) -> Double {
+  if length <= 1 {
+    return -1
+  }
+  return -1 + 2 * Double(index) / Double(length - 1)
+}
+
+func seedVR2FillPixelRotaryAxis(
+  _ rot: inout Tensor<Float>, token: Int, axis: Int, index: Int, length: Int, rotaryDim: Int
+) {
+  precondition(rotaryDim % 6 == 0)
+  let axisDim = rotaryDim / 3
+  let axisOffset = axis * axisDim
+  let pairs = axisDim / 2
+  let position = seedVR2PixelRotaryPosition(index, length: length)
+  for k in 0..<pairs {
+    let multiplier = pairs == 1 ? 1 : 1 + 127 * Double(k) / Double(pairs - 1)
+    let theta = position * multiplier * Double.pi
+    let sintheta = sin(theta)
+    let costheta = cos(theta)
+    rot[0, token, 0, axisOffset + k * 2] = Float(costheta)
+    rot[0, token, 0, axisOffset + k * 2 + 1] = Float(sintheta)
+  }
+}
+
+func seedVR2PixelVideoRotaryWindowTensors(
+  windows: [SeedVR2Window3D], txtLen: Int, rotaryDim: Int
+) -> (vid: [Tensor<Float>], txt: [Tensor<Float>]) {
+  var vid = [Tensor<Float>]()
+  var txt = [Tensor<Float>]()
+  for window in windows {
+    var vidRot = Tensor<Float>(.CPU, .NHWC(1, window.tokenLength, 1, rotaryDim))
+    var token = 0
+    for t in 0..<window.tLength {
+      for h in 0..<window.hLength {
+        for w in 0..<window.wLength {
+          seedVR2FillPixelRotaryAxis(
+            &vidRot, token: token, axis: 0, index: t, length: window.tLength,
+            rotaryDim: rotaryDim)
+          seedVR2FillPixelRotaryAxis(
+            &vidRot, token: token, axis: 1, index: h, length: window.hLength,
+            rotaryDim: rotaryDim)
+          seedVR2FillPixelRotaryAxis(
+            &vidRot, token: token, axis: 2, index: w, length: window.wLength,
+            rotaryDim: rotaryDim)
+          token += 1
+        }
+      }
+    }
+    vid.append(vidRot)
+
+    var txtRot = Tensor<Float>(.CPU, .NHWC(1, txtLen, 1, rotaryDim))
+    for textIndex in 0..<txtLen {
+      seedVR2FillIdentityRotary(&txtRot, token: textIndex, rotaryDim: rotaryDim)
+    }
+    txt.append(txtRot)
+  }
+  return (vid, txt)
+}
+
+func seedVR2RotaryWindowTensors(
+  config: SeedVR2DiTConfig, windows: [SeedVR2Window3D], txtLen: Int
+) -> (vid: [Tensor<Float>], txt: [Tensor<Float>]) {
+  switch config.rotaryKind {
+  case .mmrope3d:
+    return seedVR2MMRotary3DWindowTensors(
+      windows: windows, txtLen: txtLen, rotaryDim: config.rotaryDim)
+  case .pixelVideoOnly:
+    return seedVR2PixelVideoRotaryWindowTensors(
+      windows: windows, txtLen: txtLen, rotaryDim: config.rotaryDim)
+  }
 }
 
 func seedVR2PrintRotaryParity(
@@ -801,7 +887,7 @@ func seedVR2StateTensor(_ stateDict: PythonObject, _ key: String) -> Tensor<Floa
 
 func seedVR2DiTBlockMod(
   blockIndex: Int, branch: String, layer: String, emb: Model.IO, hiddenSize: Int,
-  sharedWeights: Bool
+  sharedWeights: Bool, includeGate: Bool = true
 ) -> ((PythonObject) -> Void, [Model.IO]) {
   let layerOffset = layer == "attn" ? 0 : 3
   let shift = Parameter<Float>(
@@ -810,14 +896,19 @@ func seedVR2DiTBlockMod(
   let scale = Parameter<Float>(
     .GPU(swiftDevice), .NC(1, hiddenSize), trainable: false,
     name: "block\(blockIndex)_\(branch)_\(layer)_scale")
-  let gate = Parameter<Float>(
-    .GPU(swiftDevice), .NC(1, hiddenSize), trainable: false,
-    name: "block\(blockIndex)_\(branch)_\(layer)_gate")
-  let mod = [
+  let gate =
+    includeGate
+    ? Parameter<Float>(
+      .GPU(swiftDevice), .NC(1, hiddenSize), trainable: false,
+      name: "block\(blockIndex)_\(branch)_\(layer)_gate")
+    : nil
+  var mod = [
     seedVR2EmbRow(emb, offset: layerOffset, width: hiddenSize) + shift,
     seedVR2EmbRow(emb, offset: layerOffset + 1, width: hiddenSize) + scale,
-    seedVR2EmbRow(emb, offset: layerOffset + 2, width: hiddenSize) + gate,
   ]
+  if let gate = gate {
+    mod.append(seedVR2EmbRow(emb, offset: layerOffset + 2, width: hiddenSize) + gate)
+  }
   let reader: (PythonObject) -> Void = { stateDict in
     let specificPrefix = "blocks.\(blockIndex).ada.\(branch)"
     let sharedPrefix = "blocks.\(blockIndex).ada.all"
@@ -826,8 +917,10 @@ func seedVR2DiTBlockMod(
       from: seedVR2StateTensorNC(stateDict, "\(statePrefix).\(layer)_shift", width: hiddenSize))
     scale.weight.copy(
       from: seedVR2StateTensorNC(stateDict, "\(statePrefix).\(layer)_scale", width: hiddenSize))
-    gate.weight.copy(
-      from: seedVR2StateTensorNC(stateDict, "\(statePrefix).\(layer)_gate", width: hiddenSize))
+    if let gate = gate {
+      gate.weight.copy(
+        from: seedVR2StateTensorNC(stateDict, "\(statePrefix).\(layer)_gate", width: hiddenSize))
+    }
   }
   return (reader, mod)
 }
@@ -937,7 +1030,8 @@ func seedVR2BatchedWindowAttentionSDPA(
   let batch = vidQ.count
   precondition(batch > 0)
   precondition(vidK.count == batch && vidV.count == batch)
-  precondition(txtQ.count == batch && txtK.count == batch)
+  precondition(txtK.count == batch)
+  precondition(!returnText || txtQ.count == batch)
   let batchedVidQ = seedVR2Concat(vidQ, axis: 0).reshaped(
     [batch, windowLen, heads, headDim]
   ).contiguous()
@@ -947,18 +1041,25 @@ func seedVR2BatchedWindowAttentionSDPA(
   let batchedVidV = seedVR2Concat(vidV, axis: 0).reshaped(
     [batch, windowLen, heads, headDim]
   ).contiguous()
-  let batchedTxtQ = seedVR2Concat(txtQ, axis: 0).reshaped(
-    [batch, txtLen, heads, headDim]
-  ).contiguous()
   let batchedTxtK = seedVR2Concat(txtK, axis: 0).reshaped(
     [batch, txtLen, heads, headDim]
   ).contiguous()
   let batchedTxtV = seedVR2Concat(vidQ.map { _ in txtV }, axis: 0).reshaped(
     [batch, txtLen, heads, headDim]
   ).contiguous()
-  let q = Functional.concat(axis: 1, batchedVidQ, batchedTxtQ).contiguous()
   let k = Functional.concat(axis: 1, batchedVidK, batchedTxtK).contiguous()
   let v = Functional.concat(axis: 1, batchedVidV, batchedTxtV).contiguous()
+  if !returnText {
+    let vidOnlyOut = ScaledDotProductAttention(
+      scale: 1.0 / Float(headDim).squareRoot(), flags: [.Float16])(
+        batchedVidQ, k, v
+      ).contiguous().reshaped([batch * windowLen, heads, headDim]).contiguous()
+    return (vidOnlyOut, nil)
+  }
+  let batchedTxtQ = seedVR2Concat(txtQ, axis: 0).reshaped(
+    [batch, txtLen, heads, headDim]
+  ).contiguous()
+  let q = Functional.concat(axis: 1, batchedVidQ, batchedTxtQ).contiguous()
   let out = ScaledDotProductAttention(scale: 1.0 / Float(headDim).squareRoot(), flags: [.Float16])(
     q, k, v
   ).contiguous()
@@ -968,9 +1069,6 @@ func seedVR2BatchedWindowAttentionSDPA(
     strides: [queryLen * heads * headDim, heads * headDim, headDim, 1]
   ).contiguous().copied().reshaped([batch * windowLen, heads, headDim])
     .contiguous()
-  guard returnText else {
-    return (vidOut, nil)
-  }
   let txtOut = out.reshaped(
     [batch, txtLen, heads, headDim], offset: [0, windowLen, 0, 0],
     strides: [queryLen * heads * headDim, heads * headDim, headDim, 1]
@@ -983,11 +1081,12 @@ func seedVR2WindowAttentionSDPA(
   txtQ: Model.IO, txtK: Model.IO, txtV: Model.IO,
   vidFreqs: [Model.IO], txtFreqs: [Model.IO],
   windows: [SeedVR2Window3D], frames: Int, height: Int, width: Int, txtLen: Int,
-  heads: Int, headDim: Int, rotaryDim: Int, returnText: Bool = true
+  heads: Int, headDim: Int, rotaryDim: Int, rotateText: Bool, returnText: Bool = true
 ) -> (Model.IO, Model.IO?) {
   let windowCount = windows.count
   precondition(windowCount > 0)
-  precondition(vidFreqs.count == windowCount && txtFreqs.count == windowCount)
+  precondition(vidFreqs.count == windowCount)
+  precondition(!rotateText || txtFreqs.count == windowCount)
 
   var windowVidQ = [Model.IO]()
   var windowVidK = [Model.IO]()
@@ -1014,14 +1113,23 @@ func seedVR2WindowAttentionSDPA(
       seedVR2WindowSlice3D(
         vidV, window: window, frames: frames, height: height, width: width, heads: heads,
         headDim: headDim))
-    windowTxtQ.append(
-      seedVR2ApplyRotary3D(
-        txtQ, rot: txtFreqs[windowIndex], seqLen: txtLen, heads: heads, headDim: headDim,
-        rotDim: rotaryDim))
-    windowTxtK.append(
-      seedVR2ApplyRotary3D(
-        txtK, rot: txtFreqs[windowIndex], seqLen: txtLen, heads: heads, headDim: headDim,
-        rotDim: rotaryDim))
+    if rotateText {
+      if returnText {
+        windowTxtQ.append(
+          seedVR2ApplyRotary3D(
+            txtQ, rot: txtFreqs[windowIndex], seqLen: txtLen, heads: heads, headDim: headDim,
+            rotDim: rotaryDim))
+      }
+      windowTxtK.append(
+        seedVR2ApplyRotary3D(
+          txtK, rot: txtFreqs[windowIndex], seqLen: txtLen, heads: heads, headDim: headDim,
+          rotDim: rotaryDim))
+    } else {
+      if returnText {
+        windowTxtQ.append(txtQ)
+      }
+      windowTxtK.append(txtK)
+    }
   }
 
   var windowVidOuts = [Model.IO]()
@@ -1039,7 +1147,7 @@ func seedVR2WindowAttentionSDPA(
       vidQ: groupRange.map { windowVidQ[$0] },
       vidK: groupRange.map { windowVidK[$0] },
       vidV: groupRange.map { windowVidV[$0] },
-      txtQ: groupRange.map { windowTxtQ[$0] },
+      txtQ: returnText ? groupRange.map { windowTxtQ[$0] } : [],
       txtK: groupRange.map { windowTxtK[$0] },
       txtV: txtV,
       windowLen: windowLen, txtLen: txtLen, heads: heads, headDim: headDim,
@@ -1150,14 +1258,15 @@ func seedVR2WindowSpec3D(frames: Int, height: Int, width: Int, shifted: Bool) ->
 
 func SeedVR2DiTBlock(
   config: SeedVR2DiTConfig, layerIndex: Int, windows: [SeedVR2Window3D], frames: Int,
-  height: Int, width: Int, txtLen: Int, lastLayer: Bool = false
+  height: Int, width: Int, txtLen: Int, lastLayer: Bool = false, returnText: Bool = true
 ) -> ((PythonObject) -> Void, Model) {
   precondition(!windows.isEmpty)
   let vid = Input()
   let txt = Input()
   let emb = Input()
   let windowVidFreqs = windows.map { _ in Input() }
-  let windowTxtFreqs = windows.map { _ in Input() }
+  let rotateText = config.rotaryKind == .mmrope3d
+  let windowTxtFreqs = rotateText ? windows.map { _ in Input() } : []
   let hiddenSize = config.hiddenSize
   let heads = config.heads
   let headDim = config.headDim
@@ -1189,15 +1298,19 @@ func SeedVR2DiTBlock(
   } else {
     let (txtAttnModReader, txtAttnMod) = seedVR2DiTBlockMod(
       blockIndex: layerIndex, branch: "txt", layer: "attn", emb: emb, hiddenSize: hiddenSize,
-      sharedWeights: sharedWeights)
-    let (txtMlpModReader, txtMlpModValue) = seedVR2DiTBlockMod(
-      blockIndex: layerIndex, branch: "txt", layer: "mlp", emb: emb, hiddenSize: hiddenSize,
-      sharedWeights: sharedWeights)
+      sharedWeights: sharedWeights, includeGate: returnText)
     readers.append(txtAttnModReader)
-    readers.append(txtMlpModReader)
     txtAttnIn = (txtAttnNorm(txt) .* txtAttnMod[1] + txtAttnMod[0]).copied()
-    txtAttnGate = txtAttnMod[2]
-    txtMlpMod = txtMlpModValue
+    txtAttnGate = returnText ? txtAttnMod[2] : nil
+    if returnText {
+      let (txtMlpModReader, txtMlpModValue) = seedVR2DiTBlockMod(
+        blockIndex: layerIndex, branch: "txt", layer: "mlp", emb: emb, hiddenSize: hiddenSize,
+        sharedWeights: sharedWeights)
+      readers.append(txtMlpModReader)
+      txtMlpMod = txtMlpModValue
+    } else {
+      txtMlpMod = nil
+    }
   }
 
   let vidQProj = Dense(count: hiddenSize, noBias: true, name: "vid_q")
@@ -1216,15 +1329,17 @@ func SeedVR2DiTBlock(
   let vidQ = vidNormQ(vidQProj(vidAttnProjIn).reshaped([vidLen, heads, headDim])).copied()
   let vidK = vidNormK(vidKProj(vidAttnProjIn).reshaped([vidLen, heads, headDim])).copied()
   let vidV = vidVProj(vidAttnProjIn).reshaped([vidLen, heads, headDim]).copied()
-  let txtQ = txtNormQ(txtQProj(txtAttnProjIn).reshaped([txtLen, heads, headDim])).copied()
   let txtK = txtNormK(txtKProj(txtAttnProjIn).reshaped([txtLen, heads, headDim])).copied()
   let txtV = txtVProj(txtAttnProjIn).reshaped([txtLen, heads, headDim]).copied()
+  let txtQ =
+    returnText
+    ? txtNormQ(txtQProj(txtAttnProjIn).reshaped([txtLen, heads, headDim])).copied() : txtK
 
   let (vidAttn3D, txtAttn3D) = seedVR2WindowAttentionSDPA(
     vidQ: vidQ, vidK: vidK, vidV: vidV, txtQ: txtQ, txtK: txtK, txtV: txtV,
     vidFreqs: windowVidFreqs, txtFreqs: windowTxtFreqs, windows: windows, frames: frames,
     height: height, width: width, txtLen: txtLen, heads: heads, headDim: headDim,
-    rotaryDim: config.rotaryDim, returnText: !lastLayer)
+    rotaryDim: config.rotaryDim, rotateText: rotateText, returnText: returnText)
   let vidAttnFlat = seedVR2FlattenHeads(vidAttn3D, seqLen: vidLen, heads: heads, headDim: headDim)
     .copied()
   let vidAttnOut = Dense(count: hiddenSize, name: "vid_attn_out")
@@ -1304,12 +1419,16 @@ func SeedVR2DiTBlock(
         copyParameterFloat16(vidQProj.weight, from: qWeight)
         copyParameterFloat16(vidKProj.weight, from: kWeight)
         copyParameterFloat16(vidVProj.weight, from: vWeight)
-        copyParameterFloat16(txtQProj.weight, from: qWeight)
+        if returnText {
+          copyParameterFloat16(txtQProj.weight, from: qWeight)
+        }
         copyParameterFloat16(txtKProj.weight, from: kWeight)
         copyParameterFloat16(txtVProj.weight, from: vWeight)
         copyParameterFloat16(vidNormQ.weight, from: allNormQ)
         copyParameterFloat16(vidNormK.weight, from: allNormK)
-        copyParameterFloat16(txtNormQ.weight, from: allNormQ)
+        if returnText {
+          copyParameterFloat16(txtNormQ.weight, from: allNormQ)
+        }
         copyParameterFloat16(txtNormK.weight, from: allNormK)
       } else {
         let vidQKV = stateDict["\(prefix).attn.proj_qkv.vid.weight"].to(torch.float).cpu()
@@ -1322,8 +1441,10 @@ func SeedVR2DiTBlock(
         copyParameterFloat16(
           vidVProj.weight, from: try! Tensor<Float>(numpy: vidQKV[(2 * hiddenSize)..., ...].numpy())
         )
-        copyParameterFloat16(
-          txtQProj.weight, from: try! Tensor<Float>(numpy: txtQKV[..<hiddenSize, ...].numpy()))
+        if returnText {
+          copyParameterFloat16(
+            txtQProj.weight, from: try! Tensor<Float>(numpy: txtQKV[..<hiddenSize, ...].numpy()))
+        }
         copyParameterFloat16(
           txtKProj.weight,
           from: try! Tensor<Float>(numpy: txtQKV[hiddenSize..<(2 * hiddenSize), ...].numpy()))
@@ -1334,8 +1455,11 @@ func SeedVR2DiTBlock(
           vidNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.vid.weight"))
         copyParameterFloat16(
           vidNormK.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.vid.weight"))
-        copyParameterFloat16(
-          txtNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.txt.weight"))
+        if returnText {
+          copyParameterFloat16(
+            txtNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.txt.weight")
+          )
+        }
         copyParameterFloat16(
           txtNormK.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.txt.weight"))
       }
@@ -1431,12 +1555,16 @@ func SeedVR2DiTBlock(
         copyParameterFloat16(vidQProj.weight, from: qWeight)
         copyParameterFloat16(vidKProj.weight, from: kWeight)
         copyParameterFloat16(vidVProj.weight, from: vWeight)
-        copyParameterFloat16(txtQProj.weight, from: qWeight)
+        if returnText {
+          copyParameterFloat16(txtQProj.weight, from: qWeight)
+        }
         copyParameterFloat16(txtKProj.weight, from: kWeight)
         copyParameterFloat16(txtVProj.weight, from: vWeight)
         copyParameterFloat16(vidNormQ.weight, from: allNormQ)
         copyParameterFloat16(vidNormK.weight, from: allNormK)
-        copyParameterFloat16(txtNormQ.weight, from: allNormQ)
+        if returnText {
+          copyParameterFloat16(txtNormQ.weight, from: allNormQ)
+        }
         copyParameterFloat16(txtNormK.weight, from: allNormK)
       } else {
         let vidQKV = stateDict["\(prefix).attn.proj_qkv.vid.weight"].to(torch.float).cpu()
@@ -1449,8 +1577,10 @@ func SeedVR2DiTBlock(
         copyParameterFloat16(
           vidVProj.weight, from: try! Tensor<Float>(numpy: vidQKV[(2 * hiddenSize)..., ...].numpy())
         )
-        copyParameterFloat16(
-          txtQProj.weight, from: try! Tensor<Float>(numpy: txtQKV[..<hiddenSize, ...].numpy()))
+        if returnText {
+          copyParameterFloat16(
+            txtQProj.weight, from: try! Tensor<Float>(numpy: txtQKV[..<hiddenSize, ...].numpy()))
+        }
         copyParameterFloat16(
           txtKProj.weight,
           from: try! Tensor<Float>(numpy: txtQKV[hiddenSize..<(2 * hiddenSize), ...].numpy()))
@@ -1461,8 +1591,11 @@ func SeedVR2DiTBlock(
           vidNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.vid.weight"))
         copyParameterFloat16(
           vidNormK.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.vid.weight"))
-        copyParameterFloat16(
-          txtNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.txt.weight"))
+        if returnText {
+          copyParameterFloat16(
+            txtNormQ.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_q.txt.weight")
+          )
+        }
         copyParameterFloat16(
           txtNormK.weight, from: seedVR2StateTensor(stateDict, "\(prefix).attn.norm_k.txt.weight"))
       }
@@ -1534,7 +1667,7 @@ func SeedVR2DiTBlock(
       reader(stateDict)
     }
   }
-  let outputs = lastLayer ? [vidFinal] : [vidFinal, txtFinal!]
+  let outputs = returnText ? [vidFinal, txtFinal!] : [vidFinal]
   return (reader, Model([vid, txt, emb] + windowVidFreqs + windowTxtFreqs, outputs))
 }
 
@@ -1602,10 +1735,11 @@ func SeedVR2DiT(
     frames: frames, height: patchHeight, width: patchWidth, shifted: false)
   let shiftedWindows = seedVR2WindowSpec3D(
     frames: frames, height: patchHeight, width: patchWidth, shifted: true)
+  let rotateText = config.rotaryKind == .mmrope3d
   let regularVidFreqs = regularWindows.map { _ in Input() }
-  let regularTxtFreqs = regularWindows.map { _ in Input() }
+  let regularTxtFreqs = rotateText ? regularWindows.map { _ in Input() } : []
   let shiftedVidFreqs = shiftedWindows.map { _ in Input() }
-  let shiftedTxtFreqs = shiftedWindows.map { _ in Input() }
+  let shiftedTxtFreqs = rotateText ? shiftedWindows.map { _ in Input() } : []
 
   let (txtInReader, txtIn) = SeedVR2DiTTextIn(hiddenSize: config.hiddenSize)
   let (patchInReader, patchIn) = SeedVR2DiTPatchIn(
@@ -1618,17 +1752,20 @@ func SeedVR2DiT(
 
   var readers: [(PythonObject) -> Void] = [txtInReader, patchInReader, embReader]
   for layerIndex in 0..<config.layers {
-    let lastLayer = config.lastLayerVidOnly && layerIndex == config.layers - 1
+    let isFinalLayer = layerIndex == config.layers - 1
+    let lastLayer = config.lastLayerVidOnly && isFinalLayer
+    let returnText = !isFinalLayer
     let useShifted = layerIndex % 2 == 1 || lastLayer
     let windows = useShifted ? shiftedWindows : regularWindows
     let (blockReader, block) = SeedVR2DiTBlock(
       config: config, layerIndex: layerIndex, windows: windows, frames: frames,
-      height: patchHeight, width: patchWidth, txtLen: txtLen, lastLayer: lastLayer)
+      height: patchHeight, width: patchWidth, txtLen: txtLen, lastLayer: lastLayer,
+      returnText: returnText)
     let blockFreqs =
       useShifted ? (shiftedVidFreqs + shiftedTxtFreqs) : (regularVidFreqs + regularTxtFreqs)
     let blockOut = block([vidOut, txtOut, emb] + blockFreqs)
     vidOut = blockOut[0].copied()
-    if !lastLayer {
+    if returnText {
       txtOut = blockOut[1].copied()
     }
     readers.append(blockReader)
@@ -2312,10 +2449,10 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
   let shiftedWindows = seedVR2WindowSpec3D(
     frames: latentDepth, height: patchHeight, width: patchWidth, shifted: true)
 
-  let regularRotary = seedVR2MMRotary3DWindowTensors(
-    windows: regularWindows, txtLen: txtLen, rotaryDim: seedVR2Config.rotaryDim)
-  let shiftedRotary = seedVR2MMRotary3DWindowTensors(
-    windows: shiftedWindows, txtLen: txtLen, rotaryDim: seedVR2Config.rotaryDim)
+  let regularRotary = seedVR2RotaryWindowTensors(
+    config: seedVR2Config, windows: regularWindows, txtLen: txtLen)
+  let shiftedRotary = seedVR2RotaryWindowTensors(
+    config: seedVR2Config, windows: shiftedWindows, txtLen: txtLen)
 
   torch.manual_seed(seed)
   let noise = try! Tensor<Float>(
@@ -2353,7 +2490,9 @@ if envFlag("SEEDVR2_RUN_UPSCALE") {
     let shiftedVidFreqInputs = shiftedRotary.vid.map { rematerializeOnDeviceFloat16(graph, $0) }
     let shiftedTxtFreqInputs = shiftedRotary.txt.map { rematerializeOnDeviceFloat16(graph, $0) }
     let rotaryInputs =
-      regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
+      seedVR2Config.rotaryKind == .mmrope3d
+      ? regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
+      : regularVidFreqInputs + shiftedVidFreqInputs
     let ditInputs: [DynamicGraph_Any] =
       [
         rawVidInput as DynamicGraph_Any, rawTxtInput as DynamicGraph_Any,
@@ -2471,10 +2610,10 @@ if envFlag("SEEDVR2_RUN_DIT") || envFlag("SEEDVR2_RUN_DIT_WINDOW_FULL")
       shiftedProbe, kind: "vid", count: shiftedWindows.count)
     let shiftedReferenceTxtFreqs = loadWindowFreqs(
       shiftedProbe, kind: "txt", count: shiftedWindows.count)
-    let regularRotary = seedVR2MMRotary3DWindowTensors(
-      windows: regularWindows, txtLen: ditTxtLen, rotaryDim: seedVR2Config.rotaryDim)
-    let shiftedRotary = seedVR2MMRotary3DWindowTensors(
-      windows: shiftedWindows, txtLen: ditTxtLen, rotaryDim: seedVR2Config.rotaryDim)
+    let regularRotary = seedVR2RotaryWindowTensors(
+      config: seedVR2Config, windows: regularWindows, txtLen: ditTxtLen)
+    let shiftedRotary = seedVR2RotaryWindowTensors(
+      config: seedVR2Config, windows: shiftedWindows, txtLen: ditTxtLen)
     seedVR2PrintRotaryParity(
       "SeedVR2 dit regular vid", swift: regularRotary.vid, reference: regularReferenceVidFreqs)
     seedVR2PrintRotaryParity(
@@ -2494,7 +2633,9 @@ if envFlag("SEEDVR2_RUN_DIT") || envFlag("SEEDVR2_RUN_DIT_WINDOW_FULL")
     let shiftedVidFreqInputs = shiftedRotary.vid.map { rematerializeOnDeviceFloat16(graph, $0) }
     let shiftedTxtFreqInputs = shiftedRotary.txt.map { rematerializeOnDeviceFloat16(graph, $0) }
     let rotaryInputs =
-      regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
+      seedVR2Config.rotaryKind == .mmrope3d
+      ? regularVidFreqInputs + regularTxtFreqInputs + shiftedVidFreqInputs + shiftedTxtFreqInputs
+      : regularVidFreqInputs + shiftedVidFreqInputs
     let ditInputs: [DynamicGraph_Any] =
       [
         rawVidInput as DynamicGraph_Any, rawTxtInput as DynamicGraph_Any,
