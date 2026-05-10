@@ -3,18 +3,19 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/fast/Data/anima_preview_3_f16.ckpt", flags: [.readOnly]
+  "/home/liu/workspace/swift-diffusion/qwen_3.5_4b_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/fast/Data/anima_preview_3_i8x.ckpt",
+    "/fast/Data/qwen_3.5_4b_i8x_s.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
       guard let anyTensor = store.read(key) else { continue }
       guard anyTensor.dataType != .Float32 else {
         // If it is already in FP32, skip transcode to FP16. Only useful for UMT5 XXL / Wan v2.1 models.
-        let tensor = Tensor<Float32>(anyTensor).toCPU()
+        let tensor = Tensor<Float16>(from: anyTensor).toCPU()
+        // let tensor = Tensor<Float32>(anyTensor).toCPU()
         $0.write(key, tensor: tensor)
         continue
       }
@@ -43,6 +44,11 @@ graph.openStore(
         || key.contains("_pad_token")  // Z-Image related.
         || key.contains("_registers") || key.contains("_connector") || key.contains("_extractor")  // LTX-2 related.
         || key.contains("token_embedding")  // Anima related.
+        || key.contains("positive_embedding")  // SeedVR2 related.
+        || key.contains("negative_embedding")  // SeedVR2 related.
+        // || key.contains("embed_tokens")  // Qwen 3.5 related.
+        || key.contains("patch_embed")  // Qwen 3.5 related.
+        || key.contains("linear_attn.conv1d.")  // Qwen 3.5 related.
       {
         $0.write(key, tensor: tensor)
         continue
@@ -106,7 +112,7 @@ graph.openStore(
           $0.write(key, tensor: tensor, codec: [.i8x, .ezm7])
         }
       } else if shape.count == 4 && n > 1 {
-        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7])
+        $0.write(key, tensor: tensor, codec: [.i8x, .ezm7])
       } else {
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
