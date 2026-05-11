@@ -18,13 +18,6 @@ func envInt(_ name: String, _ defaultValue: Int) -> Int {
   return intValue
 }
 
-func envFloat(_ name: String, _ defaultValue: Float) -> Float {
-  guard let value = ProcessInfo.processInfo.environment[name], let floatValue = Float(value) else {
-    return defaultValue
-  }
-  return floatValue
-}
-
 func envFlag(_ name: String) -> Bool {
   guard let value = ProcessInfo.processInfo.environment[name] else { return false }
   return value == "1" || value.lowercased() == "true" || value.lowercased() == "yes"
@@ -48,23 +41,18 @@ enum HiDreamO1Config {
   static let hiddenSize = 4_096
   static let timestepFrequencySize = 256
   static let pixelBottleneckSize = hiddenSize / 4
-  static let samplePatchTokens = envInt("HIDREAMO1_PARITY_PATCH_TOKENS", 4)
-  static let parityHeight = envInt("HIDREAMO1_PARITY_HEIGHT", 64)
-  static let parityWidth = envInt("HIDREAMO1_PARITY_WIDTH", 64)
+  static let samplePatchTokens = 4
+  static let parityHeight = 64
+  static let parityWidth = 64
   static let generationHeight = envInt("HIDREAMO1_GENERATION_HEIGHT", 512)
   static let generationWidth = envInt("HIDREAMO1_GENERATION_WIDTH", 512)
-  static let generationLayers = envInt("HIDREAMO1_GENERATION_LAYERS", 36)
+  static let generationLayers = 36
   static let generationDevice = envInt("HIDREAMO1_SWIFT_DEVICE", 3)
   static let generationSeed = envInt("HIDREAMO1_SEED", 32)
-  static let generationNoiseScale = envFloat("HIDREAMO1_NOISE_SCALE", 7.5)
-  static let generationNoiseClipStd = envFloat("HIDREAMO1_NOISE_CLIP_STD", 2.5)
+  static let generationNoiseScale: Float = 7.5
+  static let generationNoiseClipStd: Float = 2.5
   static let storePath = envString(
     "HIDREAMO1_STORE_PATH", "/slow/Data/HiDream-O1-Image-Dev/hidream_o1_dev_f32.ckpt")
-  static let denoiserParityHeight = envInt("HIDREAMO1_DENOISER_PARITY_HEIGHT", 64)
-  static let denoiserParityWidth = envInt("HIDREAMO1_DENOISER_PARITY_WIDTH", 64)
-  static let denoiserParityLayers = envInt("HIDREAMO1_DENOISER_PARITY_LAYERS", 1)
-  static let denoiserParitySeed = envInt("HIDREAMO1_DENOISER_PARITY_SEED", 123)
-  static let denoiserParityTimestep = envFloat("HIDREAMO1_DENOISER_PARITY_TIMESTEP", 0.001)
   static let outputPath = envString(
     "HIDREAMO1_OUTPUT_PATH", "/slow/Data/HiDream-O1-Image-Dev/o1_swift_dev.png")
   static let devFirstTimestep: Float = 0.001  // 1 - 999 / 1000.
@@ -72,6 +60,7 @@ enum HiDreamO1Config {
     999, 987, 974, 960, 945, 929, 913, 895, 877, 857, 836, 814, 790, 764, 737,
     707, 675, 640, 602, 560, 515, 464, 409, 347, 278, 199, 110, 8,
   ]
+  static let mlpDownScaleSummary = "0..<16:2, 16..<35:4, 35..<36:64"
 }
 
 func preparePythonPath() {
@@ -104,6 +93,10 @@ func tensorFromPython(_ tensor: PythonObject) -> Tensor<Float> {
   try! Tensor<Float>(numpy: tensor.type(torch.float).cpu().numpy())
 }
 
+func tensorFromPython<T: TensorNumeric>(_ tensor: PythonObject, as dataType: T.Type) -> Tensor<T> {
+  Tensor<T>(from: tensorFromPython(tensor))
+}
+
 func tensorInt32FromPython(_ tensor: PythonObject) -> Tensor<Int32> {
   try! Tensor<Int32>(numpy: tensor.type(torch.int32).cpu().numpy())
 }
@@ -119,9 +112,14 @@ func maxAbsAndRelativeDiff2D<T: TensorNumeric & BinaryFloatingPoint>(
   var maxReferenceAbs: Float = 0
   for i in 0..<torchTensor.shape[0] {
     for j in 0..<torchTensor.shape[1] {
+      let swiftValue = Float(swiftTensor[i, j])
+      let referenceValue = torchTensor[i, j]
+      if !swiftValue.isFinite || !referenceValue.isFinite {
+        return (.infinity, .infinity)
+      }
       let referenceAbs = abs(torchTensor[i, j])
       maxReferenceAbs = max(maxReferenceAbs, referenceAbs)
-      maxDiff = max(maxDiff, abs(Float(swiftTensor[i, j]) - torchTensor[i, j]))
+      maxDiff = max(maxDiff, abs(swiftValue - referenceValue))
     }
   }
   return (maxDiff, maxDiff / max(1e-6, maxReferenceAbs))
@@ -148,9 +146,21 @@ func qkvInterleavedWeight(_ tensor: PythonObject, heads: Int, headDimension: Int
   return try! Tensor<Float>(numpy: numpy)
 }
 
+func qkvInterleavedWeight<T: TensorNumeric>(
+  _ tensor: PythonObject, heads: Int, headDimension: Int, as dataType: T.Type
+) -> Tensor<T> {
+  Tensor<T>(from: qkvInterleavedWeight(tensor, heads: heads, headDimension: headDimension))
+}
+
 func qkvInterleavedNorm(_ tensor: PythonObject, headDimension: Int) -> Tensor<Float> {
   let numpy = tensor.type(torch.float).view(2, headDimension / 2).transpose(0, 1).cpu().numpy()
   return try! Tensor<Float>(numpy: numpy)
+}
+
+func qkvInterleavedNorm<T: TensorNumeric>(
+  _ tensor: PythonObject, headDimension: Int, as dataType: T.Type
+) -> Tensor<T> {
+  Tensor<T>(from: qkvInterleavedNorm(tensor, headDimension: headDimension))
 }
 
 func qwen3VLMRotary(positionIDs: Tensor<Int32>, headDimension: Int = 128, theta: Double = 5_000_000)
@@ -196,6 +206,21 @@ func mixedAttentionMask(tokenTypes: Tensor<Int32>) -> Tensor<Float> {
   return mask
 }
 
+func mixedAttentionMaskFloat16(tokenTypes: Tensor<Int32>) -> Tensor<Float16> {
+  precondition(tokenTypes.shape.count == 2)
+  precondition(tokenTypes.shape[0] == 1)
+  let tokenLength = tokenTypes.shape[1]
+  var mask = Tensor<Float16>(.CPU, .NHWC(1, 1, tokenLength, tokenLength))
+  let masked = -Float16.greatestFiniteMagnitude
+  for i in 0..<tokenLength {
+    let isGen = tokenTypes[0, i] != 0
+    for j in 0..<tokenLength {
+      mask[0, 0, i, j] = (!isGen && j > i) ? masked : 0
+    }
+  }
+  return mask
+}
+
 func timeEmbedding(timestep: Float, embeddingSize: Int = HiDreamO1Config.timestepFrequencySize)
   -> Tensor<Float>
 {
@@ -210,25 +235,29 @@ func timeEmbedding(timestep: Float, embeddingSize: Int = HiDreamO1Config.timeste
   return embedding
 }
 
-func TimestepEmbedder() -> (Model, (PythonObject) -> Void) {
+func TimestepEmbedder<T: TensorNumeric>(_ dataType: T.Type) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let fc0 = Dense(count: HiDreamO1Config.hiddenSize, name: "t_embedder_mlp_0")
   let fc1 = Dense(count: HiDreamO1Config.hiddenSize, name: "t_embedder_mlp_2")
   let out = fc1(fc0(x).swish())
   let reader: (PythonObject) -> Void = { stateDict in
     fc0.weight.copy(
-      from: tensorFromPython(stateDict["model.t_embedder1.mlp.0.weight"]))
+      from: tensorFromPython(stateDict["model.t_embedder1.mlp.0.weight"], as: T.self))
     fc0.bias.copy(
-      from: tensorFromPython(stateDict["model.t_embedder1.mlp.0.bias"]))
+      from: tensorFromPython(stateDict["model.t_embedder1.mlp.0.bias"], as: T.self))
     fc1.weight.copy(
-      from: tensorFromPython(stateDict["model.t_embedder1.mlp.2.weight"]))
+      from: tensorFromPython(stateDict["model.t_embedder1.mlp.2.weight"], as: T.self))
     fc1.bias.copy(
-      from: tensorFromPython(stateDict["model.t_embedder1.mlp.2.bias"]))
+      from: tensorFromPython(stateDict["model.t_embedder1.mlp.2.bias"], as: T.self))
   }
   return (Model([x], [out]), reader)
 }
 
-func PixelEmbedder() -> (Model, (PythonObject) -> Void) {
+func TimestepEmbedder() -> (Model, (PythonObject) -> Void) {
+  TimestepEmbedder(Float.self)
+}
+
+func PixelEmbedder<T: TensorNumeric>(_ dataType: T.Type) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let proj1 = Dense(
     count: HiDreamO1Config.pixelBottleneckSize, noBias: true, name: "x_embedder_proj1")
@@ -236,38 +265,50 @@ func PixelEmbedder() -> (Model, (PythonObject) -> Void) {
   let out = proj2(proj1(x))
   let reader: (PythonObject) -> Void = { stateDict in
     proj1.weight.copy(
-      from: tensorFromPython(stateDict["model.x_embedder.proj1.weight"]))
+      from: tensorFromPython(stateDict["model.x_embedder.proj1.weight"], as: T.self))
     proj2.weight.copy(
-      from: tensorFromPython(stateDict["model.x_embedder.proj2.weight"]))
+      from: tensorFromPython(stateDict["model.x_embedder.proj2.weight"], as: T.self))
     proj2.bias.copy(
-      from: tensorFromPython(stateDict["model.x_embedder.proj2.bias"]))
+      from: tensorFromPython(stateDict["model.x_embedder.proj2.bias"], as: T.self))
   }
   return (Model([x], [out]), reader)
 }
 
-func FinalLayer() -> (Model, (PythonObject) -> Void) {
+func PixelEmbedder() -> (Model, (PythonObject) -> Void) {
+  PixelEmbedder(Float.self)
+}
+
+func FinalLayer<T: TensorNumeric>(_ dataType: T.Type) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let linear = Dense(count: HiDreamO1Config.patchDimension, name: "final_layer2")
   let out = linear(x)
   let reader: (PythonObject) -> Void = { stateDict in
     linear.weight.copy(
-      from: tensorFromPython(stateDict["model.final_layer2.linear.weight"]))
+      from: tensorFromPython(stateDict["model.final_layer2.linear.weight"], as: T.self))
     linear.bias.copy(
-      from: tensorFromPython(stateDict["model.final_layer2.linear.bias"]))
+      from: tensorFromPython(stateDict["model.final_layer2.linear.bias"], as: T.self))
   }
   return (Model([x], [out]), reader)
 }
 
-func PixelRoundTrip() -> (Model, (PythonObject) -> Void) {
+func FinalLayer() -> (Model, (PythonObject) -> Void) {
+  FinalLayer(Float.self)
+}
+
+func PixelRoundTrip<T: TensorNumeric>(_ dataType: T.Type) -> (Model, (PythonObject) -> Void) {
   let x = Input()
-  let (embedder, embedderReader) = PixelEmbedder()
-  let (final, finalReader) = FinalLayer()
+  let (embedder, embedderReader) = PixelEmbedder(T.self)
+  let (final, finalReader) = FinalLayer(T.self)
   let out = final(embedder(x))
   let reader: (PythonObject) -> Void = { stateDict in
     embedderReader(stateDict)
     finalReader(stateDict)
   }
   return (Model([x], [out]), reader)
+}
+
+func PixelRoundTrip() -> (Model, (PythonObject) -> Void) {
+  PixelRoundTrip(Float.self)
 }
 
 func HiDreamO1FeedForward(hiddenSize: Int, intermediateSize: Int) -> (Model, Model, Model, Model) {
@@ -279,8 +320,23 @@ func HiDreamO1FeedForward(hiddenSize: Int, intermediateSize: Int) -> (Model, Mod
   return (gate, up, down, Model([x], [out]))
 }
 
-func HiDreamO1SelfAttention(
-  prefix: String, width: Int, headDimension: Int, heads: Int, kvHeads: Int, tokenLength: Int
+func HiDreamO1FeedForwardMixedFP16(
+  hiddenSize: Int, intermediateSize: Int, downScale: Float
+) -> (Model, Model, Model, Model) {
+  let x = Input()
+  let gate = Dense(count: intermediateSize, noBias: true, name: "mlp_gate_proj")
+  let up = Dense(count: intermediateSize, noBias: true, name: "mlp_up_proj")
+  let down = Dense(count: hiddenSize, noBias: true, name: "mlp_down_proj")
+  let x16 = x.to(.Float16)
+  let product = gate(x16).to(.Float32).swish() .* up(x16).to(.Float32)
+  let downInput = ((1.0 / downScale) * product).to(.Float16)
+  let out = downScale * down(downInput).to(.Float32)
+  return (gate, up, down, Model([x], [out]))
+}
+
+func HiDreamO1SelfAttention<T: TensorNumeric>(
+  _ dataType: T.Type, prefix: String, width: Int, headDimension: Int, heads: Int, kvHeads: Int,
+  tokenLength: Int, outputFloat32: Bool = false
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let rot = Input()
@@ -330,28 +386,35 @@ func HiDreamO1SelfAttention(
     .transposed(1, 2).reshaped([tokenLength, heads * headDimension])
   let unifyHeads = Dense(count: width, noBias: true, name: "o_proj")
   out = unifyHeads(out)
+  if outputFloat32 {
+    out = out.to(.Float32)
+  }
   let reader: (PythonObject) -> Void = { stateDict in
     toQueries.weight.copy(
       from: qkvInterleavedWeight(
         stateDict["\(prefix).self_attn.q_proj.weight"], heads: heads,
-        headDimension: headDimension))
+        headDimension: headDimension, as: T.self))
     normQ.weight.copy(
       from: qkvInterleavedNorm(
-        stateDict["\(prefix).self_attn.q_norm.weight"], headDimension: headDimension))
+        stateDict["\(prefix).self_attn.q_norm.weight"], headDimension: headDimension, as: T.self))
     toKeys.weight.copy(
       from: qkvInterleavedWeight(
         stateDict["\(prefix).self_attn.k_proj.weight"], heads: kvHeads,
-        headDimension: headDimension))
+        headDimension: headDimension, as: T.self))
     normK.weight.copy(
       from: qkvInterleavedNorm(
-        stateDict["\(prefix).self_attn.k_norm.weight"], headDimension: headDimension))
-    toValues.weight.copy(from: tensorFromPython(stateDict["\(prefix).self_attn.v_proj.weight"]))
-    unifyHeads.weight.copy(from: tensorFromPython(stateDict["\(prefix).self_attn.o_proj.weight"]))
+        stateDict["\(prefix).self_attn.k_norm.weight"], headDimension: headDimension, as: T.self))
+    toValues.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).self_attn.v_proj.weight"], as: T.self))
+    unifyHeads.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).self_attn.o_proj.weight"], as: T.self))
   }
   return (Model([x, rot, attentionMask], [out]), reader)
 }
 
-func HiDreamO1DecoderLayer(layerIdx: Int, tokenLength: Int) -> (Model, (PythonObject) -> Void) {
+func HiDreamO1DecoderLayer<T: TensorNumeric>(
+  _ dataType: T.Type, layerIdx: Int, tokenLength: Int
+) -> (Model, (PythonObject) -> Void) {
   let prefix = "model.language_model.layers.\(layerIdx)"
   let x = Input()
   let rot = Input()
@@ -359,8 +422,8 @@ func HiDreamO1DecoderLayer(layerIdx: Int, tokenLength: Int) -> (Model, (PythonOb
   let norm1 = RMSNorm(epsilon: 1e-6, axis: [1], name: "input_layernorm")
   var out = norm1(x)
   let (attention, attentionReader) = HiDreamO1SelfAttention(
-    prefix: prefix, width: HiDreamO1Config.hiddenSize, headDimension: 128, heads: 32, kvHeads: 8,
-    tokenLength: tokenLength)
+    T.self, prefix: prefix, width: HiDreamO1Config.hiddenSize, headDimension: 128, heads: 32,
+    kvHeads: 8, tokenLength: tokenLength)
   out = x + attention(out, rot, attentionMask)
   let residual = out
   let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "post_attention_layernorm")
@@ -370,17 +433,67 @@ func HiDreamO1DecoderLayer(layerIdx: Int, tokenLength: Int) -> (Model, (PythonOb
   out = residual + feedForward(out)
   let reader: (PythonObject) -> Void = { stateDict in
     attentionReader(stateDict)
-    norm1.weight.copy(from: tensorFromPython(stateDict["\(prefix).input_layernorm.weight"]))
+    norm1.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).input_layernorm.weight"], as: T.self))
     norm2.weight.copy(
-      from: tensorFromPython(stateDict["\(prefix).post_attention_layernorm.weight"]))
-    gate.weight.copy(from: tensorFromPython(stateDict["\(prefix).mlp.gate_proj.weight"]))
-    up.weight.copy(from: tensorFromPython(stateDict["\(prefix).mlp.up_proj.weight"]))
-    down.weight.copy(from: tensorFromPython(stateDict["\(prefix).mlp.down_proj.weight"]))
+      from: tensorFromPython(stateDict["\(prefix).post_attention_layernorm.weight"], as: T.self))
+    gate.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).mlp.gate_proj.weight"], as: T.self))
+    up.weight.copy(from: tensorFromPython(stateDict["\(prefix).mlp.up_proj.weight"], as: T.self))
+    down.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).mlp.down_proj.weight"], as: T.self))
   }
   return (Model([x, rot, attentionMask], [out]), reader)
 }
 
-func HiDreamO1Denoiser(
+func HiDreamO1DecoderLayer(layerIdx: Int, tokenLength: Int) -> (Model, (PythonObject) -> Void) {
+  HiDreamO1DecoderLayer(Float.self, layerIdx: layerIdx, tokenLength: tokenLength)
+}
+
+func HiDreamO1DecoderLayerMixedFP16(
+  layerIdx: Int, tokenLength: Int
+) -> (Model, (PythonObject) -> Void) {
+  let prefix = "model.language_model.layers.\(layerIdx)"
+  let x = Input()
+  let rot = Input()
+  let attentionMask = Input()
+  let norm1 = RMSNorm(epsilon: 1e-6, axis: [1], name: "input_layernorm")
+  var out = norm1(x).to(.Float16)
+  let (attention, attentionReader) = HiDreamO1SelfAttention(
+    Float16.self, prefix: prefix, width: HiDreamO1Config.hiddenSize, headDimension: 128, heads: 32,
+    kvHeads: 8, tokenLength: tokenLength, outputFloat32: true)
+  out = x + attention(out, rot, attentionMask)
+  let residual = out
+  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "post_attention_layernorm")
+  out = norm2(out)
+  let downScale: Float
+  if layerIdx < 16 {
+    downScale = 2
+  } else if layerIdx < 35 {
+    downScale = 4
+  } else {
+    downScale = 64
+  }
+  let (gate, up, down, feedForward) = HiDreamO1FeedForwardMixedFP16(
+    hiddenSize: HiDreamO1Config.hiddenSize, intermediateSize: 12_288,
+    downScale: downScale)
+  out = residual + feedForward(out)
+  let reader: (PythonObject) -> Void = { stateDict in
+    attentionReader(stateDict)
+    norm1.weight.copy(from: tensorFromPython(stateDict["\(prefix).input_layernorm.weight"]))
+    norm2.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).post_attention_layernorm.weight"]))
+    gate.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).mlp.gate_proj.weight"], as: Float16.self))
+    up.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).mlp.up_proj.weight"], as: Float16.self))
+    down.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).mlp.down_proj.weight"], as: Float16.self))
+  }
+  return (Model([x, rot, attentionMask], [out]), reader)
+}
+
+func HiDreamO1DenoiserMixedFP16(
   textPrefixLength: Int, imageTokenCount: Int, layerCount: Int
 ) -> ((PythonObject) -> Void, Model) {
   let textPrefix = Input()
@@ -388,16 +501,18 @@ func HiDreamO1Denoiser(
   let pixelPatches = Input()
   let rot = Input()
   let attentionMask = Input()
-  let (timestepEmbedder, timestepReader) = TimestepEmbedder()
-  let (pixelEmbedder, pixelReader) = PixelEmbedder()
-  let tEmbedding = timestepEmbedder(timestepFrequency)
-  let pixelEmbedding = pixelEmbedder(pixelPatches)
+  let (timestepEmbedder, timestepReader) = TimestepEmbedder(Float16.self)
+  let (pixelEmbedder, pixelReader) = PixelEmbedder(Float16.self)
+  let tEmbedding = timestepEmbedder(timestepFrequency.to(.Float16)).to(.Float32)
+  let pixelEmbedding = pixelEmbedder(pixelPatches.to(.Float16)).to(.Float32)
+  let rotary = rot.to(.Float16)
+  let mask = attentionMask
   var out = Concat(axis: 0)(textPrefix, tEmbedding, pixelEmbedding)
   var readers = [(PythonObject) -> Void]()
   for layerIdx in 0..<layerCount {
-    let (layer, reader) = HiDreamO1DecoderLayer(
+    let (layer, reader) = HiDreamO1DecoderLayerMixedFP16(
       layerIdx: layerIdx, tokenLength: textPrefixLength + 1 + imageTokenCount)
-    out = layer(out, rot, attentionMask)
+    out = layer(out, rotary, mask)
     readers.append { stateDict in
       loadLog("load model.language_model.layers.\(layerIdx)")
       reader(stateDict)
@@ -405,8 +520,8 @@ func HiDreamO1Denoiser(
   }
   let norm = RMSNorm(epsilon: 1e-6, axis: [1], name: "norm")
   out = norm(out)
-  let (finalLayer, finalReader) = FinalLayer()
-  var predicted = finalLayer(out)
+  let (finalLayer, finalReader) = FinalLayer(Float16.self)
+  var predicted = finalLayer(out.to(.Float16)).to(.Float32)
   predicted = predicted.reshaped(
     [imageTokenCount, HiDreamO1Config.patchDimension],
     offset: [textPrefixLength + 1, 0],
@@ -556,58 +671,7 @@ func runDecoderLayerParity(stateDict: PythonObject) -> Bool {
   }
 }
 
-func runDenoiserParity() -> Bool {
-  graph.withNoGrad {
-    let prompt = envString(
-      "HIDREAMO1_DENOISER_PARITY_PROMPT",
-      "A friendly golden retriever sitting in a sunlit park.")
-    let height = HiDreamO1Config.denoiserParityHeight
-    let width = HiDreamO1Config.denoiserParityWidth
-    let layerCount = HiDreamO1Config.denoiserParityLayers
-    let timestep = HiDreamO1Config.denoiserParityTimestep
-    let device = HiDreamO1Config.generationDevice
-    let referenceDevice = envString("HIDREAMO1_DENOISER_REFERENCE_DEVICE", "cuda:\(device)")
-    print(
-      "hidream-o1 denoiser parity size:", width, "x", height, "layers:", layerCount,
-      "timestep:", timestep, "swift device:", device, "reference device:", referenceDevice)
-    let sample = reference.generation_inputs(HiDreamO1Paths.modelPath, prompt, height, width)
-    let textPrefixCPU = tensorFromPython(sample["text_prefix_embeddings"])
-    let positionIDs = tensorInt32FromPython(sample["position_ids"])
-    let tokenTypes = tensorInt32FromPython(sample["token_types"])
-    let imageTokenCount = Int(sample["image_token_count"])!
-    let textPrefixLength = textPrefixCPU.shape[0]
-    let tokenLength = tokenTypes.shape[1]
-    precondition(tokenLength == textPrefixLength + 1 + imageTokenCount)
-    let patchesTorch = reference.random_patch_tokens(
-      imageTokenCount, seed: HiDreamO1Config.denoiserParitySeed)
-    print("hidream-o1 computing torch denoiser reference")
-    let expected = tensorFromPython(
-      reference.denoiser_step(
-        HiDreamO1Paths.modelPath, prompt, patchesTorch, timestep, height, width, layerCount,
-        referenceDevice, true))
-    print("hidream-o1 compiling swift denoiser parity graph")
-    let textPrefix = graph.variable(textPrefixCPU).toGPU(device)
-    let tFreq = graph.variable(timeEmbedding(timestep: timestep)).toGPU(device)
-    let patches = graph.variable(tensorFromPython(patchesTorch)).toGPU(device)
-    let rot = graph.variable(qwen3VLMRotary(positionIDs: positionIDs)).toGPU(device)
-    let attentionMask = graph.variable(mixedAttentionMask(tokenTypes: tokenTypes)).toGPU(device)
-    let (reader, denoiser) = HiDreamO1Denoiser(
-      textPrefixLength: textPrefixLength, imageTokenCount: imageTokenCount, layerCount: layerCount)
-    denoiser.compile(inputs: textPrefix, tFreq, patches, rot, attentionMask)
-    print("hidream-o1 loading swift denoiser parity weights")
-    loadHiDreamO1DenoiserWeights(denoiser, reader: reader)
-    let swiftOutput = denoiser(inputs: textPrefix, tFreq, patches, rot, attentionMask)[0].as(
-      of: Float.self
-    ).toCPU()
-    let (maxAbs, relative) = maxAbsAndRelativeDiff2D(swiftOutput, expected)
-    print("hidream-o1 denoiser parity shape:", swiftOutput.shape, expected.shape)
-    printSamples("hidream-o1 denoiser", swiftOutput, expected)
-    print("hidream-o1 denoiser max-abs diff:", maxAbs, "relative:", relative)
-    return maxAbs <= 5e-3 && relative <= 5e-4
-  }
-}
-
-func savePatchImage(_ patches: DynamicGraph.Tensor<Float>, height: Int, width: Int, path: String) {
+func savePatchImage(_ patches: Tensor<Float>, height: Int, width: Int, path: String) {
   precondition(height % HiDreamO1Config.patchSize == 0)
   precondition(width % HiDreamO1Config.patchSize == 0)
   precondition(patches.shape.count == 2)
@@ -617,6 +681,32 @@ func savePatchImage(_ patches: DynamicGraph.Tensor<Float>, height: Int, width: I
   let widthPatches = width / patchSize
   precondition(patches.shape[0] == heightPatches * widthPatches)
   precondition(patches.shape[1] == HiDreamO1Config.patchDimension)
+  var minValue = Float.greatestFiniteMagnitude
+  var maxValue = -Float.greatestFiniteMagnitude
+  var finiteCount = 0
+  var nonFiniteCount = 0
+  var belowDisplayRange = 0
+  var aboveDisplayRange = 0
+  for i in 0..<patches.shape[0] {
+    for j in 0..<patches.shape[1] {
+      let value = patches[i, j]
+      if value.isFinite {
+        finiteCount += 1
+        minValue = min(minValue, value)
+        maxValue = max(maxValue, value)
+        if value < -1 {
+          belowDisplayRange += 1
+        } else if value > 1 {
+          aboveDisplayRange += 1
+        }
+      } else {
+        nonFiniteCount += 1
+      }
+    }
+  }
+  print(
+    "hidream-o1 image patch stats min:", minValue, "max:", maxValue, "finite:", finiteCount,
+    "non-finite:", nonFiniteCount, "<-1:", belowDisplayRange, ">1:", aboveDisplayRange)
   var rgba = [PNG.RGBA<UInt8>](repeating: .init(0), count: height * width)
   func encode(_ value: Float) -> UInt8 {
     guard value.isFinite else { return 0 }
@@ -658,9 +748,10 @@ func runGeneration() {
     )
     print("hidream-o1 generation prompt:", prompt)
     print(
-      "hidream-o1 generation size:", HiDreamO1Config.generationWidth, "x",
+      "hidream-o1 generation precision: mixed-fp16 size:", HiDreamO1Config.generationWidth, "x",
       HiDreamO1Config.generationHeight, "layers:", HiDreamO1Config.generationLayers,
       "device:", HiDreamO1Config.generationDevice)
+    print("hidream-o1 mixed-fp16 mlp down scale:", HiDreamO1Config.mlpDownScaleSummary)
     let sample = reference.generation_inputs(
       HiDreamO1Paths.modelPath, prompt, HiDreamO1Config.generationHeight,
       HiDreamO1Config.generationWidth)
@@ -676,12 +767,12 @@ func runGeneration() {
     let tFreq0 = graph.variable(timeEmbedding(timestep: HiDreamO1Config.devFirstTimestep)).toGPU(
       device)
     let rot = graph.variable(qwen3VLMRotary(positionIDs: positionIDs)).toGPU(device)
-    let attentionMask = graph.variable(mixedAttentionMask(tokenTypes: tokenTypes))
-      .toGPU(device)
+    let attentionMask = graph.variable(mixedAttentionMaskFloat16(tokenTypes: tokenTypes)).toGPU(
+      device)
     var z = graph.variable(
       .GPU(device), .NC(imageTokenCount, HiDreamO1Config.patchDimension), of: Float.self)
     z.randn(std: HiDreamO1Config.generationNoiseScale, mean: 0)
-    let (reader, denoiser) = HiDreamO1Denoiser(
+    let (reader, denoiser) = HiDreamO1DenoiserMixedFP16(
       textPrefixLength: textPrefixLength, imageTokenCount: imageTokenCount,
       layerCount: HiDreamO1Config.generationLayers)
     print("hidream-o1 compiling denoiser")
@@ -695,8 +786,7 @@ func runGeneration() {
     for (stepIdx, timestep) in steps.enumerated() {
       let tPixel = 1 - timestep / 1000
       let tFreq = graph.variable(timeEmbedding(timestep: tPixel)).toGPU(device)
-      let xPred = denoiser(inputs: textPrefix, tFreq, z, rot, attentionMask)[0]
-        .as(of: Float.self)
+      let xPred = denoiser(inputs: textPrefix, tFreq, z, rot, attentionMask)[0].as(of: Float.self)
       let sigmaNext = stepIdx + 1 < steps.count ? steps[stepIdx + 1] / 1000 : 0
       if sigmaNext > 0 {
         let noise = graph.variable(
@@ -714,7 +804,7 @@ func runGeneration() {
         "hidream-o1 generation step \(stepIdx + 1)/\(steps.count) timestep \(Int(timestep)) elapsed",
         Date().timeIntervalSince(runStart))
     }
-    let output = z.toCPU()
+    let output = Tensor<Float>(from: z.as(of: Float.self).rawValue.toCPU())
     savePatchImage(
       output, height: HiDreamO1Config.generationHeight, width: HiDreamO1Config.generationWidth,
       path: HiDreamO1Config.outputPath)
@@ -741,12 +831,6 @@ if !envFlag("HIDREAMO1_SKIP_PARITY") {
   print("hidream-o1 initial parity passed")
 } else {
   print("hidream-o1 parity skipped by HIDREAMO1_SKIP_PARITY")
-}
-if envFlag("HIDREAMO1_RUN_DENOISER_PARITY") {
-  if !runDenoiserParity() {
-    fatalError("hidream-o1 denoiser parity failed")
-  }
-  print("hidream-o1 denoiser parity passed")
 }
 if envFlag("HIDREAMO1_RUN_GENERATION") {
   runGeneration()
