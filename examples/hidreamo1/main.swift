@@ -93,7 +93,7 @@ func tensorFromPython(_ tensor: PythonObject) -> Tensor<Float> {
   try! Tensor<Float>(numpy: tensor.type(torch.float).cpu().numpy())
 }
 
-func tensorFromPython<T: TensorNumeric>(_ tensor: PythonObject, as dataType: T.Type) -> Tensor<T> {
+func tensorFromPython<T: TensorNumeric>(_ tensor: PythonObject, as _: T.Type) -> Tensor<T> {
   Tensor<T>(from: tensorFromPython(tensor))
 }
 
@@ -147,7 +147,7 @@ func qkvInterleavedWeight(_ tensor: PythonObject, heads: Int, headDimension: Int
 }
 
 func qkvInterleavedWeight<T: TensorNumeric>(
-  _ tensor: PythonObject, heads: Int, headDimension: Int, as dataType: T.Type
+  _ tensor: PythonObject, heads: Int, headDimension: Int, as _: T.Type
 ) -> Tensor<T> {
   Tensor<T>(from: qkvInterleavedWeight(tensor, heads: heads, headDimension: headDimension))
 }
@@ -158,7 +158,7 @@ func qkvInterleavedNorm(_ tensor: PythonObject, headDimension: Int) -> Tensor<Fl
 }
 
 func qkvInterleavedNorm<T: TensorNumeric>(
-  _ tensor: PythonObject, headDimension: Int, as dataType: T.Type
+  _ tensor: PythonObject, headDimension: Int, as _: T.Type
 ) -> Tensor<T> {
   Tensor<T>(from: qkvInterleavedNorm(tensor, headDimension: headDimension))
 }
@@ -189,36 +189,6 @@ func qwen3VLMRotary(positionIDs: Tensor<Int32>, headDimension: Int = 128, theta:
     }
   }
   return rotary
-}
-
-func mixedAttentionMask(tokenTypes: Tensor<Int32>) -> Tensor<Float> {
-  precondition(tokenTypes.shape.count == 2)
-  precondition(tokenTypes.shape[0] == 1)
-  let tokenLength = tokenTypes.shape[1]
-  var mask = Tensor<Float>(.CPU, .NHWC(1, 1, tokenLength, tokenLength))
-  let masked = -Float.greatestFiniteMagnitude
-  for i in 0..<tokenLength {
-    let isGen = tokenTypes[0, i] != 0
-    for j in 0..<tokenLength {
-      mask[0, 0, i, j] = (!isGen && j > i) ? masked : 0
-    }
-  }
-  return mask
-}
-
-func mixedAttentionMaskFloat16(tokenTypes: Tensor<Int32>) -> Tensor<Float16> {
-  precondition(tokenTypes.shape.count == 2)
-  precondition(tokenTypes.shape[0] == 1)
-  let tokenLength = tokenTypes.shape[1]
-  var mask = Tensor<Float16>(.CPU, .NHWC(1, 1, tokenLength, tokenLength))
-  let masked = -Float16.greatestFiniteMagnitude
-  for i in 0..<tokenLength {
-    let isGen = tokenTypes[0, i] != 0
-    for j in 0..<tokenLength {
-      mask[0, 0, i, j] = (!isGen && j > i) ? masked : 0
-    }
-  }
-  return mask
 }
 
 func timeEmbedding(timestep: Float, embeddingSize: Int = HiDreamO1Config.timestepFrequencySize)
@@ -311,15 +281,6 @@ func PixelRoundTrip() -> (Model, (PythonObject) -> Void) {
   PixelRoundTrip(Float.self)
 }
 
-func HiDreamO1FeedForward(hiddenSize: Int, intermediateSize: Int) -> (Model, Model, Model, Model) {
-  let x = Input()
-  let gate = Dense(count: intermediateSize, noBias: true, name: "mlp_gate_proj")
-  let up = Dense(count: intermediateSize, noBias: true, name: "mlp_up_proj")
-  let down = Dense(count: hiddenSize, noBias: true, name: "mlp_down_proj")
-  let out = down(gate(x).swish() .* up(x))
-  return (gate, up, down, Model([x], [out]))
-}
-
 func HiDreamO1FeedForwardMixedFP16(
   hiddenSize: Int, intermediateSize: Int, downScale: Float
 ) -> (Model, Model, Model, Model) {
@@ -334,135 +295,90 @@ func HiDreamO1FeedForwardMixedFP16(
   return (gate, up, down, Model([x], [out]))
 }
 
-func HiDreamO1SelfAttention<T: TensorNumeric>(
-  _ dataType: T.Type, prefix: String, width: Int, headDimension: Int, heads: Int, kvHeads: Int,
-  tokenLength: Int, outputFloat32: Bool = false
+func HiDreamO1SelfAttentionMixedFP16(
+  prefix: String, width: Int, headDimension: Int, heads: Int, kvHeads: Int, tokenLength: Int,
+  causalTokenCount: Int
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let rot = Input()
-  let attentionMask = Input()
+  precondition(causalTokenCount > 0)
+  precondition(causalTokenCount < tokenLength)
   let toKeys = Dense(count: headDimension * kvHeads, noBias: true, name: "k_proj")
   let toQueries = Dense(count: headDimension * heads, noBias: true, name: "q_proj")
   let toValues = Dense(count: headDimension * kvHeads, noBias: true, name: "v_proj")
-  var keys = toKeys(x).reshaped([1, tokenLength, kvHeads, headDimension])
+  var keys = toKeys(x).reshaped(.NHWC(1, tokenLength, kvHeads, headDimension))
   let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "k_norm")
   keys = normK(keys)
-  var queries = toQueries(x).reshaped([1, tokenLength, heads, headDimension])
+  var queries = toQueries(x).reshaped(.NHWC(1, tokenLength, heads, headDimension))
   let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "q_norm")
   queries = normQ(queries)
-  let values = toValues(x).reshaped([1, tokenLength, kvHeads, headDimension]).transposed(1, 2)
-  queries = Functional.cmul(left: queries, right: rot).transposed(1, 2)
-  keys = Functional.cmul(left: keys, right: rot).transposed(1, 2)
-  var outs = [Model.IO]()
-  let headsPerKVHead = heads / kvHeads
-  for i in 0..<kvHeads {
-    let query = queries.reshaped(
-      [1, headsPerKVHead, tokenLength, headDimension],
-      offset: [0, i * headsPerKVHead, 0, 0],
-      strides: [heads * tokenLength * headDimension, tokenLength * headDimension, headDimension, 1])
-    let key = keys.reshaped(
-      [1, 1, tokenLength, headDimension],
-      offset: [0, i, 0, 0],
-      strides: [
-        kvHeads * tokenLength * headDimension, tokenLength * headDimension, headDimension, 1,
-      ])
-    let value = values.reshaped(
-      [1, 1, tokenLength, headDimension],
-      offset: [0, i, 0, 0],
-      strides: [
-        kvHeads * tokenLength * headDimension, tokenLength * headDimension, headDimension, 1,
-      ])
-    var dot =
-      (1.0 / Float(headDimension).squareRoot()) * Matmul(transposeB: (2, 3))(query, key)
-      + attentionMask
-    if let last = outs.last {
-      dot.add(dependencies: [last])
-    }
-    dot = dot.reshaped([headsPerKVHead * tokenLength, tokenLength]).softmax()
-    dot = dot.reshaped([1, headsPerKVHead, tokenLength, tokenLength])
-    outs.append(dot * value)
-  }
-  var out = Concat(axis: 1)(outs).reshaped([1, heads, tokenLength, headDimension])
-    .transposed(1, 2).reshaped([tokenLength, heads * headDimension])
+  let values = toValues(x).reshaped(.NHWC(1, tokenLength, kvHeads, headDimension))
+  queries = Functional.cmul(left: queries, right: rot)
+  keys = Functional.cmul(left: keys, right: rot)
+  let imageTokenCount = tokenLength - causalTokenCount
+  let causalQueries = queries.reshaped(
+    [1, causalTokenCount, heads, headDimension],
+    strides: [tokenLength * heads * headDimension, heads * headDimension, headDimension, 1]
+  ).contiguous().reshaped(.NHWC(1, causalTokenCount, heads, headDimension))
+  let causalKeys = keys.reshaped(
+    [1, causalTokenCount, kvHeads, headDimension],
+    strides: [tokenLength * kvHeads * headDimension, kvHeads * headDimension, headDimension, 1]
+  ).contiguous().reshaped(.NHWC(1, causalTokenCount, kvHeads, headDimension))
+  let causalValues = values.reshaped(
+    [1, causalTokenCount, kvHeads, headDimension],
+    strides: [tokenLength * kvHeads * headDimension, kvHeads * headDimension, headDimension, 1]
+  ).contiguous().reshaped(.NHWC(1, causalTokenCount, kvHeads, headDimension))
+  let imageQueries = queries.reshaped(
+    [1, imageTokenCount, heads, headDimension],
+    offset: [0, causalTokenCount, 0, 0],
+    strides: [tokenLength * heads * headDimension, heads * headDimension, headDimension, 1]
+  ).contiguous().reshaped(.NHWC(1, imageTokenCount, heads, headDimension))
+  let scale = 1.0 / Float(headDimension).squareRoot()
+  let causalOut = ScaledDotProductAttention(scale: scale, isCausal: true, flags: [.Float16])(
+    causalQueries, causalKeys, causalValues)
+  let imageOut = ScaledDotProductAttention(scale: scale, flags: [.Float16])(
+    imageQueries, keys, values)
   let unifyHeads = Dense(count: width, noBias: true, name: "o_proj")
-  out = unifyHeads(out)
-  if outputFloat32 {
-    out = out.to(.Float32)
-  }
+  let out = unifyHeads(
+    Concat(axis: 1)(causalOut, imageOut).reshaped([tokenLength, heads * headDimension])
+  ).to(.Float32)
   let reader: (PythonObject) -> Void = { stateDict in
     toQueries.weight.copy(
       from: qkvInterleavedWeight(
         stateDict["\(prefix).self_attn.q_proj.weight"], heads: heads,
-        headDimension: headDimension, as: T.self))
+        headDimension: headDimension, as: Float16.self))
     normQ.weight.copy(
       from: qkvInterleavedNorm(
-        stateDict["\(prefix).self_attn.q_norm.weight"], headDimension: headDimension, as: T.self))
+        stateDict["\(prefix).self_attn.q_norm.weight"], headDimension: headDimension,
+        as: Float16.self))
     toKeys.weight.copy(
       from: qkvInterleavedWeight(
         stateDict["\(prefix).self_attn.k_proj.weight"], heads: kvHeads,
-        headDimension: headDimension, as: T.self))
+        headDimension: headDimension, as: Float16.self))
     normK.weight.copy(
       from: qkvInterleavedNorm(
-        stateDict["\(prefix).self_attn.k_norm.weight"], headDimension: headDimension, as: T.self))
+        stateDict["\(prefix).self_attn.k_norm.weight"], headDimension: headDimension,
+        as: Float16.self))
     toValues.weight.copy(
-      from: tensorFromPython(stateDict["\(prefix).self_attn.v_proj.weight"], as: T.self))
+      from: tensorFromPython(stateDict["\(prefix).self_attn.v_proj.weight"], as: Float16.self))
     unifyHeads.weight.copy(
-      from: tensorFromPython(stateDict["\(prefix).self_attn.o_proj.weight"], as: T.self))
+      from: tensorFromPython(stateDict["\(prefix).self_attn.o_proj.weight"], as: Float16.self))
   }
-  return (Model([x, rot, attentionMask], [out]), reader)
-}
-
-func HiDreamO1DecoderLayer<T: TensorNumeric>(
-  _ dataType: T.Type, layerIdx: Int, tokenLength: Int
-) -> (Model, (PythonObject) -> Void) {
-  let prefix = "model.language_model.layers.\(layerIdx)"
-  let x = Input()
-  let rot = Input()
-  let attentionMask = Input()
-  let norm1 = RMSNorm(epsilon: 1e-6, axis: [1], name: "input_layernorm")
-  var out = norm1(x)
-  let (attention, attentionReader) = HiDreamO1SelfAttention(
-    T.self, prefix: prefix, width: HiDreamO1Config.hiddenSize, headDimension: 128, heads: 32,
-    kvHeads: 8, tokenLength: tokenLength)
-  out = x + attention(out, rot, attentionMask)
-  let residual = out
-  let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "post_attention_layernorm")
-  out = norm2(out)
-  let (gate, up, down, feedForward) = HiDreamO1FeedForward(
-    hiddenSize: HiDreamO1Config.hiddenSize, intermediateSize: 12_288)
-  out = residual + feedForward(out)
-  let reader: (PythonObject) -> Void = { stateDict in
-    attentionReader(stateDict)
-    norm1.weight.copy(
-      from: tensorFromPython(stateDict["\(prefix).input_layernorm.weight"], as: T.self))
-    norm2.weight.copy(
-      from: tensorFromPython(stateDict["\(prefix).post_attention_layernorm.weight"], as: T.self))
-    gate.weight.copy(
-      from: tensorFromPython(stateDict["\(prefix).mlp.gate_proj.weight"], as: T.self))
-    up.weight.copy(from: tensorFromPython(stateDict["\(prefix).mlp.up_proj.weight"], as: T.self))
-    down.weight.copy(
-      from: tensorFromPython(stateDict["\(prefix).mlp.down_proj.weight"], as: T.self))
-  }
-  return (Model([x, rot, attentionMask], [out]), reader)
-}
-
-func HiDreamO1DecoderLayer(layerIdx: Int, tokenLength: Int) -> (Model, (PythonObject) -> Void) {
-  HiDreamO1DecoderLayer(Float.self, layerIdx: layerIdx, tokenLength: tokenLength)
+  return (Model([x, rot], [out]), reader)
 }
 
 func HiDreamO1DecoderLayerMixedFP16(
-  layerIdx: Int, tokenLength: Int
+  layerIdx: Int, tokenLength: Int, causalTokenCount: Int
 ) -> (Model, (PythonObject) -> Void) {
   let prefix = "model.language_model.layers.\(layerIdx)"
   let x = Input()
   let rot = Input()
-  let attentionMask = Input()
   let norm1 = RMSNorm(epsilon: 1e-6, axis: [1], name: "input_layernorm")
   var out = norm1(x).to(.Float16)
-  let (attention, attentionReader) = HiDreamO1SelfAttention(
-    Float16.self, prefix: prefix, width: HiDreamO1Config.hiddenSize, headDimension: 128, heads: 32,
-    kvHeads: 8, tokenLength: tokenLength, outputFloat32: true)
-  out = x + attention(out, rot, attentionMask)
+  let (attention, attentionReader) = HiDreamO1SelfAttentionMixedFP16(
+    prefix: prefix, width: HiDreamO1Config.hiddenSize, headDimension: 128, heads: 32,
+    kvHeads: 8, tokenLength: tokenLength, causalTokenCount: causalTokenCount)
+  out = x + attention(out, rot)
   let residual = out
   let norm2 = RMSNorm(epsilon: 1e-6, axis: [1], name: "post_attention_layernorm")
   out = norm2(out)
@@ -490,7 +406,7 @@ func HiDreamO1DecoderLayerMixedFP16(
     down.weight.copy(
       from: tensorFromPython(stateDict["\(prefix).mlp.down_proj.weight"], as: Float16.self))
   }
-  return (Model([x, rot, attentionMask], [out]), reader)
+  return (Model([x, rot], [out]), reader)
 }
 
 func HiDreamO1DenoiserMixedFP16(
@@ -500,19 +416,18 @@ func HiDreamO1DenoiserMixedFP16(
   let timestepFrequency = Input()
   let pixelPatches = Input()
   let rot = Input()
-  let attentionMask = Input()
   let (timestepEmbedder, timestepReader) = TimestepEmbedder(Float16.self)
   let (pixelEmbedder, pixelReader) = PixelEmbedder(Float16.self)
   let tEmbedding = timestepEmbedder(timestepFrequency.to(.Float16)).to(.Float32)
   let pixelEmbedding = pixelEmbedder(pixelPatches.to(.Float16)).to(.Float32)
   let rotary = rot.to(.Float16)
-  let mask = attentionMask
   var out = Concat(axis: 0)(textPrefix, tEmbedding, pixelEmbedding)
   var readers = [(PythonObject) -> Void]()
   for layerIdx in 0..<layerCount {
     let (layer, reader) = HiDreamO1DecoderLayerMixedFP16(
-      layerIdx: layerIdx, tokenLength: textPrefixLength + 1 + imageTokenCount)
-    out = layer(out, rotary, mask)
+      layerIdx: layerIdx, tokenLength: textPrefixLength + 1 + imageTokenCount,
+      causalTokenCount: textPrefixLength + 1)
+    out = layer(out, rotary)
     readers.append { stateDict in
       loadLog("load model.language_model.layers.\(layerIdx)")
       reader(stateDict)
@@ -536,7 +451,7 @@ func HiDreamO1DenoiserMixedFP16(
     finalReader(stateDict)
   }
   return (
-    reader, Model([textPrefix, timestepFrequency, pixelPatches, rot, attentionMask], [predicted])
+    reader, Model([textPrefix, timestepFrequency, pixelPatches, rot], [predicted])
   )
 }
 
@@ -652,22 +567,28 @@ func runDecoderLayerParity(stateDict: PythonObject) -> Bool {
     let positionIDs = tensorInt32FromPython(sample["position_ids"])
     let tokenTypes = tensorInt32FromPython(sample["token_types"])
     let tokenLength = tokenTypes.shape[1]
+    var causalTokenCount = 0
+    while causalTokenCount < tokenLength && tokenTypes[0, causalTokenCount] == 0 {
+      causalTokenCount += 1
+    }
     let hiddenStatesTorch = reference.random_hidden_sequence(tokenLength)
     let expected = tensorFromPython(
       reference.qwen3vl_decoder_layer(
         stateDict, hiddenStatesTorch, sample["position_ids"], sample["token_types"], 0)[0])
-    let hiddenStates = graph.variable(tensorFromPython(hiddenStatesTorch[0]))
-    let rot = graph.variable(qwen3VLMRotary(positionIDs: positionIDs))
-    let attentionMask = graph.variable(mixedAttentionMask(tokenTypes: tokenTypes))
-    let (model, reader) = HiDreamO1DecoderLayer(layerIdx: 0, tokenLength: tokenLength)
-    model.compile(inputs: hiddenStates, rot, attentionMask)
+    let device = HiDreamO1Config.generationDevice
+    let hiddenStates = graph.variable(tensorFromPython(hiddenStatesTorch[0])).toGPU(device)
+    let rot = graph.variable(Tensor<Float16>(from: qwen3VLMRotary(positionIDs: positionIDs)))
+      .toGPU(device)
+    let (model, reader) = HiDreamO1DecoderLayerMixedFP16(
+      layerIdx: 0, tokenLength: tokenLength, causalTokenCount: causalTokenCount)
+    model.compile(inputs: hiddenStates, rot)
     reader(stateDict)
-    let swiftOutput = model(inputs: hiddenStates, rot, attentionMask)[0].as(of: Float.self).toCPU()
+    let swiftOutput = model(inputs: hiddenStates, rot)[0].as(of: Float.self).toCPU()
     let (maxAbs, relative) = maxAbsAndRelativeDiff2D(swiftOutput, expected)
-    print("hidream-o1 decoder layer0 parity shape:", swiftOutput.shape, expected.shape)
-    printSamples("hidream-o1 decoder layer0", swiftOutput, expected)
-    print("hidream-o1 decoder layer0 max-abs diff:", maxAbs, "relative:", relative)
-    return maxAbs <= 2e-3 && relative <= 2e-4
+    print("hidream-o1 decoder layer0 mixed-fp16 parity shape:", swiftOutput.shape, expected.shape)
+    printSamples("hidream-o1 decoder layer0 mixed-fp16", swiftOutput, expected)
+    print("hidream-o1 decoder layer0 mixed-fp16 max-abs diff:", maxAbs, "relative:", relative)
+    return maxAbs <= 2e-1 && relative <= 5e-3
   }
 }
 
@@ -757,18 +678,15 @@ func runGeneration() {
       HiDreamO1Config.generationWidth)
     let textPrefixCPU = tensorFromPython(sample["text_prefix_embeddings"])
     let positionIDs = tensorInt32FromPython(sample["position_ids"])
-    let tokenTypes = tensorInt32FromPython(sample["token_types"])
     let imageTokenCount = Int(sample["image_token_count"])!
     let textPrefixLength = textPrefixCPU.shape[0]
-    let tokenLength = tokenTypes.shape[1]
-    precondition(tokenLength == textPrefixLength + 1 + imageTokenCount)
+    let tokenLength = textPrefixLength + 1 + imageTokenCount
+    precondition(positionIDs.shape[2] == tokenLength)
     let device = HiDreamO1Config.generationDevice
     let textPrefix = graph.variable(textPrefixCPU).toGPU(device)
     let tFreq0 = graph.variable(timeEmbedding(timestep: HiDreamO1Config.devFirstTimestep)).toGPU(
       device)
     let rot = graph.variable(qwen3VLMRotary(positionIDs: positionIDs)).toGPU(device)
-    let attentionMask = graph.variable(mixedAttentionMaskFloat16(tokenTypes: tokenTypes)).toGPU(
-      device)
     var z = graph.variable(
       .GPU(device), .NC(imageTokenCount, HiDreamO1Config.patchDimension), of: Float.self)
     z.randn(std: HiDreamO1Config.generationNoiseScale, mean: 0)
@@ -776,7 +694,7 @@ func runGeneration() {
       textPrefixLength: textPrefixLength, imageTokenCount: imageTokenCount,
       layerCount: HiDreamO1Config.generationLayers)
     print("hidream-o1 compiling denoiser")
-    denoiser.compile(inputs: textPrefix, tFreq0, z, rot, attentionMask)
+    denoiser.compile(inputs: textPrefix, tFreq0, z, rot)
     print("hidream-o1 loading denoiser weights")
     let loadStart = Date()
     loadHiDreamO1DenoiserWeights(denoiser, reader: reader)
@@ -786,7 +704,7 @@ func runGeneration() {
     for (stepIdx, timestep) in steps.enumerated() {
       let tPixel = 1 - timestep / 1000
       let tFreq = graph.variable(timeEmbedding(timestep: tPixel)).toGPU(device)
-      let xPred = denoiser(inputs: textPrefix, tFreq, z, rot, attentionMask)[0].as(of: Float.self)
+      let xPred = denoiser(inputs: textPrefix, tFreq, z, rot)[0].as(of: Float.self)
       let sigmaNext = stepIdx + 1 < steps.count ? steps[stepIdx + 1] / 1000 : 0
       if sigmaNext > 0 {
         let noise = graph.variable(
