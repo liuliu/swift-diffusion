@@ -3,11 +3,11 @@ import NNC
 let graph = DynamicGraph()
 
 graph.openStore(
-  "/home/liu/workspace/swift-diffusion/qwen_3.5_4b_f16.ckpt", flags: [.readOnly]
+  "/fast/Data/hidream_o1_dev_f16.ckpt", flags: [.readOnly]
 ) { store in
   let keys = store.keys
   graph.openStore(
-    "/fast/Data/qwen_3.5_4b_i8x_s.ckpt",
+    "/fast/Data/hidream_o1_dev_i8x.ckpt",
     flags: .truncateWhenClose
   ) {
     for key in keys {
@@ -46,7 +46,7 @@ graph.openStore(
         || key.contains("token_embedding")  // Anima related.
         || key.contains("positive_embedding")  // SeedVR2 related.
         || key.contains("negative_embedding")  // SeedVR2 related.
-        // || key.contains("embed_tokens")  // Qwen 3.5 related.
+        || key.contains("embed_tokens")  // Qwen 3.5 related.
         || key.contains("patch_embed")  // Qwen 3.5 related.
         || key.contains("linear_attn.conv1d.")  // Qwen 3.5 related.
       {

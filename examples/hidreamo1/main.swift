@@ -39,6 +39,7 @@ enum HiDreamO1Config {
   static let imageChannels = 3
   static let patchDimension = imageChannels * patchSize * patchSize
   static let hiddenSize = 4_096
+  static let vocabularySize = 151_936
   static let timestepFrequencySize = 256
   static let pixelBottleneckSize = hiddenSize / 4
   static let samplePatchTokens = 4
@@ -61,6 +62,24 @@ enum HiDreamO1Config {
     707, 675, 640, 602, 560, 515, 464, 409, 347, 278, 199, 110, 8,
   ]
   static let mlpDownScaleSummary = "0..<16:2, 16..<35:4, 35..<36:64"
+}
+
+enum HiDreamO1VisionConfig {
+  static let patchSize = 16
+  static let temporalPatchSize = 2
+  static let spatialMergeSize = 2
+  static let imageChannels = 3
+  static let hiddenSize = 1_152
+  static let intermediateSize = 4_304
+  static let outputHiddenSize = 4_096
+  static let layerCount = 27
+  static let heads = 16
+  static let headDimension = hiddenSize / heads
+  static let patchDimension = imageChannels * temporalPatchSize * patchSize * patchSize
+  static let positionEmbeddings = 2_304
+  static let parityGridT = envInt("HIDREAMO1_VISUAL_GRID_T", 1)
+  static let parityGridH = envInt("HIDREAMO1_VISUAL_GRID_H", 4)
+  static let parityGridW = envInt("HIDREAMO1_VISUAL_GRID_W", 4)
 }
 
 func preparePythonPath() {
@@ -163,6 +182,26 @@ func qkvInterleavedNorm<T: TensorNumeric>(
   Tensor<T>(from: qkvInterleavedNorm(tensor, headDimension: headDimension))
 }
 
+func flattenedConv3DWeight(_ tensor: PythonObject) -> Tensor<Float> {
+  let numpy = tensor.type(torch.float).flatten(1).contiguous().cpu().numpy()
+  return try! Tensor<Float>(numpy: numpy)
+}
+
+func rotaryInterleavedWeight(_ tensor: PythonObject, heads: Int, headDimension: Int)
+  -> Tensor<Float>
+{
+  let numpy = tensor.type(torch.float).view(heads, 2, headDimension / 2, -1).transpose(1, 2)
+    .contiguous().view(heads * headDimension, -1).cpu().numpy()
+  return try! Tensor<Float>(numpy: numpy)
+}
+
+func rotaryInterleavedBias(_ tensor: PythonObject, heads: Int, headDimension: Int) -> Tensor<Float>
+{
+  let numpy = tensor.type(torch.float).view(heads, 2, headDimension / 2).transpose(1, 2)
+    .contiguous().view(heads * headDimension).cpu().numpy()
+  return try! Tensor<Float>(numpy: numpy)
+}
+
 func qwen3VLMRotary(positionIDs: Tensor<Int32>, headDimension: Int = 128, theta: Double = 5_000_000)
   -> Tensor<Float>
 {
@@ -191,6 +230,90 @@ func qwen3VLMRotary(positionIDs: Tensor<Int32>, headDimension: Int = 128, theta:
   return rotary
 }
 
+func qwen3VLVisionTokenCount(gridThw: [(t: Int, h: Int, w: Int)]) -> Int {
+  gridThw.reduce(0) { $0 + $1.t * $1.h * $1.w }
+}
+
+func qwen3VLVisionRotary(gridThw: [(t: Int, h: Int, w: Int)]) -> Tensor<Float> {
+  let tokenLength = qwen3VLVisionTokenCount(gridThw: gridThw)
+  let headDimension = HiDreamO1VisionConfig.headDimension
+  let half = headDimension / 2
+  let quarter = half / 2
+  let merge = HiDreamO1VisionConfig.spatialMergeSize
+  var rotary = Tensor<Float>(.CPU, .NHWC(1, tokenLength, 1, headDimension))
+  var tokenIndex = 0
+  for grid in gridThw {
+    for _ in 0..<grid.t {
+      for blockY in 0..<(grid.h / merge) {
+        for blockX in 0..<(grid.w / merge) {
+          for intraY in 0..<merge {
+            for intraX in 0..<merge {
+              let y = blockY * merge + intraY
+              let x = blockX * merge + intraX
+              for i in 0..<half {
+                let position = i < quarter ? y : x
+                let freqIndex = i < quarter ? i : i - quarter
+                let freq =
+                  Double(position) / pow(10_000.0, Double(freqIndex * 2) / Double(half))
+                rotary[0, tokenIndex, 0, i * 2] = Float(cos(freq))
+                rotary[0, tokenIndex, 0, i * 2 + 1] = Float(sin(freq))
+              }
+              tokenIndex += 1
+            }
+          }
+        }
+      }
+    }
+  }
+  return rotary
+}
+
+func qwen3VLVisionPositionInterpolation(gridThw: [(t: Int, h: Int, w: Int)]) -> (
+  ids: Tensor<Int32>, weights: Tensor<Float>
+) {
+  let tokenLength = qwen3VLVisionTokenCount(gridThw: gridThw)
+  let side = Int(Double(HiDreamO1VisionConfig.positionEmbeddings).squareRoot())
+  let merge = HiDreamO1VisionConfig.spatialMergeSize
+  var ids = Tensor<Int32>(.CPU, .C(4 * tokenLength))
+  var weights = Tensor<Float>(.CPU, .C(4 * tokenLength))
+  var tokenIndex = 0
+  for grid in gridThw {
+    for _ in 0..<grid.t {
+      for blockY in 0..<(grid.h / merge) {
+        for blockX in 0..<(grid.w / merge) {
+          for intraY in 0..<merge {
+            for intraX in 0..<merge {
+              let y = blockY * merge + intraY
+              let x = blockX * merge + intraX
+              let yPosition = grid.h == 1 ? 0 : Double(y) * Double(side - 1) / Double(grid.h - 1)
+              let xPosition = grid.w == 1 ? 0 : Double(x) * Double(side - 1) / Double(grid.w - 1)
+              let yFloor = Int(yPosition)
+              let xFloor = Int(xPosition)
+              let yCeil = min(yFloor + 1, side - 1)
+              let xCeil = min(xFloor + 1, side - 1)
+              let dy = Float(yPosition - Double(yFloor))
+              let dx = Float(xPosition - Double(xFloor))
+              let cornerIDs = [
+                yFloor * side + xFloor, yFloor * side + xCeil, yCeil * side + xFloor,
+                yCeil * side + xCeil,
+              ]
+              let cornerWeights = [
+                (1 - dy) * (1 - dx), (1 - dy) * dx, dy * (1 - dx), dy * dx,
+              ]
+              for i in 0..<4 {
+                ids[i * tokenLength + tokenIndex] = Int32(cornerIDs[i])
+                weights[i * tokenLength + tokenIndex] = cornerWeights[i]
+              }
+              tokenIndex += 1
+            }
+          }
+        }
+      }
+    }
+  }
+  return (ids, weights)
+}
+
 func timeEmbedding(timestep: Float, embeddingSize: Int = HiDreamO1Config.timestepFrequencySize)
   -> Tensor<Float>
 {
@@ -207,8 +330,8 @@ func timeEmbedding(timestep: Float, embeddingSize: Int = HiDreamO1Config.timeste
 
 func TimestepEmbedder<T: TensorNumeric>(_ dataType: T.Type) -> (Model, (PythonObject) -> Void) {
   let x = Input()
-  let fc0 = Dense(count: HiDreamO1Config.hiddenSize, name: "t_embedder_mlp_0")
-  let fc1 = Dense(count: HiDreamO1Config.hiddenSize, name: "t_embedder_mlp_2")
+  let fc0 = Dense(count: HiDreamO1Config.hiddenSize, name: "t_embedder_0")
+  let fc1 = Dense(count: HiDreamO1Config.hiddenSize, name: "t_embedder_1")
   let out = fc1(fc0(x).swish())
   let reader: (PythonObject) -> Void = { stateDict in
     fc0.weight.copy(
@@ -230,8 +353,8 @@ func TimestepEmbedder() -> (Model, (PythonObject) -> Void) {
 func PixelEmbedder<T: TensorNumeric>(_ dataType: T.Type) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let proj1 = Dense(
-    count: HiDreamO1Config.pixelBottleneckSize, noBias: true, name: "x_embedder_proj1")
-  let proj2 = Dense(count: HiDreamO1Config.hiddenSize, name: "x_embedder_proj2")
+    count: HiDreamO1Config.pixelBottleneckSize, noBias: true, name: "x_embedder_0")
+  let proj2 = Dense(count: HiDreamO1Config.hiddenSize, name: "x_embedder_1")
   let out = proj2(proj1(x))
   let reader: (PythonObject) -> Void = { stateDict in
     proj1.weight.copy(
@@ -250,7 +373,7 @@ func PixelEmbedder() -> (Model, (PythonObject) -> Void) {
 
 func FinalLayer<T: TensorNumeric>(_ dataType: T.Type) -> (Model, (PythonObject) -> Void) {
   let x = Input()
-  let linear = Dense(count: HiDreamO1Config.patchDimension, name: "final_layer2")
+  let linear = Dense(count: HiDreamO1Config.patchDimension, name: "linear")
   let out = linear(x)
   let reader: (PythonObject) -> Void = { stateDict in
     linear.weight.copy(
@@ -281,6 +404,290 @@ func PixelRoundTrip() -> (Model, (PythonObject) -> Void) {
   PixelRoundTrip(Float.self)
 }
 
+func HiDreamO1Qwen3VLVisualAttention(
+  prefix: String, tokenLength: Int
+) -> (Model, (PythonObject) -> Void) {
+  let x = Input()
+  let rotary = Input()
+  let hiddenSize = HiDreamO1VisionConfig.hiddenSize
+  let heads = HiDreamO1VisionConfig.heads
+  let headDimension = HiDreamO1VisionConfig.headDimension
+  let toQueries = Dense(count: hiddenSize, name: "\(prefix).attn.q_proj")
+  let toKeys = Dense(count: hiddenSize, name: "\(prefix).attn.k_proj")
+  let toValues = Dense(count: hiddenSize, name: "\(prefix).attn.v_proj")
+  var queries = toQueries(x).reshaped(.NHWC(1, tokenLength, heads, headDimension))
+  var keys = toKeys(x).reshaped(.NHWC(1, tokenLength, heads, headDimension))
+  let values = toValues(x).reshaped(.NHWC(1, tokenLength, heads, headDimension))
+  queries = Functional.cmul(left: queries, right: rotary)
+  keys = Functional.cmul(left: keys, right: rotary)
+  let queriesTransposed = queries.permuted(0, 2, 1, 3)
+  let keysTransposed = keys.permuted(0, 2, 1, 3)
+  let valuesTransposed = values.permuted(0, 2, 1, 3)
+  var dot =
+    Matmul(transposeB: (2, 3))(queriesTransposed, keysTransposed)
+    * (1.0 / Float(headDimension).squareRoot())
+  dot = dot.reshaped([heads * tokenLength, tokenLength]).softmax().reshaped([
+    1, heads, tokenLength, tokenLength,
+  ])
+  var attentionOut = dot * valuesTransposed
+  attentionOut = attentionOut.reshaped([1, heads, tokenLength, headDimension]).transposed(1, 2)
+    .reshaped([tokenLength, hiddenSize])
+  let outProj = Dense(count: hiddenSize, name: "\(prefix).attn.proj")
+  let out = outProj(attentionOut)
+  let reader: (PythonObject) -> Void = { stateDict in
+    let weight = stateDict["\(prefix).attn.qkv.weight"]
+    let bias = stateDict["\(prefix).attn.qkv.bias"]
+    loadLog("load \(prefix).attn.q")
+    toQueries.weight.copy(
+      from: rotaryInterleavedWeight(
+        weight[Python.slice(0, hiddenSize, Python.None)], heads: heads,
+        headDimension: headDimension))
+    toQueries.bias.copy(
+      from: rotaryInterleavedBias(
+        bias[Python.slice(0, hiddenSize, Python.None)], heads: heads,
+        headDimension: headDimension))
+    loadLog("load \(prefix).attn.k")
+    toKeys.weight.copy(
+      from: rotaryInterleavedWeight(
+        weight[Python.slice(hiddenSize, hiddenSize * 2, Python.None)], heads: heads,
+        headDimension: headDimension))
+    toKeys.bias.copy(
+      from: rotaryInterleavedBias(
+        bias[Python.slice(hiddenSize, hiddenSize * 2, Python.None)], heads: heads,
+        headDimension: headDimension))
+    loadLog("load \(prefix).attn.v")
+    toValues.weight.copy(
+      from: tensorFromPython(weight[Python.slice(hiddenSize * 2, hiddenSize * 3, Python.None)]))
+    toValues.bias.copy(
+      from: tensorFromPython(bias[Python.slice(hiddenSize * 2, hiddenSize * 3, Python.None)]))
+    loadLog("load \(prefix).attn.proj")
+    outProj.weight.copy(from: tensorFromPython(stateDict["\(prefix).attn.proj.weight"]))
+    outProj.bias.copy(from: tensorFromPython(stateDict["\(prefix).attn.proj.bias"]))
+  }
+  return (Model([x, rotary], [out]), reader)
+}
+
+func HiDreamO1Qwen3VLVisualBlock(
+  layerIdx: Int, tokenLength: Int
+) -> (Model, (PythonObject) -> Void) {
+  let prefix = "model.visual.blocks.\(layerIdx)"
+  let x = Input()
+  let rotary = Input()
+  let norm1 = LayerNorm(
+    epsilon: 1e-6, axis: [1], elementwiseAffine: false, name: "\(prefix).norm1")
+  let norm1Weight = Parameter<Float>(
+    .GPU(HiDreamO1Config.generationDevice), .NC(1, HiDreamO1VisionConfig.hiddenSize),
+    name: "\(prefix).norm1.weight")
+  let norm1Bias = Parameter<Float>(
+    .GPU(HiDreamO1Config.generationDevice), .NC(1, HiDreamO1VisionConfig.hiddenSize),
+    name: "\(prefix).norm1.bias")
+  let (attention, attentionReader) = HiDreamO1Qwen3VLVisualAttention(
+    prefix: prefix, tokenLength: tokenLength)
+  var out = x + attention(norm1(x) .* norm1Weight + norm1Bias, rotary)
+  let norm2 = LayerNorm(
+    epsilon: 1e-6, axis: [1], elementwiseAffine: false, name: "\(prefix).norm2")
+  let norm2Weight = Parameter<Float>(
+    .GPU(HiDreamO1Config.generationDevice), .NC(1, HiDreamO1VisionConfig.hiddenSize),
+    name: "\(prefix).norm2.weight")
+  let norm2Bias = Parameter<Float>(
+    .GPU(HiDreamO1Config.generationDevice), .NC(1, HiDreamO1VisionConfig.hiddenSize),
+    name: "\(prefix).norm2.bias")
+  let fc1 = Dense(
+    count: HiDreamO1VisionConfig.intermediateSize, name: "\(prefix).mlp.linear_fc1")
+  let fc2 = Dense(count: HiDreamO1VisionConfig.hiddenSize, name: "\(prefix).mlp.linear_fc2")
+  out = out + fc2(fc1(norm2(out) .* norm2Weight + norm2Bias).GELU(approximate: .tanh))
+  let reader: (PythonObject) -> Void = { stateDict in
+    loadLog("load \(prefix).norm1")
+    norm1Weight.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).norm1.weight"]).reshaped(
+        .NC(1, HiDreamO1VisionConfig.hiddenSize)))
+    norm1Bias.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).norm1.bias"]).reshaped(
+        .NC(1, HiDreamO1VisionConfig.hiddenSize)))
+    loadLog("load \(prefix).attn")
+    attentionReader(stateDict)
+    loadLog("load \(prefix).norm2")
+    norm2Weight.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).norm2.weight"]).reshaped(
+        .NC(1, HiDreamO1VisionConfig.hiddenSize)))
+    norm2Bias.weight.copy(
+      from: tensorFromPython(stateDict["\(prefix).norm2.bias"]).reshaped(
+        .NC(1, HiDreamO1VisionConfig.hiddenSize)))
+    loadLog("load \(prefix).mlp")
+    fc1.weight.copy(from: tensorFromPython(stateDict["\(prefix).mlp.linear_fc1.weight"]))
+    fc1.bias.copy(from: tensorFromPython(stateDict["\(prefix).mlp.linear_fc1.bias"]))
+    fc2.weight.copy(from: tensorFromPython(stateDict["\(prefix).mlp.linear_fc2.weight"]))
+    fc2.bias.copy(from: tensorFromPython(stateDict["\(prefix).mlp.linear_fc2.bias"]))
+  }
+  return (Model([x, rotary], [out]), reader)
+}
+
+func HiDreamO1Qwen3VLVisualStem(
+  gridThw: [(t: Int, h: Int, w: Int)]
+) -> ((PythonObject) -> Void, Model) {
+  let tokenLength = qwen3VLVisionTokenCount(gridThw: gridThw)
+  let patches = Input()
+  let positionIDs = Input()
+  let positionWeights = Input()
+  let patchEmbed = Dense(
+    count: HiDreamO1VisionConfig.hiddenSize, name: "model.visual.patch_embed.proj")
+  let positionEmbed = Embedding(
+    Float.self, vocabularySize: HiDreamO1VisionConfig.positionEmbeddings,
+    embeddingSize: HiDreamO1VisionConfig.hiddenSize, name: "model.visual.pos_embed")
+  let learnedPosition =
+    (positionEmbed(positionIDs).reshaped([4, tokenLength, HiDreamO1VisionConfig.hiddenSize])
+    .* positionWeights.to(.Float32).reshaped([4, tokenLength, 1])).reduced(.sum, axis: [0])
+    .reshaped([tokenLength, HiDreamO1VisionConfig.hiddenSize])
+  let out = patchEmbed(patches) + learnedPosition
+  let reader: (PythonObject) -> Void = { stateDict in
+    patchEmbed.weight.copy(
+      from: flattenedConv3DWeight(stateDict["model.visual.patch_embed.proj.weight"]))
+    patchEmbed.bias.copy(from: tensorFromPython(stateDict["model.visual.patch_embed.proj.bias"]))
+    positionEmbed.parameters.copy(
+      from: tensorFromPython(stateDict["model.visual.pos_embed.weight"]))
+  }
+  return (reader, Model([patches, positionIDs, positionWeights], [out]))
+}
+
+func HiDreamO1Qwen3VLVisualMerger(tokenLength: Int) -> ((PythonObject) -> Void, Model) {
+  let x = Input()
+  let mergedHiddenSize =
+    HiDreamO1VisionConfig.hiddenSize * HiDreamO1VisionConfig.spatialMergeSize
+    * HiDreamO1VisionConfig.spatialMergeSize
+  let mergedTokenLength =
+    tokenLength
+    / (HiDreamO1VisionConfig.spatialMergeSize * HiDreamO1VisionConfig.spatialMergeSize)
+  let mergerNorm = LayerNorm(
+    epsilon: 1e-6, axis: [1], elementwiseAffine: false, name: "model.visual.merger.norm")
+  let mergerNormWeight = Parameter<Float>(
+    .GPU(HiDreamO1Config.generationDevice), .NC(1, HiDreamO1VisionConfig.hiddenSize),
+    name: "model.visual.merger.norm.weight")
+  let mergerNormBias = Parameter<Float>(
+    .GPU(HiDreamO1Config.generationDevice), .NC(1, HiDreamO1VisionConfig.hiddenSize),
+    name: "model.visual.merger.norm.bias")
+  var out = (mergerNorm(x) .* mergerNormWeight + mergerNormBias).reshaped([
+    mergedTokenLength, mergedHiddenSize,
+  ])
+  let mergerFc1 = Dense(count: mergedHiddenSize, name: "model.visual.merger.linear_fc1")
+  let mergerFc2 = Dense(
+    count: HiDreamO1VisionConfig.outputHiddenSize, name: "model.visual.merger.linear_fc2")
+  out = mergerFc2(mergerFc1(out).GELU())
+  let reader: (PythonObject) -> Void = { stateDict in
+    mergerNormWeight.weight.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.norm.weight"]).reshaped(
+        .NC(1, HiDreamO1VisionConfig.hiddenSize)))
+    mergerNormBias.weight.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.norm.bias"]).reshaped(
+        .NC(1, HiDreamO1VisionConfig.hiddenSize)))
+    mergerFc1.weight.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.linear_fc1.weight"]))
+    mergerFc1.bias.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.linear_fc1.bias"]))
+    mergerFc2.weight.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.linear_fc2.weight"]))
+    mergerFc2.bias.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.linear_fc2.bias"]))
+  }
+  return (reader, Model([x], [out]))
+}
+
+func HiDreamO1Qwen3VLVisualTransformer(
+  gridThw: [(t: Int, h: Int, w: Int)]
+) -> ((PythonObject) -> Void, Model) {
+  let tokenLength = qwen3VLVisionTokenCount(gridThw: gridThw)
+  let patches = Input()
+  let positionIDs = Input()
+  let positionWeights = Input()
+  let rotary = Input()
+  let patchEmbed = Dense(
+    count: HiDreamO1VisionConfig.hiddenSize, name: "model.visual.patch_embed.proj")
+  let positionEmbed = Embedding(
+    Float.self, vocabularySize: HiDreamO1VisionConfig.positionEmbeddings,
+    embeddingSize: HiDreamO1VisionConfig.hiddenSize, name: "model.visual.pos_embed")
+  let learnedPosition =
+    (positionEmbed(positionIDs).reshaped([4, tokenLength, HiDreamO1VisionConfig.hiddenSize])
+    .* positionWeights.to(.Float32).reshaped([4, tokenLength, 1])).reduced(.sum, axis: [0])
+    .reshaped([tokenLength, HiDreamO1VisionConfig.hiddenSize])
+  var out = patchEmbed(patches) + learnedPosition
+  var layerReaders = [(PythonObject) -> Void]()
+  for layerIdx in 0..<HiDreamO1VisionConfig.layerCount {
+    let (block, reader) = HiDreamO1Qwen3VLVisualBlock(
+      layerIdx: layerIdx, tokenLength: tokenLength)
+    out = block(out, rotary)
+    layerReaders.append { stateDict in
+      loadLog("load model.visual.blocks.\(layerIdx)")
+      reader(stateDict)
+    }
+  }
+  let mergedHiddenSize =
+    HiDreamO1VisionConfig.hiddenSize * HiDreamO1VisionConfig.spatialMergeSize
+    * HiDreamO1VisionConfig.spatialMergeSize
+  let mergedTokenLength =
+    tokenLength
+    / (HiDreamO1VisionConfig.spatialMergeSize * HiDreamO1VisionConfig.spatialMergeSize)
+  let mergerNorm = LayerNorm(
+    epsilon: 1e-6, axis: [1], elementwiseAffine: false, name: "model.visual.merger.norm")
+  let mergerNormWeight = Parameter<Float>(
+    .GPU(HiDreamO1Config.generationDevice), .NC(1, HiDreamO1VisionConfig.hiddenSize),
+    name: "model.visual.merger.norm.weight")
+  let mergerNormBias = Parameter<Float>(
+    .GPU(HiDreamO1Config.generationDevice), .NC(1, HiDreamO1VisionConfig.hiddenSize),
+    name: "model.visual.merger.norm.bias")
+  out = (mergerNorm(out) .* mergerNormWeight + mergerNormBias).reshaped([
+    mergedTokenLength, mergedHiddenSize,
+  ])
+  let mergerFc1 = Dense(count: mergedHiddenSize, name: "model.visual.merger.linear_fc1")
+  let mergerFc2 = Dense(
+    count: HiDreamO1VisionConfig.outputHiddenSize, name: "model.visual.merger.linear_fc2")
+  out = mergerFc2(mergerFc1(out).GELU())
+  let reader: (PythonObject) -> Void = { stateDict in
+    patchEmbed.weight.copy(
+      from: flattenedConv3DWeight(stateDict["model.visual.patch_embed.proj.weight"]))
+    patchEmbed.bias.copy(from: tensorFromPython(stateDict["model.visual.patch_embed.proj.bias"]))
+    positionEmbed.parameters.copy(
+      from: tensorFromPython(stateDict["model.visual.pos_embed.weight"]))
+    for reader in layerReaders {
+      reader(stateDict)
+    }
+    mergerNormWeight.weight.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.norm.weight"]).reshaped(
+        .NC(1, HiDreamO1VisionConfig.hiddenSize)))
+    mergerNormBias.weight.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.norm.bias"]).reshaped(
+        .NC(1, HiDreamO1VisionConfig.hiddenSize)))
+    mergerFc1.weight.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.linear_fc1.weight"]))
+    mergerFc1.bias.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.linear_fc1.bias"]))
+    mergerFc2.weight.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.linear_fc2.weight"]))
+    mergerFc2.bias.copy(
+      from: tensorFromPython(stateDict["model.visual.merger.linear_fc2.bias"]))
+  }
+  return (
+    reader, Model([patches, positionIDs, positionWeights, rotary], [out])
+  )
+}
+
+func loadHiDreamO1VisualWeights(
+  _ visual: Model, reader: (PythonObject) -> Void, stateDict: PythonObject
+) {
+  if envFlag("HIDREAMO1_LOAD_VISUAL_WEIGHTS") {
+    print("hidream-o1 reading visual store:", HiDreamO1Config.storePath)
+    graph.openStore(HiDreamO1Config.storePath, flags: [.readOnly]) {
+      try! $0.read("visual", model: visual, strict: true)
+    }
+  } else {
+    reader(stateDict)
+  }
+  if envFlag("HIDREAMO1_WRITE_VISUAL_WEIGHTS") {
+    print("hidream-o1 writing visual store:", HiDreamO1Config.storePath)
+    graph.openStore(HiDreamO1Config.storePath) {
+      $0.write("visual", model: visual)
+    }
+  }
+}
+
 func HiDreamO1FeedForwardMixedFP16(
   hiddenSize: Int, intermediateSize: Int, downScale: Float
 ) -> (Model, Model, Model, Model) {
@@ -307,10 +714,10 @@ func HiDreamO1SelfAttentionMixedFP16(
   let toQueries = Dense(count: headDimension * heads, noBias: true, name: "q_proj")
   let toValues = Dense(count: headDimension * kvHeads, noBias: true, name: "v_proj")
   var keys = toKeys(x).reshaped(.NHWC(1, tokenLength, kvHeads, headDimension))
-  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "k_norm")
+  let normK = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_k")
   keys = normK(keys)
   var queries = toQueries(x).reshaped(.NHWC(1, tokenLength, heads, headDimension))
-  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "q_norm")
+  let normQ = RMSNorm(epsilon: 1e-6, axis: [3], name: "norm_q")
   queries = normQ(queries)
   let values = toValues(x).reshaped(.NHWC(1, tokenLength, kvHeads, headDimension))
   queries = Functional.cmul(left: queries, right: rot)
@@ -338,7 +745,7 @@ func HiDreamO1SelfAttentionMixedFP16(
     causalQueries, causalKeys, causalValues)
   let imageOut = ScaledDotProductAttention(scale: scale, flags: [.Float16])(
     imageQueries, keys, values)
-  let unifyHeads = Dense(count: width, noBias: true, name: "o_proj")
+  let unifyHeads = Dense(count: width, noBias: true, name: "out_proj")
   let out = unifyHeads(
     Concat(axis: 1)(causalOut, imageOut).reshaped([tokenLength, heads * headDimension])
   ).to(.Float32)
@@ -412,12 +819,16 @@ func HiDreamO1DecoderLayerMixedFP16(
 func HiDreamO1DenoiserMixedFP16(
   textPrefixLength: Int, imageTokenCount: Int, layerCount: Int
 ) -> ((PythonObject) -> Void, Model) {
-  let textPrefix = Input()
+  let textPrefixTokens = Input()
   let timestepFrequency = Input()
   let pixelPatches = Input()
   let rot = Input()
+  let tokenEmbed = Embedding(
+    Float16.self, vocabularySize: HiDreamO1Config.vocabularySize,
+    embeddingSize: HiDreamO1Config.hiddenSize, name: "tok_embeddings")
   let (timestepEmbedder, timestepReader) = TimestepEmbedder(Float16.self)
   let (pixelEmbedder, pixelReader) = PixelEmbedder(Float16.self)
+  let textPrefix = tokenEmbed(textPrefixTokens).to(.Float32)
   let tEmbedding = timestepEmbedder(timestepFrequency.to(.Float16)).to(.Float32)
   let pixelEmbedding = pixelEmbedder(pixelPatches.to(.Float16)).to(.Float32)
   let rotary = rot.to(.Float16)
@@ -442,6 +853,9 @@ func HiDreamO1DenoiserMixedFP16(
     offset: [textPrefixLength + 1, 0],
     strides: [HiDreamO1Config.patchDimension, 1])
   let reader: (PythonObject) -> Void = { stateDict in
+    tokenEmbed.parameters.copy(
+      from: tensorFromPython(
+        stateDict["model.language_model.embed_tokens.weight"], as: Float16.self))
     timestepReader(stateDict)
     pixelReader(stateDict)
     for reader in readers {
@@ -451,23 +865,23 @@ func HiDreamO1DenoiserMixedFP16(
     finalReader(stateDict)
   }
   return (
-    reader, Model([textPrefix, timestepFrequency, pixelPatches, rot], [predicted])
+    reader, Model([textPrefixTokens, timestepFrequency, pixelPatches, rot], [predicted])
   )
 }
 
 func loadHiDreamO1DenoiserWeights(_ denoiser: Model, reader: (PythonObject) -> Void) {
   if envFlag("HIDREAMO1_LOAD_WEIGHTS") {
-    print("hidream-o1 reading denoiser store:", HiDreamO1Config.storePath)
+    print("hidream-o1 reading dit store:", HiDreamO1Config.storePath)
     graph.openStore(HiDreamO1Config.storePath, flags: [.readOnly]) {
-      try! $0.read("denoiser", model: denoiser, strict: true)
+      try! $0.read("dit", model: denoiser, strict: true)
     }
   } else {
     reader(reference.lazy_state(HiDreamO1Paths.modelPath))
   }
   if envFlag("HIDREAMO1_WRITE_WEIGHTS") {
-    print("hidream-o1 writing denoiser store:", HiDreamO1Config.storePath)
+    print("hidream-o1 writing dit store:", HiDreamO1Config.storePath)
     graph.openStore(HiDreamO1Config.storePath) {
-      $0.write("denoiser", model: denoiser)
+      $0.write("dit", model: denoiser)
     }
   }
 }
@@ -556,6 +970,70 @@ func runPixelRoundTripParity(stateDict: PythonObject) -> Bool {
     printSamples("hidream-o1 pixel roundtrip", swiftOutput, expected)
     print("hidream-o1 pixel roundtrip max-abs diff:", maxAbs, "relative:", relative)
     return maxAbs <= 2e-4 && relative <= 2e-5
+  }
+}
+
+func runQwen3VLVisualParity() -> Bool {
+  graph.withNoGrad {
+    let grid = [
+      (
+        t: HiDreamO1VisionConfig.parityGridT, h: HiDreamO1VisionConfig.parityGridH,
+        w: HiDreamO1VisionConfig.parityGridW
+      )
+    ]
+    precondition(grid[0].h % HiDreamO1VisionConfig.spatialMergeSize == 0)
+    precondition(grid[0].w % HiDreamO1VisionConfig.spatialMergeSize == 0)
+    let tokenLength = qwen3VLVisionTokenCount(gridThw: grid)
+    let mergedTokenLength =
+      tokenLength
+      / (HiDreamO1VisionConfig.spatialMergeSize * HiDreamO1VisionConfig.spatialMergeSize)
+    print(
+      "hidream-o1 visual parity grid:", grid[0].t, grid[0].h, grid[0].w, "tokens:",
+      tokenLength, "merged:", mergedTokenLength)
+    let stateDict = reference.load_visual_state(
+      HiDreamO1Paths.modelPath, HiDreamO1VisionConfig.layerCount)
+    let patchesTorch = reference.random_vision_patches(
+      grid[0].t, grid[0].h, grid[0].w)
+    let gridTorch = torch.tensor([[grid[0].t, grid[0].h, grid[0].w]], dtype: torch.long)
+    let device = HiDreamO1Config.generationDevice
+    let patches = graph.variable(tensorFromPython(patchesTorch)).toGPU(device)
+    let position = qwen3VLVisionPositionInterpolation(gridThw: grid)
+    let positionIDs = graph.variable(position.ids).toGPU(device)
+    let positionWeights = graph.variable(position.weights).toGPU(device)
+    let stemTorch = reference.vision_stem(stateDict, patchesTorch, gridTorch)
+    let stemExpected = tensorFromPython(stemTorch)
+    let (stemReader, stem) = HiDreamO1Qwen3VLVisualStem(gridThw: grid)
+    stem.compile(inputs: patches, positionIDs, positionWeights)
+    stemReader(stateDict)
+    let stemOutput = stem(inputs: patches, positionIDs, positionWeights)[0].as(of: Float.self)
+      .toCPU()
+    let (stemMaxAbs, stemRelative) = maxAbsAndRelativeDiff2D(stemOutput, stemExpected)
+    print("hidream-o1 visual stem max-abs diff:", stemMaxAbs, "relative:", stemRelative)
+    let mergerExpected = tensorFromPython(reference.vision_merger(stateDict, stemTorch))
+    let stemForMerger = graph.variable(stemExpected).toGPU(device)
+    let (mergerReader, merger) = HiDreamO1Qwen3VLVisualMerger(tokenLength: tokenLength)
+    merger.compile(inputs: stemForMerger)
+    mergerReader(stateDict)
+    let mergerOutput = merger(inputs: stemForMerger)[0].as(of: Float.self).toCPU()
+    let (mergerMaxAbs, mergerRelative) = maxAbsAndRelativeDiff2D(mergerOutput, mergerExpected)
+    print("hidream-o1 visual merger max-abs diff:", mergerMaxAbs, "relative:", mergerRelative)
+    print("hidream-o1 visual computing torch reference")
+    let expected = tensorFromPython(
+      reference.vision_transformer(
+        stateDict, patchesTorch, gridTorch, HiDreamO1VisionConfig.layerCount))
+    let rotary = graph.variable(qwen3VLVisionRotary(gridThw: grid)).toGPU(device)
+    let (reader, visual) = HiDreamO1Qwen3VLVisualTransformer(gridThw: grid)
+    print("hidream-o1 compiling visual")
+    visual.compile(inputs: patches, positionIDs, positionWeights, rotary)
+    print("hidream-o1 loading visual weights")
+    loadHiDreamO1VisualWeights(visual, reader: reader, stateDict: stateDict)
+    let swiftOutput = visual(inputs: patches, positionIDs, positionWeights, rotary)[0]
+      .as(of: Float.self).toCPU()
+    let (maxAbs, relative) = maxAbsAndRelativeDiff2D(swiftOutput, expected)
+    print("hidream-o1 visual parity shape:", swiftOutput.shape, expected.shape)
+    printSamples("hidream-o1 visual", swiftOutput, expected)
+    print("hidream-o1 visual max-abs diff:", maxAbs, "relative:", relative)
+    return maxAbs <= 2e-3 && relative <= 2e-4
   }
 }
 
@@ -676,14 +1154,14 @@ func runGeneration() {
     let sample = reference.generation_inputs(
       HiDreamO1Paths.modelPath, prompt, HiDreamO1Config.generationHeight,
       HiDreamO1Config.generationWidth)
-    let textPrefixCPU = tensorFromPython(sample["text_prefix_embeddings"])
+    let textPrefixTokensCPU = tensorInt32FromPython(sample["text_prefix_ids"])
     let positionIDs = tensorInt32FromPython(sample["position_ids"])
     let imageTokenCount = Int(sample["image_token_count"])!
-    let textPrefixLength = textPrefixCPU.shape[0]
+    let textPrefixLength = textPrefixTokensCPU.shape[0]
     let tokenLength = textPrefixLength + 1 + imageTokenCount
     precondition(positionIDs.shape[2] == tokenLength)
     let device = HiDreamO1Config.generationDevice
-    let textPrefix = graph.variable(textPrefixCPU).toGPU(device)
+    let textPrefixTokens = graph.variable(textPrefixTokensCPU).toGPU(device)
     let tFreq0 = graph.variable(timeEmbedding(timestep: HiDreamO1Config.devFirstTimestep)).toGPU(
       device)
     let rot = graph.variable(qwen3VLMRotary(positionIDs: positionIDs)).toGPU(device)
@@ -694,7 +1172,7 @@ func runGeneration() {
       textPrefixLength: textPrefixLength, imageTokenCount: imageTokenCount,
       layerCount: HiDreamO1Config.generationLayers)
     print("hidream-o1 compiling denoiser")
-    denoiser.compile(inputs: textPrefix, tFreq0, z, rot)
+    denoiser.compile(inputs: textPrefixTokens, tFreq0, z, rot)
     print("hidream-o1 loading denoiser weights")
     let loadStart = Date()
     loadHiDreamO1DenoiserWeights(denoiser, reader: reader)
@@ -704,7 +1182,7 @@ func runGeneration() {
     for (stepIdx, timestep) in steps.enumerated() {
       let tPixel = 1 - timestep / 1000
       let tFreq = graph.variable(timeEmbedding(timestep: tPixel)).toGPU(device)
-      let xPred = denoiser(inputs: textPrefix, tFreq, z, rot)[0].as(of: Float.self)
+      let xPred = denoiser(inputs: textPrefixTokens, tFreq, z, rot)[0].as(of: Float.self)
       let sigmaNext = stepIdx + 1 < steps.count ? steps[stepIdx + 1] / 1000 : 0
       if sigmaNext > 0 {
         let noise = graph.variable(
@@ -749,6 +1227,12 @@ if !envFlag("HIDREAMO1_SKIP_PARITY") {
   print("hidream-o1 initial parity passed")
 } else {
   print("hidream-o1 parity skipped by HIDREAMO1_SKIP_PARITY")
+}
+if envFlag("HIDREAMO1_RUN_VISUAL_PARITY") {
+  if !runQwen3VLVisualParity() {
+    fatalError("hidream-o1 visual parity failed")
+  }
+  print("hidream-o1 visual parity passed")
 }
 if envFlag("HIDREAMO1_RUN_GENERATION") {
   runGeneration()
