@@ -675,7 +675,7 @@ func loadHiDreamO1VisualWeights(
   if envFlag("HIDREAMO1_LOAD_VISUAL_WEIGHTS") {
     print("hidream-o1 reading visual store:", HiDreamO1Config.storePath)
     graph.openStore(HiDreamO1Config.storePath, flags: [.readOnly]) {
-      try! $0.read("visual", model: visual, strict: true)
+      try! $0.read("vision_model", model: visual, strict: true)
     }
   } else {
     reader(stateDict)
@@ -683,7 +683,7 @@ func loadHiDreamO1VisualWeights(
   if envFlag("HIDREAMO1_WRITE_VISUAL_WEIGHTS") {
     print("hidream-o1 writing visual store:", HiDreamO1Config.storePath)
     graph.openStore(HiDreamO1Config.storePath) {
-      $0.write("visual", model: visual)
+      $0.write("vision_model", model: visual)
     }
   }
 }
@@ -1070,6 +1070,47 @@ func runDecoderLayerParity(stateDict: PythonObject) -> Bool {
   }
 }
 
+func runFullDenoiserParity() -> Bool {
+  graph.withNoGrad {
+    let prompt = "A friendly golden retriever sitting in a sunlit park."
+    let sample = reference.generation_inputs(
+      HiDreamO1Paths.modelPath, prompt, HiDreamO1Config.parityHeight, HiDreamO1Config.parityWidth)
+    let textPrefixTokensCPU = tensorInt32FromPython(sample["text_prefix_ids"])
+    let positionIDs = tensorInt32FromPython(sample["position_ids"])
+    let imageTokenCount = Int(sample["image_token_count"])!
+    let textPrefixLength = textPrefixTokensCPU.shape[0]
+    let patchesTorch = reference.random_patch_tokens(imageTokenCount, seed: 45)
+    let expected = tensorFromPython(
+      reference.denoiser_step(
+        HiDreamO1Paths.modelPath, prompt, patchesTorch,
+        timestep: HiDreamO1Config.devFirstTimestep,
+        height: HiDreamO1Config.parityHeight, width: HiDreamO1Config.parityWidth,
+        layer_count: HiDreamO1Config.generationLayers,
+        device: "cuda:\(HiDreamO1Config.generationDevice)",
+        verbose: false))
+    let device = HiDreamO1Config.generationDevice
+    let textPrefixTokens = graph.variable(textPrefixTokensCPU).toGPU(device)
+    let timestepFrequency = graph.variable(
+      timeEmbedding(timestep: HiDreamO1Config.devFirstTimestep)
+    )
+    .toGPU(device)
+    let patches = graph.variable(tensorFromPython(patchesTorch)).toGPU(device)
+    let rot = graph.variable(qwen3VLMRotary(positionIDs: positionIDs)).toGPU(device)
+    let (reader, denoiser) = HiDreamO1DenoiserMixedFP16(
+      textPrefixLength: textPrefixLength, imageTokenCount: imageTokenCount,
+      layerCount: HiDreamO1Config.generationLayers)
+    denoiser.compile(inputs: textPrefixTokens, timestepFrequency, patches, rot)
+    loadHiDreamO1DenoiserWeights(denoiser, reader: reader)
+    let swiftOutput = denoiser(inputs: textPrefixTokens, timestepFrequency, patches, rot)[0]
+      .as(of: Float.self).toCPU()
+    let (maxAbs, relative) = maxAbsAndRelativeDiff2D(swiftOutput, expected)
+    print("hidream-o1 full denoiser mixed-fp16 parity shape:", swiftOutput.shape, expected.shape)
+    printSamples("hidream-o1 full denoiser mixed-fp16", swiftOutput, expected)
+    print("hidream-o1 full denoiser mixed-fp16 max-abs diff:", maxAbs, "relative:", relative)
+    return maxAbs <= 0.5 && relative <= 2e-2
+  }
+}
+
 func savePatchImage(_ patches: Tensor<Float>, height: Int, width: Int, path: String) {
   precondition(height % HiDreamO1Config.patchSize == 0)
   precondition(width % HiDreamO1Config.patchSize == 0)
@@ -1233,6 +1274,12 @@ if envFlag("HIDREAMO1_RUN_VISUAL_PARITY") {
     fatalError("hidream-o1 visual parity failed")
   }
   print("hidream-o1 visual parity passed")
+}
+if envFlag("HIDREAMO1_RUN_FULL_DENOISER_PARITY") {
+  if !runFullDenoiserParity() {
+    fatalError("hidream-o1 full denoiser parity failed")
+  }
+  print("hidream-o1 full denoiser parity passed")
 }
 if envFlag("HIDREAMO1_RUN_GENERATION") {
   runGeneration()
