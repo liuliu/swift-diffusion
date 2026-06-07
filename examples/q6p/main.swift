@@ -3,9 +3,9 @@ import NNC
 
 let graph = DynamicGraph()
 
-private let imatrixPath = "/home/liu/workspace/s4nnc/qwen"  // 36_27b_ud_q4_k_xl_tensor_imatrix.csv"
-private let inputPath = "/fast/Data/hidream_o1_dev_2604_f16.ckpt"
-private let outputPath = "/fast/Data/hidream_o1_dev_2604_q6p.ckpt"
+private let imatrixPath = "/home/liu/workspace/s4nnc/qwen36_27b_ud_q4_k_xl_tensor_imatrix.csv"
+private let inputPath = "/slow/Data/qwen_3.6_27b_mtp_f16.ckpt"
+private let outputPath = "/fast/Data/qwen_3.6_27b_mtp_i8x.ckpt"
 
 private struct QuantizationEntry {
   let format: String
@@ -132,6 +132,8 @@ private func csvQuantizationKey(for key: String) -> String? {
 }
 
 private func codec(for format: String) -> DynamicGraph.Store.Codec? {
+  return nil
+  /*
   switch format {
   case "Q5_K":
     return [.i8x(.q5k), .ezm7]
@@ -156,6 +158,7 @@ private func codec(for format: String) -> DynamicGraph.Store.Codec? {
   default:
     return nil
   }
+  */
 }
 
 graph.openStore(
@@ -271,12 +274,12 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7], imatrix: imatrix)
+          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
         } else {
-          $0.write(key, tensor: tensor, codec: [.q6p, .ezm7], imatrix: imatrix)
+          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
         }
       } else if shape.count == 4 && n > 1 {
-        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7], imatrix: imatrix)
+        $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
       } else {
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }

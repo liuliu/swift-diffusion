@@ -312,6 +312,14 @@ swift_binary(
 )
 
 swift_binary(
+    name = "trailerstore",
+    srcs = ["trailerstore/main.swift"],
+    deps = [
+        "@s4nnc//nnc",
+    ],
+)
+
+swift_binary(
     name = "lora_training",
     srcs = ["lora_training/main.swift"],
     data = [
@@ -1183,6 +1191,21 @@ swift_binary(
 swift_binary(
     name = "flux2",
     srcs = ["flux2/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
+    name = "ideogram4",
+    srcs = ["ideogram4/main.swift"],
     data = [
     ],
     deps = [
