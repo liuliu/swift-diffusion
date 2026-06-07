@@ -192,6 +192,15 @@ builtins.exec(
           w = w * state_dict[scale_key].to(dtype).view(-1, 1)
       return w.float().view(heads, 2, head_dim // 2, -1).transpose(1, 2).cpu().numpy()
 
+  def dequant_interleaved_qkv_slice_np(state_dict, key, start, heads, head_dim, dtype_name):
+      dtype = ref_dtype(dtype_name)
+      w = state_dict[key].to(dtype)
+      scale_key = key[:-7] + ".weight_scale" if key.endswith(".weight") else key + "_scale"
+      if scale_key in state_dict:
+          w = w * state_dict[scale_key].to(dtype).view(-1, 1)
+      w = w[start:start + heads * head_dim]
+      return w.float().view(heads, 2, head_dim // 2, -1).transpose(1, 2).cpu().numpy()
+
   def interleaved_qk_norm_np(state_dict, key, head_dim):
       return state_dict[key].float().view(2, head_dim // 2).transpose(0, 1).cpu().numpy()
 
@@ -540,28 +549,6 @@ builtins.exec(
       if text_len:
           indicator[:, :text_len] = LLM_TOKEN_INDICATOR
       t = torch.full((1,), float(t_value), dtype=torch.float32, device=device)
-      with torch.no_grad():
-          param_dtype = getattr(model.input_proj, "compute_dtype", None) or model.input_proj.weight.dtype
-          x_model = x.to(param_dtype)
-          t_model = t.to(param_dtype)
-          llm_model = llm_features.to(param_dtype)
-          llm_token_mask = (indicator == LLM_TOKEN_INDICATOR).to(x_model.dtype).unsqueeze(-1)
-          output_image_mask = (indicator == OUTPUT_IMAGE_INDICATOR).to(x_model.dtype).unsqueeze(-1)
-          llm_model = llm_model * llm_token_mask
-          x_model = x_model * output_image_mask
-          x_model = model.input_proj(x_model) * output_image_mask
-          t_cond = model.t_embedding(t_model)
-          if t.dim() == 1:
-              t_cond = t_cond.unsqueeze(1)
-          adaln_input = F.silu(model.adaln_proj(t_cond))
-          llm_model = model.llm_cond_proj(model.llm_cond_norm(llm_model)) * llm_token_mask
-          h = x_model + llm_model
-          h = h + model.embed_image_indicator((indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long))
-          stem = h.clone()
-          cos, sin = model.rotary_emb(position_ids)
-          cos = cos.to(h.dtype)
-          sin = sin.to(h.dtype)
-          layer0 = model.layers[0](h, segment_ids=segment_ids, cos=cos, sin=sin, adaln_input=adaln_input)
       out = model(
           llm_features=llm_features,
           x=x,
@@ -573,60 +560,7 @@ builtins.exec(
       return {
           "text_features": text_features[0].float().cpu().numpy(),
           "x_image": x_image[0].float().cpu().numpy(),
-          "position_ids": position_ids[0].cpu().numpy(),
-          "indicator": (indicator[0] == OUTPUT_IMAGE_INDICATOR).long().cpu().numpy(),
-          "stem": stem[0].float().cpu().numpy(),
-          "layer0": layer0[0].float().cpu().numpy(),
           "reference": out[0, text_len:].float().cpu().numpy(),
-      }
-
-  def run_transformer_prefix_case(model, text_len, grid_h, grid_w, t_value, layers_to_run, device_index, dtype_name):
-      dtype = ref_dtype(dtype_name)
-      device = torch.device(f"cuda:{device_index}")
-      torch.manual_seed(1234 + text_len * 17 + grid_h * 31 + grid_w)
-      image_len = grid_h * grid_w
-      total = text_len + image_len
-      text_features = torch.randn((1, text_len, 53248), dtype=torch.float32, device=device) * 0.01
-      x_image = torch.randn((1, image_len, 128), dtype=torch.float32, device=device)
-      llm_features = torch.zeros((1, total, 53248), dtype=torch.float32, device=device)
-      x = torch.zeros((1, total, 128), dtype=torch.float32, device=device)
-      if text_len:
-          llm_features[:, :text_len] = text_features
-      x[:, text_len:] = x_image
-      position_ids = make_position_ids(text_len, grid_h, grid_w).to(device)
-      segment_ids = torch.ones((1, total), dtype=torch.long, device=device)
-      indicator = torch.full((1, total), OUTPUT_IMAGE_INDICATOR, dtype=torch.long, device=device)
-      if text_len:
-          indicator[:, :text_len] = LLM_TOKEN_INDICATOR
-      t = torch.full((1,), float(t_value), dtype=torch.float32, device=device)
-      with torch.no_grad():
-          param_dtype = getattr(model.input_proj, "compute_dtype", None) or model.input_proj.weight.dtype
-          x_model = x.to(param_dtype)
-          t_model = t.to(param_dtype)
-          llm_model = llm_features.to(param_dtype)
-          llm_token_mask = (indicator == LLM_TOKEN_INDICATOR).to(x_model.dtype).unsqueeze(-1)
-          output_image_mask = (indicator == OUTPUT_IMAGE_INDICATOR).to(x_model.dtype).unsqueeze(-1)
-          llm_model = llm_model * llm_token_mask
-          x_model = x_model * output_image_mask
-          x_model = model.input_proj(x_model) * output_image_mask
-          t_cond = model.t_embedding(t_model)
-          if t.dim() == 1:
-              t_cond = t_cond.unsqueeze(1)
-          adaln_input = F.silu(model.adaln_proj(t_cond))
-          llm_model = model.llm_cond_proj(model.llm_cond_norm(llm_model)) * llm_token_mask
-          h = x_model + llm_model
-          h = h + model.embed_image_indicator((indicator == OUTPUT_IMAGE_INDICATOR).to(torch.long))
-          if layers_to_run > 0:
-              cos, sin = model.rotary_emb(position_ids)
-              cos = cos.to(h.dtype)
-              sin = sin.to(h.dtype)
-              for layer in model.layers[:layers_to_run]:
-                  h = layer(h, segment_ids=segment_ids, cos=cos, sin=sin, adaln_input=adaln_input)
-      return {
-          "text_features": text_features[0].float().cpu().numpy(),
-          "x_image": x_image[0].float().cpu().numpy(),
-          "indicator": (indicator[0] == OUTPUT_IMAGE_INDICATOR).long().cpu().numpy(),
-          "reference": h[0].float().cpu().numpy(),
       }
   """#,
   helper.__dict__)
@@ -724,13 +658,6 @@ func dequantWeight(_ stateDict: PythonObject, _ key: String) -> Tensor<Float> {
   tensorFromPython(helper.dequant_weight_np(stateDict, key, dtypeName))
 }
 
-func dequantInterleavedQKWeight(
-  _ stateDict: PythonObject, _ key: String, heads: Int, headDim: Int
-) -> Tensor<Float> {
-  tensorFromPython(
-    helper.dequant_interleaved_qk_weight_np(stateDict, key, heads, headDim, dtypeName))
-}
-
 func dequantTextWeight(_ stateDict: PythonObject, _ key: String) -> Tensor<Float> {
   tensorFromPython(helper.dequant_weight_np(stateDict, key, textDtypeName))
 }
@@ -740,6 +667,13 @@ func dequantTextInterleavedQKWeight(
 ) -> Tensor<Float> {
   tensorFromPython(
     helper.dequant_interleaved_qk_weight_np(stateDict, key, heads, headDim, textDtypeName))
+}
+
+func dequantInterleavedQKVSlice(
+  _ stateDict: PythonObject, _ key: String, start: Int, heads: Int, headDim: Int
+) -> Tensor<Float> {
+  tensorFromPython(
+    helper.dequant_interleaved_qkv_slice_np(stateDict, key, start, heads, headDim, dtypeName))
 }
 
 func interleavedQKNorm(_ stateDict: PythonObject, _ key: String, headDim: Int) -> Tensor<Float> {
@@ -807,23 +741,18 @@ func mropeAngles(position: (Int, Int, Int), headDim: Int, theta: Double = 5_000_
   return angles
 }
 
-func makeRotary(positionIDs: [(Int, Int, Int)], headDim: Int) -> (Tensor<Float>, Tensor<Float>) {
+func makeRotary(positionIDs: [(Int, Int, Int)], headDim: Int) -> Tensor<Float> {
   let tokenLength = positionIDs.count
   let half = headDim / 2
-  var cosTensor = Tensor<Float>(.CPU, .NHWC(1, tokenLength, 1, headDim))
-  var sinTensor = Tensor<Float>(.CPU, .NHWC(1, tokenLength, 1, headDim))
+  var rotary = Tensor<Float>(.CPU, .NHWC(1, tokenLength, 1, headDim))
   for i in 0..<tokenLength {
     let angles = mropeAngles(position: positionIDs[i], headDim: headDim)
     for k in 0..<half {
-      let c = Float(cos(angles[k]))
-      let s = Float(sin(angles[k]))
-      cosTensor[0, i, 0, k] = c
-      cosTensor[0, i, 0, k + half] = c
-      sinTensor[0, i, 0, k] = s
-      sinTensor[0, i, 0, k + half] = s
+      rotary[0, i, 0, k * 2] = Float(cos(angles[k]))
+      rotary[0, i, 0, k * 2 + 1] = Float(sin(angles[k]))
     }
   }
-  return (cosTensor, sinTensor)
+  return rotary
 }
 
 func makeQwenTextRotary(tokenLength: Int) -> Tensor<Float> {
@@ -839,9 +768,7 @@ func makeQwenTextRotary(tokenLength: Int) -> Tensor<Float> {
   return rotary
 }
 
-func makeIdeogramRotary(textLength: Int, gridHeight: Int, gridWidth: Int) -> (
-  Tensor<Float>, Tensor<Float>
-) {
+func makeIdeogramRotary(textLength: Int, gridHeight: Int, gridWidth: Int) -> Tensor<Float> {
   var positions = [(Int, Int, Int)]()
   for i in 0..<textLength {
     positions.append((i, i, i))
@@ -854,20 +781,17 @@ func makeIdeogramRotary(textLength: Int, gridHeight: Int, gridWidth: Int) -> (
   return makeRotary(positionIDs: positions, headDim: 256)
 }
 
-func applyRotaryHalf(
-  _ x: Model.IO, cos: Model.IO, sin: Model.IO, tokenLength: Int, heads: Int, headDim: Int
-) -> Model.IO {
-  let halfDim = headDim / 2
-  let firstHalf = x.reshaped(
-    [1, tokenLength, heads, halfDim], offset: [0, 0, 0, 0],
-    strides: [tokenLength * heads * headDim, heads * headDim, headDim, 1]
-  ).copied()
-  let secondHalf = x.reshaped(
-    [1, tokenLength, heads, halfDim], offset: [0, 0, 0, halfDim],
-    strides: [tokenLength * heads * headDim, heads * headDim, headDim, 1]
-  ).copied()
-  let rotated = Functional.concat(axis: 3, (-secondHalf).copied(), firstHalf).copied()
-  return x .* cos + rotated .* sin
+func makeIdeogramIndicatorEmbedding(
+  _ embedding: Tensor<Float>, textLength: Int, imageLength: Int
+) -> Tensor<Float> {
+  var out = Tensor<Float>(.CPU, .WC(textLength + imageLength, 4_608))
+  for i in 0..<(textLength + imageLength) {
+    let row = i < textLength ? 0 : 1
+    for j in 0..<4_608 {
+      out[i, j] = embedding[row, j]
+    }
+  }
+  return out
 }
 
 func SelfAttention(prefix: String, width: Int, k: Int, h: Int, hk: Int, b: Int, t: Int) -> (
@@ -1038,8 +962,7 @@ func QwenTextFeatures(tokenLength: Int) -> (Model, (PythonObject) -> Void) {
 
 func Ideogram4Attention(prefix: String, tokenLength: Int) -> (Model, (PythonObject) -> Void) {
   let x = Input()
-  let rotCos = Input()
-  let rotSin = Input()
+  let rot = Input()
   let q = Dense(count: 4_608, noBias: true, name: "q")
   let k = Dense(count: 4_608, noBias: true, name: "k")
   let v = Dense(count: 4_608, noBias: true, name: "v")
@@ -1050,10 +973,8 @@ func Ideogram4Attention(prefix: String, tokenLength: Int) -> (Model, (PythonObje
   let normK = RMSNorm(epsilon: 1e-5, axis: [3], name: "norm_k")
   keys = normK(keys)
   let values = v(x).reshaped([1, tokenLength, 18, 256])
-  queries = applyRotaryHalf(
-    queries, cos: rotCos, sin: rotSin, tokenLength: tokenLength, heads: 18, headDim: 256)
-  keys = applyRotaryHalf(
-    keys, cos: rotCos, sin: rotSin, tokenLength: tokenLength, heads: 18, headDim: 256)
+  queries = Functional.cmul(left: queries, right: rot)
+  keys = Functional.cmul(left: keys, right: rot)
   keys = keys.permuted(0, 2, 1, 3)
   queries = ((1.0 / Float(256).squareRoot()) * queries).permuted(0, 2, 1, 3)
   let attentionValues = values.permuted(0, 2, 1, 3)
@@ -1067,19 +988,27 @@ func Ideogram4Attention(prefix: String, tokenLength: Int) -> (Model, (PythonObje
   out = o(out)
   let reader: (PythonObject) -> Void = { stateDict in
     let qkv = dequantWeight(stateDict, "\(prefix).attention.qkv.weight")
-    q.weight.copy(from: Tensor<FloatType>(from: qkv[0..<4_608, 0..<4_608]))
-    k.weight.copy(from: Tensor<FloatType>(from: qkv[4_608..<(4_608 * 2), 0..<4_608]))
+    q.weight.copy(
+      from: Tensor<FloatType>(
+        from: dequantInterleavedQKVSlice(
+          stateDict, "\(prefix).attention.qkv.weight", start: 0, heads: 18, headDim: 256)))
+    k.weight.copy(
+      from: Tensor<FloatType>(
+        from: dequantInterleavedQKVSlice(
+          stateDict, "\(prefix).attention.qkv.weight", start: 4_608, heads: 18, headDim: 256)))
     v.weight.copy(from: Tensor<FloatType>(from: qkv[(4_608 * 2)..<(4_608 * 3), 0..<4_608]))
     q.weight.to(.unifiedMemory)
     k.weight.to(.unifiedMemory)
     v.weight.to(.unifiedMemory)
     copyDenseWeight(o, stateDict, "\(prefix).attention.o.weight")
     normQ.weight.copy(
-      from: Tensor<FloatType>(from: tensorValue(stateDict, "\(prefix).attention.norm_q.weight")))
+      from: Tensor<FloatType>(
+        from: interleavedQKNorm(stateDict, "\(prefix).attention.norm_q.weight", headDim: 256)))
     normK.weight.copy(
-      from: Tensor<FloatType>(from: tensorValue(stateDict, "\(prefix).attention.norm_k.weight")))
+      from: Tensor<FloatType>(
+        from: interleavedQKNorm(stateDict, "\(prefix).attention.norm_k.weight", headDim: 256)))
   }
-  return (Model([x, rotCos, rotSin], [out]), reader)
+  return (Model([x, rot], [out]), reader)
 }
 
 func Ideogram4MLP(prefix: String) -> (Model, (PythonObject) -> Void) {
@@ -1098,21 +1027,19 @@ func Ideogram4MLP(prefix: String) -> (Model, (PythonObject) -> Void) {
 
 func Ideogram4Block(prefix: String, tokenLength: Int) -> (Model, (PythonObject) -> Void) {
   let x = Input()
-  let rotCos = Input()
-  let rotSin = Input()
+  let rot = Input()
   let adaln = Input()
-  let modulation = Dense(count: 4 * 4_608, name: "adaln_modulation")
-  let mod = modulation(adaln)
-  let scaleMSA = 1 + mod.reshaped([1, 4_608], offset: [0, 0], strides: [4 * 4_608, 1])
-  let gateMSA = mod.reshaped([1, 4_608], offset: [0, 4_608], strides: [4 * 4_608, 1]).tanh()
-  let scaleMLP = 1 + mod.reshaped([1, 4_608], offset: [0, 4_608 * 2], strides: [4 * 4_608, 1])
-  let gateMLP = mod.reshaped([1, 4_608], offset: [0, 4_608 * 3], strides: [4 * 4_608, 1]).tanh()
+  let adaLNs = (0..<4).map { Dense(count: 4_608, name: "ada_ln_\($0)") }
+  let scaleMSA = 1 + adaLNs[0](adaln)
+  let gateMSA = adaLNs[1](adaln).tanh()
+  let scaleMLP = 1 + adaLNs[2](adaln)
+  let gateMLP = adaLNs[3](adaln).tanh()
 
   let attentionNorm1 = RMSNorm(epsilon: 1e-5, axis: [1], name: "attention_norm1")
   let attnIn = (attentionNorm1(x) .* scaleMSA).to(FloatType.dataType)
   let (attention, attentionReader) = Ideogram4Attention(prefix: prefix, tokenLength: tokenLength)
   let attentionNorm2 = RMSNorm(epsilon: 1e-5, axis: [1], name: "attention_norm2")
-  var out = x + gateMSA.to(of: x) .* attentionNorm2(attention(attnIn, rotCos, rotSin)).to(of: x)
+  var out = x + gateMSA.to(of: x) .* attentionNorm2(attention(attnIn, rot)).to(of: x)
   let ffnNorm1 = RMSNorm(epsilon: 1e-5, axis: [1], name: "ffn_norm1")
   let (mlp, mlpReader) = Ideogram4MLP(prefix: prefix)
   let ffnNorm2 = RMSNorm(epsilon: 1e-5, axis: [1], name: "ffn_norm2")
@@ -1121,9 +1048,15 @@ func Ideogram4Block(prefix: String, tokenLength: Int) -> (Model, (PythonObject) 
     + gateMLP.to(of: out)
     .* ffnNorm2(mlp((ffnNorm1(out) .* scaleMLP).to(FloatType.dataType))).to(of: out)
   let reader: (PythonObject) -> Void = { stateDict in
-    copyDense(
-      modulation, stateDict, weight: "\(prefix).adaln_modulation.weight",
-      bias: "\(prefix).adaln_modulation.bias")
+    let adalnWeight = dequantWeight(stateDict, "\(prefix).adaln_modulation.weight")
+    let adalnBias = tensorValue(stateDict, "\(prefix).adaln_modulation.bias")
+    for (i, adaLN) in adaLNs.enumerated() {
+      adaLN.weight.copy(
+        from: Tensor<FloatType>(
+          from: adalnWeight[(4_608 * i)..<(4_608 * (i + 1)), 0..<512]))
+      adaLN.bias.copy(from: Tensor<FloatType>(from: adalnBias[(4_608 * i)..<(4_608 * (i + 1))]))
+      adaLN.weight.to(.unifiedMemory)
+    }
     attentionReader(stateDict)
     mlpReader(stateDict)
     attentionNorm1.weight.copy(
@@ -1135,28 +1068,21 @@ func Ideogram4Block(prefix: String, tokenLength: Int) -> (Model, (PythonObject) 
     ffnNorm2.weight.copy(
       from: Tensor<FloatType>(from: tensorValue(stateDict, "\(prefix).ffn_norm2.weight")))
   }
-  return (Model([x, rotCos, rotSin, adaln], [out]), reader)
+  return (Model([x, rot, adaln], [out]), reader)
 }
 
-func Ideogram4Transformer(
-  textLength: Int, imageLength: Int, layersToRun: Int = 34, outputHidden: Bool = false
-) -> (Model, (PythonObject) -> Void) {
-  let usesAdaln = layersToRun > 0 || !outputHidden
-  let usesRotary = layersToRun > 0
+func Ideogram4Transformer(textLength: Int, imageLength: Int) -> (Model, (PythonObject) -> Void) {
+  let tokenLength = textLength + imageLength
   let xImage = Input()
   let textFeatures: Input? = textLength > 0 ? Input() : nil
-  let indicator = Input()
-  let rotCos: Input? = usesRotary ? Input() : nil
-  let rotSin: Input? = usesRotary ? Input() : nil
-  let tEmbed: Input? = usesAdaln ? Input() : nil
+  let indicatorEmbedding = Input()
+  let rot = Input()
+  let tEmbed = Input()
   let inputProj = Dense(count: 4_608, name: "input_proj")
   let imageOut = inputProj(xImage)
   let llmNorm = RMSNorm(epsilon: 1e-6, axis: [1], name: "llm_cond_norm")
   let llmProj = Dense(count: 4_608, name: "llm_cond_proj")
-  let indicatorEmbed = Embedding(
-    FloatType.self, vocabularySize: 2, embeddingSize: 4_608, name: "embed_image_indicator")
 
-  let tokenLength = textLength + imageLength
   var out: Model.IO
   if let textFeatures {
     let textOut = llmProj(llmNorm(textFeatures).to(FloatType.dataType))
@@ -1164,53 +1090,27 @@ func Ideogram4Transformer(
   } else {
     out = imageOut
   }
-  out = (out + indicatorEmbed(indicator)).to(FloatType.dataType)
+  out = (out + indicatorEmbedding).to(FloatType.dataType)
 
-  let tMlpIn: Model?
-  let tMlpOut: Model?
-  let adalnProj: Model?
-  let adaln: Model.IO?
-  if let tEmbed {
-    let mlpIn = Dense(count: 4_608, name: "t_embedding_mlp_in")
-    let mlpOut = Dense(count: 4_608, name: "t_embedding_mlp_out")
-    let proj = Dense(count: 512, name: "adaln_proj")
-    tMlpIn = mlpIn
-    tMlpOut = mlpOut
-    adalnProj = proj
-    adaln = proj(mlpOut(mlpIn(tEmbed).swish())).swish()
-  } else {
-    tMlpIn = nil
-    tMlpOut = nil
-    adalnProj = nil
-    adaln = nil
-  }
+  let tMlpIn = Dense(count: 4_608, name: "t_embedding_mlp_in")
+  let tMlpOut = Dense(count: 4_608, name: "t_embedding_mlp_out")
+  let adalnProj = Dense(count: 512, name: "adaln_proj")
+  let adaln = adalnProj(tMlpOut(tMlpIn(tEmbed).swish())).swish()
 
   var readers = [(PythonObject) -> Void]()
-  for i in 0..<layersToRun {
+  for i in 0..<34 {
     let (block, reader) = Ideogram4Block(prefix: "layers.\(i)", tokenLength: tokenLength)
-    out = block(out, rotCos!, rotSin!, adaln!)
+    out = block(out, rot, adaln)
     readers.append(reader)
   }
 
-  let finalAdaln: Model?
-  let finalLinear: Model?
-  let modelOutput: Model.IO
-  if outputHidden {
-    finalAdaln = nil
-    finalLinear = nil
-    modelOutput = out.to(.Float32)
-  } else {
-    let norm = LayerNorm(epsilon: 1e-6, axis: [1], elementwiseAffine: false)
-    let finalAdalnLayer = Dense(count: 4_608, name: "final_adaln")
-    let linear = Dense(count: 128, name: "final_linear")
-    out = linear((norm(out) .* (1 + finalAdalnLayer(adaln!.swish()))).to(FloatType.dataType)).to(
-      .Float32)
-    modelOutput = out.reshaped(
-      [imageLength, 128], offset: [textLength, 0], strides: [128, 1]
-    ).copied()
-    finalAdaln = finalAdalnLayer
-    finalLinear = linear
-  }
+  let norm = LayerNorm(epsilon: 1e-6, axis: [1], elementwiseAffine: false)
+  let finalAdaln = Dense(count: 4_608, name: "final_ada_ln")
+  let finalLinear = Dense(count: 128, name: "final_linear")
+  out = finalLinear((norm(out) .* (1 + finalAdaln(adaln.swish()))).to(FloatType.dataType)).to(
+    .Float32)
+  let modelOutput = out.reshaped([imageLength, 128], offset: [textLength, 0], strides: [128, 1])
+    .copied()
 
   let reader: (PythonObject) -> Void = { stateDict in
     copyDense(inputProj, stateDict, weight: "input_proj.weight", bias: "input_proj.bias")
@@ -1219,39 +1119,25 @@ func Ideogram4Transformer(
       llmNorm.weight.copy(
         from: Tensor<FloatType>(from: tensorValue(stateDict, "llm_cond_norm.weight")))
     }
-    indicatorEmbed.parameters.copy(
-      from: Tensor<FloatType>(from: tensorValue(stateDict, "embed_image_indicator.weight")))
-    indicatorEmbed.parameters.to(.unifiedMemory)
-    if let tMlpIn, let tMlpOut, let adalnProj {
-      copyDense(
-        tMlpIn, stateDict, weight: "t_embedding.mlp_in.weight", bias: "t_embedding.mlp_in.bias")
-      copyDense(
-        tMlpOut, stateDict, weight: "t_embedding.mlp_out.weight", bias: "t_embedding.mlp_out.bias")
-      copyDense(adalnProj, stateDict, weight: "adaln_proj.weight", bias: "adaln_proj.bias")
-    }
+    copyDense(
+      tMlpIn, stateDict, weight: "t_embedding.mlp_in.weight", bias: "t_embedding.mlp_in.bias")
+    copyDense(
+      tMlpOut, stateDict, weight: "t_embedding.mlp_out.weight", bias: "t_embedding.mlp_out.bias")
+    copyDense(adalnProj, stateDict, weight: "adaln_proj.weight", bias: "adaln_proj.bias")
     for reader in readers {
       reader(stateDict)
     }
-    if let finalAdaln, let finalLinear {
-      copyDense(
-        finalAdaln, stateDict, weight: "final_layer.adaln_modulation.weight",
-        bias: "final_layer.adaln_modulation.bias")
-      copyDense(
-        finalLinear, stateDict, weight: "final_layer.linear.weight", bias: "final_layer.linear.bias"
-      )
-    }
+    copyDense(
+      finalAdaln, stateDict, weight: "final_layer.adaln_modulation.weight",
+      bias: "final_layer.adaln_modulation.bias")
+    copyDense(
+      finalLinear, stateDict, weight: "final_layer.linear.weight", bias: "final_layer.linear.bias")
   }
   var inputs: [Model.IO] = [xImage]
   if let textFeatures {
     inputs.append(textFeatures)
   }
-  inputs.append(indicator)
-  if let rotCos, let rotSin {
-    inputs += [rotCos, rotSin]
-  }
-  if let tEmbed {
-    inputs.append(tEmbed)
-  }
+  inputs += [indicatorEmbedding, rot, tEmbed]
   return (Model(inputs, [modelOutput]), reader)
 }
 
@@ -1356,23 +1242,22 @@ func runTransformerParity(subfolder: String, textLength: Int) -> Bool {
   let xImageCPU = tensorFromPython(testCase["x_image"])
   let textFeaturesCPU = tensorFromPython(testCase["text_features"])
   let reference = tensorFromPython(testCase["reference"])
-  let indicatorCPU = try! Tensor<Int32>(numpy: testCase["indicator"].astype(numpy.int32))
-  let (cosCPU, sinCPU) = makeIdeogramRotary(
+  let rotCPU = makeIdeogramRotary(
     textLength: textLength, gridHeight: ditGridHeight, gridWidth: ditGridWidth)
   let tEmbedCPU = ideogramTimestepEmbedding(ditTimestep)
   let stateDict = pack["state_dict"]
+  let indicatorEmbeddingCPU = makeIdeogramIndicatorEmbedding(
+    tensorValue(stateDict, "embed_image_indicator.weight"), textLength: textLength,
+    imageLength: imageLength)
 
   return graph.withNoGrad {
     let xImage = graph.variable(Tensor<FloatType>(from: xImageCPU).toGPU(deviceID))
       .reshaped(.WC(imageLength, 128))
-    let indicator = graph.variable(
-      .CPU, format: .NHWC, shape: [textLength + imageLength], of: Int32.self)
-    for i in 0..<(textLength + imageLength) {
-      indicator[i] = indicatorCPU[i]
-    }
-    let indicatorGPU = indicator.toGPU(deviceID)
-    let cosGPU = graph.variable(Tensor<FloatType>(from: cosCPU).toGPU(deviceID))
-    let sinGPU = graph.variable(Tensor<FloatType>(from: sinCPU).toGPU(deviceID))
+    let indicatorEmbedding = graph.variable(
+      Tensor<FloatType>(from: indicatorEmbeddingCPU).toGPU(deviceID)
+    )
+    .reshaped(.WC(textLength + imageLength, 4_608))
+    let rotGPU = graph.variable(Tensor<FloatType>(from: rotCPU).toGPU(deviceID))
     let tEmbedGPU = graph.variable(Tensor<FloatType>(from: tEmbedCPU).toGPU(deviceID))
       .reshaped(.WC(1, 4_608))
     let (model, reader) = Ideogram4Transformer(textLength: textLength, imageLength: imageLength)
@@ -1380,10 +1265,10 @@ func runTransformerParity(subfolder: String, textLength: Int) -> Bool {
     if textLength > 0 {
       let textFeatures = graph.variable(Tensor<FloatType>(from: textFeaturesCPU).toGPU(deviceID))
         .reshaped(.WC(textLength, 53_248))
-      model.compile(inputs: xImage, textFeatures, indicatorGPU, cosGPU, sinGPU, tEmbedGPU)
+      model.compile(inputs: xImage, textFeatures, indicatorEmbedding, rotGPU, tEmbedGPU)
       reader(stateDict)
       let swift = copiedToCPU(
-        model(inputs: xImage, textFeatures, indicatorGPU, cosGPU, sinGPU, tEmbedGPU)[0].as(
+        model(inputs: xImage, textFeatures, indicatorEmbedding, rotGPU, tEmbedGPU)[0].as(
           of: Float.self))
       print("ideogram4 \(label) shape:", swift.shape, reference.shape)
       let maxAbs = maxAbsDiff2D(swift, reference)
@@ -1392,92 +1277,13 @@ func runTransformerParity(subfolder: String, textLength: Int) -> Bool {
       print("ideogram4 \(label) max rel diff:", maxRel)
       return maxAbs < 0.08 && maxRel < 0.02
     } else {
-      model.compile(inputs: xImage, indicatorGPU, cosGPU, sinGPU, tEmbedGPU)
+      model.compile(inputs: xImage, indicatorEmbedding, rotGPU, tEmbedGPU)
       reader(stateDict)
       let swift = copiedToCPU(
-        model(inputs: xImage, indicatorGPU, cosGPU, sinGPU, tEmbedGPU)[0].as(of: Float.self))
+        model(inputs: xImage, indicatorEmbedding, rotGPU, tEmbedGPU)[0].as(of: Float.self))
       print("ideogram4 \(label) shape:", swift.shape, reference.shape)
       let maxAbs = maxAbsDiff2D(swift, reference)
       let maxRel = maxRelativeDiff2D(swift, reference)
-      print("ideogram4 \(label) max abs diff:", maxAbs)
-      print("ideogram4 \(label) max rel diff:", maxRel)
-      return maxAbs < 0.08 && maxRel < 0.02
-    }
-  }
-}
-
-func runTransformerPrefixParity(subfolder: String, textLength: Int, layersToRun: Int) -> Bool {
-  let label = "\(subfolder) prefix \(layersToRun)"
-  print("ideogram4 \(label) parity: start")
-  let pack = helper.load_transformer_pack(modelRoot, subfolder, deviceID, dtypeName)
-  let testCase = helper.run_transformer_prefix_case(
-    pack["model"], textLength, ditGridHeight, ditGridWidth, ditTimestep, layersToRun, deviceID,
-    dtypeName)
-  pack["model"].to("cpu")
-  torch.cuda.empty_cache()
-
-  let imageLength = ditGridHeight * ditGridWidth
-  let xImageCPU = tensorFromPython(testCase["x_image"])
-  let textFeaturesCPU = tensorFromPython(testCase["text_features"])
-  let reference = tensorFromPython(testCase["reference"])
-  let indicatorCPU = try! Tensor<Int32>(numpy: testCase["indicator"].astype(numpy.int32))
-  let (cosCPU, sinCPU) = makeIdeogramRotary(
-    textLength: textLength, gridHeight: ditGridHeight, gridWidth: ditGridWidth)
-  let tEmbedCPU = ideogramTimestepEmbedding(ditTimestep)
-  let stateDict = pack["state_dict"]
-
-  return graph.withNoGrad {
-    let xImage = graph.variable(Tensor<FloatType>(from: xImageCPU).toGPU(deviceID))
-      .reshaped(.WC(imageLength, 128))
-    let indicator = graph.variable(
-      .CPU, format: .NHWC, shape: [textLength + imageLength], of: Int32.self)
-    for i in 0..<(textLength + imageLength) {
-      indicator[i] = indicatorCPU[i]
-    }
-    let indicatorGPU = indicator.toGPU(deviceID)
-    let cosGPU = graph.variable(Tensor<FloatType>(from: cosCPU).toGPU(deviceID))
-    let sinGPU = graph.variable(Tensor<FloatType>(from: sinCPU).toGPU(deviceID))
-    let tEmbedGPU = graph.variable(Tensor<FloatType>(from: tEmbedCPU).toGPU(deviceID))
-      .reshaped(.WC(1, 4_608))
-    let (model, reader) = Ideogram4Transformer(
-      textLength: textLength, imageLength: imageLength, layersToRun: layersToRun,
-      outputHidden: true)
-    model.maxConcurrency = .limit(1)
-    if textLength > 0 {
-      let textFeatures = graph.variable(Tensor<FloatType>(from: textFeaturesCPU).toGPU(deviceID))
-        .reshaped(.WC(textLength, 53_248))
-      if layersToRun > 0 {
-        model.compile(inputs: xImage, textFeatures, indicatorGPU, cosGPU, sinGPU, tEmbedGPU)
-      } else {
-        model.compile(inputs: xImage, textFeatures, indicatorGPU)
-      }
-      reader(stateDict)
-      let swiftOutput =
-        layersToRun > 0
-        ? model(inputs: xImage, textFeatures, indicatorGPU, cosGPU, sinGPU, tEmbedGPU)[0]
-        : model(inputs: xImage, textFeatures, indicatorGPU)[0]
-      let swift = copiedToCPU(swiftOutput.as(of: Float.self))
-      let maxAbs = maxAbsDiff2D(swift, reference)
-      let maxRel = maxRelativeDiff2D(swift, reference)
-      print("ideogram4 \(label) shape:", swift.shape, reference.shape)
-      print("ideogram4 \(label) max abs diff:", maxAbs)
-      print("ideogram4 \(label) max rel diff:", maxRel)
-      return maxAbs < 0.08 && maxRel < 0.02
-    } else {
-      if layersToRun > 0 {
-        model.compile(inputs: xImage, indicatorGPU, cosGPU, sinGPU, tEmbedGPU)
-      } else {
-        model.compile(inputs: xImage, indicatorGPU)
-      }
-      reader(stateDict)
-      let swiftOutput =
-        layersToRun > 0
-        ? model(inputs: xImage, indicatorGPU, cosGPU, sinGPU, tEmbedGPU)[0]
-        : model(inputs: xImage, indicatorGPU)[0]
-      let swift = copiedToCPU(swiftOutput.as(of: Float.self))
-      let maxAbs = maxAbsDiff2D(swift, reference)
-      let maxRel = maxRelativeDiff2D(swift, reference)
-      print("ideogram4 \(label) shape:", swift.shape, reference.shape)
       print("ideogram4 \(label) max abs diff:", maxAbs)
       print("ideogram4 \(label) max rel diff:", maxRel)
       return maxAbs < 0.08 && maxRel < 0.02
@@ -1512,27 +1318,9 @@ case "parity":
   requireParity(
     runTransformerParity(subfolder: "unconditional_transformer", textLength: 0),
     "Ideogram4 unconditional transformer parity failed")
-case "debug-transformer-prefix":
-  requireParity(
-    runTransformerPrefixParity(subfolder: "transformer", textLength: ditTextLength, layersToRun: 0),
-    "Ideogram4 transformer stem parity failed")
-  requireParity(
-    runTransformerPrefixParity(subfolder: "transformer", textLength: ditTextLength, layersToRun: 1),
-    "Ideogram4 transformer layer0 parity failed")
-case "debug-transformer-depth":
-  let layers = (env["IDEOGRAM4_DEBUG_LAYERS"] ?? "34").split(separator: ",").map {
-    Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 34
-  }
-  var allDepthsPassed = true
-  for layerCount in layers {
-    let depthPassed = runTransformerPrefixParity(
-      subfolder: "transformer", textLength: ditTextLength, layersToRun: layerCount)
-    allDepthsPassed = depthPassed && allDepthsPassed
-  }
-  requireParity(allDepthsPassed, "Ideogram4 transformer depth parity failed")
 default:
   print(
-    "Usage: ideogram4 [parity|parity-text|qwen-load-text|parity-transformer|debug-transformer-prefix|debug-transformer-depth]"
+    "Usage: ideogram4 [parity|parity-text|qwen-load-text|parity-transformer]"
   )
   exit(1)
 }
