@@ -3,9 +3,9 @@ import NNC
 
 let graph = DynamicGraph()
 
-private let imatrixPath = "/home/liu/workspace/s4nnc/qwen36_27b_ud_q4_k_xl_tensor_imatrix.csv"
-private let inputPath = "/slow/Data/qwen_3.6_27b_mtp_f16.ckpt"
-private let outputPath = "/fast/Data/qwen_3.6_27b_mtp_i8x.ckpt"
+private let imatrixPath = "/slow/Data/qwen_3.5_9b_ud_q5_k_xl_quantization.csv"
+private let inputPath = "/slow/Data/qwen_3.5_9b_f16.ckpt"  // qwen_3.6_27b_mtp_f16.ckpt"
+private let outputPath = "/slow/Data/qwen_3.5_9b_i5x.ckpt"  // qwen_3.6_27b_mtp_i8x.ckpt"
 
 private struct QuantizationEntry {
   let format: String
@@ -132,9 +132,9 @@ private func csvQuantizationKey(for key: String) -> String? {
 }
 
 private func codec(for format: String) -> DynamicGraph.Store.Codec? {
-  return nil
-  /*
   switch format {
+  case "Q6_K":
+    return [.i8x(.q6k), .ezm7]
   case "Q5_K":
     return [.i8x(.q5k), .ezm7]
   case "Q4_K":
@@ -158,7 +158,6 @@ private func codec(for format: String) -> DynamicGraph.Store.Codec? {
   default:
     return nil
   }
-  */
 }
 
 graph.openStore(
@@ -173,8 +172,7 @@ graph.openStore(
       guard let anyTensor = store.read(key) else { continue }
       guard anyTensor.dataType != .Float32 else {
         // If it is already in FP32, skip transcode to FP16. Only useful for UMT5 XXL / Wan v2.1 models.
-        let tensor = Tensor<Float16>(from: anyTensor).toCPU()
-        // let tensor = Tensor<Float32>(anyTensor).toCPU()
+        let tensor = Tensor<Float32>(anyTensor).toCPU()
         $0.write(key, tensor: tensor)
         continue
       }
@@ -194,7 +192,7 @@ graph.openStore(
       let shape = tensor.shape
       print("write \(key) \(tensor)")
       if key.contains("embedder") || key.contains("pos_embed") || key.contains("-linear-")
-        || key.contains("-linear_final-")
+        || key.contains("-linear_final-") || key.contains("-final_linear-")
         || key.contains("-proj_out-") || key.contains("-audio_proj_out-")
         || key.contains("_embeddings") || key.contains("register_tokens")
         || (key.contains("refiner_") && !key.contains("noise_refiner_")
@@ -205,7 +203,9 @@ graph.openStore(
         || key.contains("token_embedding")  // Anima related.
         || key.contains("positive_embedding")  // SeedVR2 related.
         || key.contains("negative_embedding")  // SeedVR2 related.
-        || key.contains("embed_tokens")  // Qwen 3.5 related.
+        || key.contains("indicator_embedding")  // Ideogram 4 related.
+        || key.contains("t_embedding")  // Ideogram 4 related.
+        // || key.contains("embed_tokens")  // Qwen 3.5 related.
         || key.contains("patch_embed")  // Qwen 3.5 related.
         || key.contains("linear_attn.conv1d.")  // Qwen 3.5 related.
       {

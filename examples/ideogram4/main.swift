@@ -20,6 +20,16 @@ let ditTextLength = Int(env["IDEOGRAM4_DIT_TEXT_TOKENS"] ?? "4") ?? 4
 let ditGridHeight = Int(env["IDEOGRAM4_DIT_GRID_H"] ?? "1") ?? 1
 let ditGridWidth = Int(env["IDEOGRAM4_DIT_GRID_W"] ?? "1") ?? 1
 let ditTimestep = Float(env["IDEOGRAM4_DIT_T"] ?? "0.75") ?? 0.75
+let exportTextTokenLength =
+  Int(env["IDEOGRAM4_EXPORT_TEXT_TOKENS"] ?? "\(textTokenLength)")
+  ?? textTokenLength
+let exportDiTTextLength = Int(env["IDEOGRAM4_EXPORT_DIT_TEXT_TOKENS"] ?? "64") ?? 64
+let exportDiTGridHeight = Int(env["IDEOGRAM4_EXPORT_DIT_GRID_H"] ?? "64") ?? 64
+let exportDiTGridWidth = Int(env["IDEOGRAM4_EXPORT_DIT_GRID_W"] ?? "64") ?? 64
+let textExportPath =
+  env["IDEOGRAM4_TEXT_EXPORT"]
+  ?? "/slow/Data/ideogram4_text_model_f16.ckpt"
+let ditExportPath = env["IDEOGRAM4_DIT_EXPORT"] ?? "/slow/Data/ideogram4_dit_f32.ckpt"
 let mode = CommandLine.arguments.dropFirst().first ?? "parity"
 
 let site = Python.import("site")
@@ -521,6 +531,9 @@ builtins.exec(
       load_fp8_state_dict(model, state_dict, device=device, dtype=dtype)
       model.eval()
       return {"model": model, "state_dict": state_dict}
+
+  def load_transformer_state(root, subfolder):
+      return load_file(f"{root}/{subfolder}/diffusion_pytorch_model.safetensors")
 
   def make_position_ids(text_len, grid_h, grid_w):
       image = []
@@ -1291,6 +1304,100 @@ func runTransformerParity(subfolder: String, textLength: Int) -> Bool {
   }
 }
 
+func exportTextModel() {
+  print("ideogram4 text export: start")
+  print("ideogram4 text export tokens:", exportTextTokenLength)
+  print("ideogram4 text export path:", textExportPath)
+  let stateDict = helper.load_ideogram_text_state(modelRoot)
+  let rotCPU = makeQwenTextRotary(tokenLength: exportTextTokenLength)
+  graph.withNoGrad {
+    let tokens = graph.variable(
+      .CPU, format: .NHWC, shape: [exportTextTokenLength], of: Int32.self)
+    for i in 0..<exportTextTokenLength {
+      tokens[i] = 0
+    }
+    let tokensGPU = tokens.toGPU(deviceID)
+    let rotGPU = graph.variable(Tensor<TextFloatType>(from: rotCPU).toGPU(deviceID))
+    let (model, reader) = QwenTextFeatures(tokenLength: exportTextTokenLength)
+    model.maxConcurrency = .limit(1)
+    model.compile(inputs: tokensGPU, rotGPU)
+    reader(stateDict)
+    graph.openStore(textExportPath) {
+      $0.write("text_model", model: model)
+    }
+  }
+  print("ideogram4 text export: done")
+}
+
+func exportTransformer(
+  subfolder: String, modelKey: String, textLength: Int, gridHeight: Int, gridWidth: Int,
+  outputPath: String, writeIndicatorEmbedding: Bool
+) {
+  print("ideogram4 \(subfolder) export: start")
+  print("ideogram4 \(subfolder) export key:", modelKey)
+  print("ideogram4 \(subfolder) export text tokens:", textLength)
+  print("ideogram4 \(subfolder) export grid:", gridHeight, gridWidth)
+  print("ideogram4 \(subfolder) export path:", outputPath)
+  let stateDict = helper.load_transformer_state(modelRoot, subfolder)
+  let imageLength = gridHeight * gridWidth
+  let rotCPU = makeIdeogramRotary(
+    textLength: textLength, gridHeight: gridHeight, gridWidth: gridWidth)
+  let tEmbedCPU = ideogramTimestepEmbedding(ditTimestep)
+  let indicatorEmbeddingCPU = tensorValue(stateDict, "embed_image_indicator.weight")
+
+  graph.withNoGrad {
+    let xImage = graph.variable(.GPU(deviceID), .WC(imageLength, 128), of: FloatType.self)
+    xImage.full(0)
+    let indicatorEmbedding = graph.variable(
+      Tensor<FloatType>(
+        from: makeIdeogramIndicatorEmbedding(
+          indicatorEmbeddingCPU, textLength: textLength, imageLength: imageLength)
+      ).toGPU(deviceID)
+    )
+    .reshaped(.WC(textLength + imageLength, 4_608))
+    let rotGPU = graph.variable(Tensor<FloatType>(from: rotCPU).toGPU(deviceID))
+    let tEmbedGPU = graph.variable(Tensor<FloatType>(from: tEmbedCPU).toGPU(deviceID))
+      .reshaped(.WC(1, 4_608))
+    let (model, reader) = Ideogram4Transformer(textLength: textLength, imageLength: imageLength)
+    model.maxConcurrency = .limit(1)
+    if textLength > 0 {
+      let textFeatures = graph.variable(
+        .GPU(deviceID), .WC(textLength, 53_248), of: FloatType.self)
+      textFeatures.full(0)
+      model.compile(inputs: xImage, textFeatures, indicatorEmbedding, rotGPU, tEmbedGPU)
+      reader(stateDict)
+      graph.openStore(outputPath) {
+        $0.write(modelKey, model: model)
+        if writeIndicatorEmbedding {
+          $0.write("indicator_embedding", tensor: Tensor<FloatType>(from: indicatorEmbeddingCPU))
+        }
+      }
+    } else {
+      model.compile(inputs: xImage, indicatorEmbedding, rotGPU, tEmbedGPU)
+      reader(stateDict)
+      graph.openStore(outputPath) {
+        $0.write(modelKey, model: model)
+        if writeIndicatorEmbedding {
+          $0.write("indicator_embedding", tensor: Tensor<FloatType>(from: indicatorEmbeddingCPU))
+        }
+      }
+    }
+  }
+  print("ideogram4 \(subfolder) export: done")
+}
+
+func exportDiTModels() {
+  print("ideogram4 dit export path:", ditExportPath)
+  exportTransformer(
+    subfolder: "transformer", modelKey: "dit", textLength: exportDiTTextLength,
+    gridHeight: exportDiTGridHeight, gridWidth: exportDiTGridWidth, outputPath: ditExportPath,
+    writeIndicatorEmbedding: true)
+  exportTransformer(
+    subfolder: "unconditional_transformer", modelKey: "unconditional_dit", textLength: 0,
+    gridHeight: exportDiTGridHeight, gridWidth: exportDiTGridWidth, outputPath: ditExportPath,
+    writeIndicatorEmbedding: false)
+}
+
 func requireParity(_ ok: Bool, _ message: String) {
   if !ok {
     print(message)
@@ -1310,6 +1417,13 @@ case "parity-transformer":
   requireParity(
     runTransformerParity(subfolder: "unconditional_transformer", textLength: 0),
     "Ideogram4 unconditional transformer parity failed")
+case "export-text":
+  exportTextModel()
+case "export-dit":
+  exportDiTModels()
+case "export":
+  exportTextModel()
+  exportDiTModels()
 case "parity":
   requireParity(runTextParity(), "Ideogram4 text parity failed")
   requireParity(
@@ -1320,7 +1434,7 @@ case "parity":
     "Ideogram4 unconditional transformer parity failed")
 default:
   print(
-    "Usage: ideogram4 [parity|parity-text|qwen-load-text|parity-transformer]"
+    "Usage: ideogram4 [parity|parity-text|qwen-load-text|parity-transformer|export-text|export-dit|export]"
   )
   exit(1)
 }
