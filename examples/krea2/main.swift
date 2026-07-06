@@ -754,6 +754,10 @@ func copyParameter(
   parameter.weight.copy(from: Tensor<FloatType>(from: value[row, 0..<value.shape[1]]))
 }
 
+func storeName(_ prefix: String, _ name: String) -> String {
+  prefix.isEmpty ? name : "\(prefix)_\(name)"
+}
+
 func timestepEmbedding(_ timestep: Float, batchSize: Int = 1) -> Tensor<Float> {
   var embedding = Tensor<Float>(.CPU, .HWC(batchSize, 1, Krea2Config.timestepEmbedDim))
   let half = Krea2Config.timestepEmbedDim / 2
@@ -827,13 +831,15 @@ func makeQwenTextRotary(tokenLength: Int) -> Tensor<Float> {
   return rotary
 }
 
-func Krea2SwiGLU(prefix: String, hiddenSize: Int, intermediateSize: Int) -> (
+func Krea2SwiGLU(
+  prefix: String, hiddenSize: Int, intermediateSize: Int, storePrefix: String = ""
+) -> (
   Model, (PythonObject) -> Void
 ) {
   let x = Input()
-  let gate = Dense(count: intermediateSize, noBias: true, name: "gate")
-  let up = Dense(count: intermediateSize, noBias: true, name: "up")
-  let down = Dense(count: hiddenSize, noBias: true, name: "down")
+  let gate = Dense(count: intermediateSize, noBias: true, name: storeName(storePrefix, "gate"))
+  let up = Dense(count: intermediateSize, noBias: true, name: storeName(storePrefix, "up"))
+  let down = Dense(count: hiddenSize, noBias: true, name: storeName(storePrefix, "down"))
   let out = down(gate(x).swish() .* up(x))
   let reader: (PythonObject) -> Void = { stateDict in
     copyDenseWeight(gate, stateDict, "\(prefix).gate.weight")
@@ -1036,20 +1042,24 @@ func KreaQwenTextFeatures(
 
 func Krea2Attention(
   prefix: String, hiddenSize: Int, heads: Int, keyValueHeads: Int, batchSize: Int,
-  tokenLength: Int, rotary: Bool
+  tokenLength: Int, rotary: Bool, storePrefix: String = ""
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let rot = rotary ? Input() : nil
   let headDim = hiddenSize / heads
-  let toQ = Dense(count: headDim * heads, noBias: true, name: "to_q")
-  let toK = Dense(count: headDim * keyValueHeads, noBias: true, name: "to_k")
-  let toV = Dense(count: headDim * keyValueHeads, noBias: true, name: "to_v")
-  let toGate = Dense(count: hiddenSize, noBias: true, name: "to_gate")
+  let toQ = Dense(count: headDim * heads, noBias: true, name: storeName(storePrefix, "to_q"))
+  let toK = Dense(
+    count: headDim * keyValueHeads, noBias: true, name: storeName(storePrefix, "to_k"))
+  let toV = Dense(
+    count: headDim * keyValueHeads, noBias: true, name: storeName(storePrefix, "to_v"))
+  let toGate = Dense(count: hiddenSize, noBias: true, name: storeName(storePrefix, "to_gate"))
   var queries = toQ(x).reshaped([batchSize, tokenLength, heads, headDim])
-  let normQ = RMSNorm(epsilon: Krea2Config.normEps, axis: [3], name: "norm_q")
+  let normQ = RMSNorm(
+    epsilon: Krea2Config.normEps, axis: [3], name: storeName(storePrefix, "norm_q"))
   queries = normQ(queries).to(FloatType.dataType)
   var keys = toK(x).reshaped([batchSize, tokenLength, keyValueHeads, headDim])
-  let normK = RMSNorm(epsilon: Krea2Config.normEps, axis: [3], name: "norm_k")
+  let normK = RMSNorm(
+    epsilon: Krea2Config.normEps, axis: [3], name: storeName(storePrefix, "norm_k"))
   keys = normK(keys).to(FloatType.dataType)
   let values = toV(x).reshaped([batchSize, tokenLength, keyValueHeads, headDim])
   if let rot {
@@ -1060,7 +1070,7 @@ func Krea2Attention(
     queries: queries, keys: keys, values: values, batchSize: batchSize, tokenLength: tokenLength,
     heads: heads, keyValueHeads: keyValueHeads, headDim: headDim)
   let gate = toGate(x).sigmoid()
-  let toOut = Dense(count: hiddenSize, noBias: true, name: "to_out")
+  let toOut = Dense(count: hiddenSize, noBias: true, name: storeName(storePrefix, "to_out"))
   let out = toOut(attention .* gate)
   let reader: (PythonObject) -> Void = { stateDict in
     copyDenseWeight(toQ, stateDict, "\(prefix).to_q.weight")
@@ -1077,20 +1087,25 @@ func Krea2Attention(
   return (Model([x], [out]), reader)
 }
 
-func Krea2TextFusionBlock(prefix: String, batchSize: Int, tokenLength: Int) -> (
+func Krea2TextFusionBlock(
+  prefix: String, batchSize: Int, tokenLength: Int, storePrefix: String
+) -> (
   Model, (PythonObject) -> Void
 ) {
   let x = Input()
-  let norm1 = RMSNorm(epsilon: Krea2Config.normEps, axis: [2], name: "norm1")
+  let norm1 = RMSNorm(
+    epsilon: Krea2Config.normEps, axis: [2], name: storeName(storePrefix, "norm1"))
   let (attention, attentionReader) = Krea2Attention(
     prefix: "\(prefix).attn", hiddenSize: Krea2Config.textHiddenSize,
     heads: Krea2Config.textAttentionHeads, keyValueHeads: Krea2Config.textKeyValueHeads,
-    batchSize: batchSize, tokenLength: tokenLength, rotary: false)
+    batchSize: batchSize, tokenLength: tokenLength, rotary: false,
+    storePrefix: storeName(storePrefix, "attn"))
   var out = x + attention(norm1(x).to(FloatType.dataType))
-  let norm2 = RMSNorm(epsilon: Krea2Config.normEps, axis: [2], name: "norm2")
+  let norm2 = RMSNorm(
+    epsilon: Krea2Config.normEps, axis: [2], name: storeName(storePrefix, "norm2"))
   let (ff, ffReader) = Krea2SwiGLU(
     prefix: "\(prefix).ff", hiddenSize: Krea2Config.textHiddenSize,
-    intermediateSize: Krea2Config.textIntermediateSize)
+    intermediateSize: Krea2Config.textIntermediateSize, storePrefix: storeName(storePrefix, "ff"))
   out = out + ff(norm2(out).to(FloatType.dataType))
   let reader: (PythonObject) -> Void = { stateDict in
     copyRMSNorm(norm1, stateDict, "\(prefix).norm1.weight")
@@ -1110,7 +1125,7 @@ func Krea2TextFusion(batchSize: Int, textLength: Int) -> (Model, (PythonObject) 
   for i in 0..<Krea2Config.textLayerwiseBlocks {
     let (block, reader) = Krea2TextFusionBlock(
       prefix: "text_fusion.layerwise_blocks.\(i)", batchSize: batchSize * textLength,
-      tokenLength: Krea2Config.textLayers)
+      tokenLength: Krea2Config.textLayers, storePrefix: "text_fusion_layerwise")
     out = block(out)
     readers.append(reader)
   }
@@ -1118,14 +1133,15 @@ func Krea2TextFusion(batchSize: Int, textLength: Int) -> (Model, (PythonObject) 
     batchSize, textLength, Krea2Config.textLayers, Krea2Config.textHiddenSize,
   ])
   .permuted(0, 1, 3, 2)
-  let projector = Dense(count: 1, noBias: true, name: "projector")
+  let projector = Dense(count: 1, noBias: true, name: "text_fusion_projector")
   out = out.reshaped([
     batchSize * textLength * Krea2Config.textHiddenSize, Krea2Config.textLayers,
   ])
   out = projector(out).reshaped([batchSize, textLength, Krea2Config.textHiddenSize])
   for i in 0..<Krea2Config.textRefinerBlocks {
     let (block, reader) = Krea2TextFusionBlock(
-      prefix: "text_fusion.refiner_blocks.\(i)", batchSize: batchSize, tokenLength: textLength)
+      prefix: "text_fusion.refiner_blocks.\(i)", batchSize: batchSize, tokenLength: textLength,
+      storePrefix: "text_fusion_refiner")
     out = block(out)
     readers.append(reader)
   }
