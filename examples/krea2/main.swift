@@ -14,7 +14,9 @@ setbuf(stdout, nil)
 let graph = DynamicGraph()
 graph.maxConcurrency = .limit(1)
 
-let modelRoot = "/slow/Data/Krea-2-Turbo"
+let mode = CommandLine.arguments.dropFirst().first ?? "parity-dit"
+let useRawModel = mode == "parity-dit-raw" || mode == "export-dit-raw"
+let modelRoot = useRawModel ? "/slow/Data/Krea-2-Raw" : "/slow/Data/Krea-2-Turbo"
 let deviceID = 0
 let ditReferenceDtype = "float32"
 let textReferenceDtype = "float16"
@@ -29,8 +31,8 @@ let exportTextLength = 256
 let exportGridHeight = 64
 let exportGridWidth = 64
 let textExportPath = "/slow/Data/krea2_turbo_text_model_f16.ckpt"
-let ditExportPath = "/slow/Data/krea2_turbo_dit_f32.ckpt"
-let mode = CommandLine.arguments.dropFirst().first ?? "parity-dit"
+let ditExportPath =
+  useRawModel ? "/slow/Data/krea_2_raw_f32.ckpt" : "/slow/Data/krea2_turbo_dit_f32.ckpt"
 
 enum Krea2Config {
   static let hiddenSize = 6_144
@@ -722,6 +724,20 @@ func copyDense(_ dense: Model, _ stateDict: PythonObject, weight: String, bias: 
   }
 }
 
+func copyDenseChunk(
+  _ dense: Model, _ stateDict: PythonObject, weight: String, bias: String, row: Int,
+  chunkSize: Int = Krea2Config.hiddenSize
+) {
+  let weightValue = tensorValue(stateDict, weight)
+  dense.weight.copy(
+    from: Tensor<FloatType>(
+      from: weightValue[(chunkSize * row)..<(chunkSize * (row + 1)), 0..<weightValue.shape[1]]))
+  dense.weight.to(.unifiedMemory)
+  let biasValue = tensorValue(stateDict, bias)
+  dense.bias.copy(
+    from: Tensor<FloatType>(from: biasValue[(chunkSize * row)..<(chunkSize * (row + 1))]))
+}
+
 func copyTextDenseWeight(_ dense: Model, _ stateDict: PythonObject, _ key: String) {
   dense.weight.copy(from: Tensor<TextFloatType>(from: dequantTextWeight(stateDict, key)))
   dense.weight.to(.unifiedMemory)
@@ -809,13 +825,6 @@ func makeQwenTextRotary(tokenLength: Int) -> Tensor<Float> {
     }
   }
   return rotary
-}
-
-func sliceModulation(_ x: Model.IO, row: Int, hiddenSize: Int = Krea2Config.hiddenSize) -> Model.IO
-{
-  x.reshaped(
-    [1, 1, hiddenSize], offset: [0, 0, row * hiddenSize],
-    strides: [6 * hiddenSize, 6 * hiddenSize, 1])
 }
 
 func Krea2SwiGLU(prefix: String, hiddenSize: Int, intermediateSize: Int) -> (
@@ -942,17 +951,23 @@ func KreaQwenTextSelfAttention(prefix: String, tokenLength: Int) -> (Model, (Pyt
   return (Model([x, rot], [out]), reader)
 }
 
-func KreaQwenTextFeedForward() -> (Model, Model, Model, Model) {
+func KreaQwenTextFeedForward(useInstructStoreNames: Bool = false) -> (Model, Model, Model, Model) {
   let x = Input()
-  let gate = Dense(count: Krea2QwenTextConfig.intermediateSize, noBias: true, name: "gate_proj")
-  let up = Dense(count: Krea2QwenTextConfig.intermediateSize, noBias: true, name: "up_proj")
+  let namePrefix = useInstructStoreNames ? "mlp_" : ""
+  let gate = Dense(
+    count: Krea2QwenTextConfig.intermediateSize, noBias: true, name: "\(namePrefix)gate_proj")
+  let up = Dense(
+    count: Krea2QwenTextConfig.intermediateSize, noBias: true, name: "\(namePrefix)up_proj")
   var out = up(x) .* gate(x).swish()
-  let down = Dense(count: Krea2QwenTextConfig.hiddenSize, noBias: true, name: "down_proj")
+  let down = Dense(
+    count: Krea2QwenTextConfig.hiddenSize, noBias: true, name: "\(namePrefix)down_proj")
   out = down(out)
   return (gate, down, up, Model([x], [out], name: "mlp"))
 }
 
-func KreaQwenTextTransformerBlock(prefix: String, tokenLength: Int) -> (
+func KreaQwenTextTransformerBlock(
+  prefix: String, tokenLength: Int, useInstructStoreNames: Bool = false
+) -> (
   Model, (PythonObject) -> Void
 ) {
   let x = Input()
@@ -964,7 +979,8 @@ func KreaQwenTextTransformerBlock(prefix: String, tokenLength: Int) -> (
   let residual = out
   let norm2 = RMSNorm(
     epsilon: Krea2QwenTextConfig.normEps, axis: [1], name: "post_attention_layernorm")
-  let (gate, down, up, ff) = KreaQwenTextFeedForward()
+  let (gate, down, up, ff) = KreaQwenTextFeedForward(
+    useInstructStoreNames: useInstructStoreNames)
   out = residual + ff(norm2(out).to(TextFloatType.dataType)).to(of: residual)
   let reader: (PythonObject) -> Void = { stateDict in
     attentionReader(stateDict)
@@ -980,7 +996,9 @@ func KreaQwenTextTransformerBlock(prefix: String, tokenLength: Int) -> (
   return (Model([x, rot], [out]), reader)
 }
 
-func KreaQwenTextFeatures(tokenLength: Int) -> (Model, (PythonObject) -> Void) {
+func KreaQwenTextFeatures(
+  tokenLength: Int, useInstructStoreNames: Bool = false, includeFinalNorm: Bool = false
+) -> (Model, (PythonObject) -> Void) {
   let tokens = Input()
   let rot = Input()
   let (embedding, embeddingReader) = KreaQwenTextEmbedding(tokenLength: tokenLength)
@@ -990,17 +1008,27 @@ func KreaQwenTextFeatures(tokenLength: Int) -> (Model, (PythonObject) -> Void) {
   var readers = [(PythonObject) -> Void]()
   for i in 0..<Krea2QwenTextConfig.layers {
     let (layer, reader) = KreaQwenTextTransformerBlock(
-      prefix: "layers.\(i)", tokenLength: tokenLength)
+      prefix: "layers.\(i)", tokenLength: tokenLength,
+      useInstructStoreNames: useInstructStoreNames)
     out = layer(out, rot)
     readers.append(reader)
     if captureLayers.contains(i) {
       captured.append(out.to(.Float32))
     }
   }
+  let norm =
+    includeFinalNorm
+    ? RMSNorm(epsilon: Krea2QwenTextConfig.normEps, axis: [1], name: "norm") : nil
+  if let norm {
+    captured.append(norm(out).to(.Float32))
+  }
   let reader: (PythonObject) -> Void = { stateDict in
     embeddingReader(stateDict)
     for reader in readers {
       reader(stateDict)
+    }
+    if let norm {
+      norm.weight.copy(from: Tensor<TextFloatType>(from: tensorValue(stateDict, "norm.weight")))
     }
   }
   return (Model([tokens, rot], captured), reader)
@@ -1128,7 +1156,7 @@ func Krea2TransformerBlock(prefix: String, batchSize: Int, tokenLength: Int, dev
   Model, (PythonObject) -> Void
 ) {
   let x = Input()
-  let tembMod = Input()
+  let tembMods = (0..<6).map { _ in Input() }
   let rot = Input()
   let prescaleTable = Parameter<FloatType>(
     .GPU(deviceID), .CHW(1, 1, Krea2Config.hiddenSize), name: "scale_shift_table_0")
@@ -1142,12 +1170,12 @@ func Krea2TransformerBlock(prefix: String, batchSize: Int, tokenLength: Int, dev
     .GPU(deviceID), .CHW(1, 1, Krea2Config.hiddenSize), name: "scale_shift_table_4")
   let postgateTable = Parameter<FloatType>(
     .GPU(deviceID), .CHW(1, 1, Krea2Config.hiddenSize), name: "scale_shift_table_5")
-  let prescale = sliceModulation(tembMod, row: 0) + prescaleTable
-  let preshift = sliceModulation(tembMod, row: 1) + preshiftTable
-  let pregate = sliceModulation(tembMod, row: 2) + pregateTable
-  let postscale = sliceModulation(tembMod, row: 3) + postscaleTable
-  let postshift = sliceModulation(tembMod, row: 4) + postshiftTable
-  let postgate = sliceModulation(tembMod, row: 5) + postgateTable
+  let prescale = tembMods[0] + prescaleTable
+  let preshift = tembMods[1] + preshiftTable
+  let pregate = tembMods[2] + pregateTable
+  let postscale = tembMods[3] + postscaleTable
+  let postshift = tembMods[4] + postshiftTable
+  let postgate = tembMods[5] + postgateTable
   let norm1 = RMSNorm(epsilon: Krea2Config.normEps, axis: [2], name: "norm1")
   let (attention, attentionReader) = Krea2Attention(
     prefix: "\(prefix).attn", hiddenSize: Krea2Config.hiddenSize, heads: Krea2Config.attentionHeads,
@@ -1173,7 +1201,7 @@ func Krea2TransformerBlock(prefix: String, batchSize: Int, tokenLength: Int, dev
     copyParameter(postshiftTable, stateDict, "\(prefix).scale_shift_table", row: 4)
     copyParameter(postgateTable, stateDict, "\(prefix).scale_shift_table", row: 5)
   }
-  return (Model([x, tembMod, rot], [out]), reader)
+  return (Model([x, rot] + tembMods, [out]), reader)
 }
 
 func Krea2DiT(batchSize: Int, textLength: Int, gridHeight: Int, gridWidth: Int, deviceID: Int) -> (
@@ -1188,9 +1216,12 @@ func Krea2DiT(batchSize: Int, textLength: Int, gridHeight: Int, gridWidth: Int, 
   let imgIn = Dense(count: Krea2Config.hiddenSize, name: "img_in")
   let timeLinear1 = Dense(count: Krea2Config.hiddenSize, name: "time_embed_linear_1")
   let timeLinear2 = Dense(count: Krea2Config.hiddenSize, name: "time_embed_linear_2")
-  let timeModProj = Dense(count: 6 * Krea2Config.hiddenSize, name: "time_mod_proj")
   let temb = timeLinear2(timeLinear1(tEmbed).GELU(approximate: .tanh))
-  let tembMod = timeModProj(temb.GELU(approximate: .tanh))
+  let tembForModulation = temb.GELU(approximate: .tanh)
+  let timeModProjs = (0..<6).map {
+    Dense(count: Krea2Config.hiddenSize, name: "time_mod_proj_\($0)")
+  }
+  let tembMods = timeModProjs.map { $0(tembForModulation) }
   let (textFusion, textFusionReader) = Krea2TextFusion(batchSize: batchSize, textLength: textLength)
   let (txtIn, txtInReader) = Krea2TextProjection()
   let textOut = txtIn(textFusion(text))
@@ -1201,7 +1232,7 @@ func Krea2DiT(batchSize: Int, textLength: Int, gridHeight: Int, gridWidth: Int, 
     let (block, reader) = Krea2TransformerBlock(
       prefix: "transformer_blocks.\(i)", batchSize: batchSize, tokenLength: tokenLength,
       deviceID: deviceID)
-    out = block(out, tembMod, rot)
+    out = block([out, rot] + tembMods)[0]
     readers.append(reader)
   }
   out = out.reshaped(
@@ -1226,8 +1257,11 @@ func Krea2DiT(batchSize: Int, textLength: Int, gridHeight: Int, gridWidth: Int, 
     copyDense(
       timeLinear2, stateDict, weight: "time_embed.linear_2.weight",
       bias: "time_embed.linear_2.bias")
-    copyDense(
-      timeModProj, stateDict, weight: "time_mod_proj.weight", bias: "time_mod_proj.bias")
+    for i in 0..<6 {
+      copyDenseChunk(
+        timeModProjs[i], stateDict, weight: "time_mod_proj.weight", bias: "time_mod_proj.bias",
+        row: i)
+    }
     textFusionReader(stateDict)
     txtInReader(stateDict)
     for reader in readers {
@@ -1356,7 +1390,8 @@ func exportTextModel() {
     }
     let tokensGPU = tokens.toGPU(deviceID)
     let rotGPU = graph.variable(Tensor<TextFloatType>(from: rotCPU).toGPU(deviceID))
-    let (model, reader) = KreaQwenTextFeatures(tokenLength: exportTextLength)
+    let (model, reader) = KreaQwenTextFeatures(
+      tokenLength: exportTextLength, useInstructStoreNames: true, includeFinalNorm: true)
     model.maxConcurrency = .limit(1)
     model.compile(inputs: tokensGPU, rotGPU)
     reader(stateDict)
@@ -1411,6 +1446,8 @@ case "parity-text":
   requireParity(runTextParity(), "Krea2 Qwen text parity failed")
 case "parity-dit":
   requireParity(runDiTParity(), "Krea2 DiT parity failed")
+case "parity-dit-raw":
+  requireParity(runDiTParity(), "Krea2 Raw DiT parity failed")
 case "parity":
   requireParity(runTextParity(), "Krea2 Qwen text parity failed")
   requireParity(runDiTParity(), "Krea2 DiT parity failed")
@@ -1418,9 +1455,13 @@ case "export-text":
   exportTextModel()
 case "export-dit":
   exportDiT()
+case "export-dit-raw":
+  exportDiT()
 case "export":
   exportTextModel()
   exportDiT()
 default:
-  print("Usage: krea2 [parity|parity-text|parity-dit|export-text|export-dit|export]")
+  print(
+    "Usage: krea2 [parity|parity-text|parity-dit|parity-dit-raw|export-text|export-dit|export-dit-raw|export]"
+  )
 }
