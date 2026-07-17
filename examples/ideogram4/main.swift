@@ -11,7 +11,8 @@ let graph = DynamicGraph()
 graph.maxConcurrency = .limit(1)
 
 let env = ProcessInfo.processInfo.environment
-let modelRoot = env["IDEOGRAM4_MODEL"] ?? "/slow/Data/ideogram-4-fp8"
+let modelRoot = env["IDEOGRAM4_MODEL"] ?? "/slow/Data/ideogram-v4-instant"
+let textModelRoot = env["IDEOGRAM4_TEXT_MODEL"] ?? "/slow/Data/ideogram-4-fp8"
 let deviceID = Int(env["IDEOGRAM4_DEVICE"] ?? "0") ?? 0
 let dtypeName = env["IDEOGRAM4_REFERENCE_DTYPE"] ?? "float16"
 let textDtypeName = env["IDEOGRAM4_TEXT_REFERENCE_DTYPE"] ?? "float16"
@@ -29,7 +30,8 @@ let exportDiTGridWidth = Int(env["IDEOGRAM4_EXPORT_DIT_GRID_W"] ?? "64") ?? 64
 let textExportPath =
   env["IDEOGRAM4_TEXT_EXPORT"]
   ?? "/slow/Data/ideogram4_text_model_f16.ckpt"
-let ditExportPath = env["IDEOGRAM4_DIT_EXPORT"] ?? "/slow/Data/ideogram4_dit_f32.ckpt"
+let ditExportPath =
+  env["IDEOGRAM4_DIT_EXPORT"] ?? "/slow/Data/ideogram_4_instant_f32.ckpt"
 let mode = CommandLine.arguments.dropFirst().first ?? "parity"
 
 let site = Python.import("site")
@@ -105,7 +107,10 @@ torch.cuda.manual_seed_all(42)
 let helper = types.ModuleType("ideogram4_swift_reference")
 builtins.exec(
   #"""
+  import gc
+  import json
   import math
+  import os
   import torch
   import torch.nn as nn
   import torch.nn.functional as F
@@ -524,16 +529,57 @@ builtins.exec(
   def load_transformer_pack(root, subfolder, device_index, dtype_name):
       dtype = ref_dtype(dtype_name)
       device = torch.device(f"cuda:{device_index}")
-      state_dict = load_file(f"{root}/{subfolder}/diffusion_pytorch_model.safetensors")
-      model = Ideogram4Transformer()
-      model.to(dtype)
-      swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
-      load_fp8_state_dict(model, state_dict, device=device, dtype=dtype)
+      state_dict = load_transformer_state(root, subfolder)
+      if any(k.endswith(FP8_SCALE_SUFFIX) for k in state_dict):
+          model = Ideogram4Transformer()
+          model.to(dtype)
+          swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
+          load_fp8_state_dict(model, state_dict, device=device, dtype=dtype)
+      else:
+          with torch.device("meta"):
+              model = Ideogram4Transformer()
+          model.to(dtype=dtype)
+          model.to_empty(device=device)
+          model.rotary_emb = Ideogram4MRoPE().to(device)
+          missing, unexpected = model.load_state_dict(state_dict, strict=False)
+          if missing:
+              raise RuntimeError(f"missing keys after dense load: {missing[:10]}")
+          if unexpected:
+              raise RuntimeError(f"unexpected keys after dense load: {unexpected[:10]}")
       model.eval()
       return {"model": model, "state_dict": state_dict}
 
+  def release_transformer_model(pack):
+      pack["model"] = None
+      gc.collect()
+      torch.cuda.empty_cache()
+
   def load_transformer_state(root, subfolder):
-      return load_file(f"{root}/{subfolder}/diffusion_pytorch_model.safetensors")
+      directory = f"{root}/{subfolder}"
+      single_file = f"{directory}/diffusion_pytorch_model.safetensors"
+      if os.path.exists(single_file):
+          return load_file(single_file)
+      with open(f"{directory}/diffusion_pytorch_model.safetensors.index.json") as f:
+          weight_map = json.load(f)["weight_map"]
+      state_dict = {}
+      for filename in sorted(set(weight_map.values())):
+          state_dict.update(load_file(f"{directory}/{filename}"))
+      for i in range(34):
+          prefix = f"layers.{i}.attention"
+          q_key = f"{prefix}.to_q.weight"
+          if q_key in state_dict:
+              state_dict[f"{prefix}.qkv.weight"] = torch.cat(
+                  (
+                      state_dict.pop(q_key),
+                      state_dict.pop(f"{prefix}.to_k.weight"),
+                      state_dict.pop(f"{prefix}.to_v.weight"),
+                  ),
+                  dim=0,
+              )
+              state_dict[f"{prefix}.o.weight"] = state_dict.pop(
+                  f"{prefix}.to_out.0.weight"
+              )
+      return state_dict
 
   def make_position_ids(text_len, grid_h, grid_w):
       image = []
@@ -1156,11 +1202,11 @@ func Ideogram4Transformer(textLength: Int, imageLength: Int) -> (Model, (PythonO
 
 func runTextParity() -> Bool {
   print("ideogram4 text parity: start")
-  let stateDict = helper.load_ideogram_text_state(modelRoot)
+  let stateDict = helper.load_ideogram_text_state(textModelRoot)
   let tokenIds = helper.make_text_token_ids(textTokenLength)
   let reference = tensorFromPython(
     helper.run_ideogram_text_reference(
-      modelRoot, stateDict, textTokenLength, deviceID, textDtypeName))
+      textModelRoot, stateDict, textTokenLength, deviceID, textDtypeName))
   torch.cuda.empty_cache()
   let tokenIdsCPU = try! Tensor<Int32>(numpy: tokenIds[0].to(torch.int32).cpu().numpy())
   let tokenCount = tokenIdsCPU.shape[0]
@@ -1248,8 +1294,7 @@ func runTransformerParity(subfolder: String, textLength: Int) -> Bool {
   let pack = helper.load_transformer_pack(modelRoot, subfolder, deviceID, dtypeName)
   let testCase = helper.run_transformer_case(
     pack["model"], textLength, ditGridHeight, ditGridWidth, ditTimestep, deviceID, dtypeName)
-  pack["model"].to("cpu")
-  torch.cuda.empty_cache()
+  helper.release_transformer_model(pack)
 
   let imageLength = ditGridHeight * ditGridWidth
   let xImageCPU = tensorFromPython(testCase["x_image"])
@@ -1308,7 +1353,7 @@ func exportTextModel() {
   print("ideogram4 text export: start")
   print("ideogram4 text export tokens:", exportTextTokenLength)
   print("ideogram4 text export path:", textExportPath)
-  let stateDict = helper.load_ideogram_text_state(modelRoot)
+  let stateDict = helper.load_ideogram_text_state(textModelRoot)
   let rotCPU = makeQwenTextRotary(tokenLength: exportTextTokenLength)
   graph.withNoGrad {
     let tokens = graph.variable(
@@ -1392,10 +1437,6 @@ func exportDiTModels() {
     subfolder: "transformer", modelKey: "dit", textLength: exportDiTTextLength,
     gridHeight: exportDiTGridHeight, gridWidth: exportDiTGridWidth, outputPath: ditExportPath,
     writeIndicatorEmbedding: true)
-  exportTransformer(
-    subfolder: "unconditional_transformer", modelKey: "unconditional_dit", textLength: 0,
-    gridHeight: exportDiTGridHeight, gridWidth: exportDiTGridWidth, outputPath: ditExportPath,
-    writeIndicatorEmbedding: false)
 }
 
 func requireParity(_ ok: Bool, _ message: String) {
@@ -1414,9 +1455,6 @@ case "parity-transformer":
   requireParity(
     runTransformerParity(subfolder: "transformer", textLength: ditTextLength),
     "Ideogram4 conditional transformer parity failed")
-  requireParity(
-    runTransformerParity(subfolder: "unconditional_transformer", textLength: 0),
-    "Ideogram4 unconditional transformer parity failed")
 case "export-text":
   exportTextModel()
 case "export-dit":
@@ -1429,9 +1467,6 @@ case "parity":
   requireParity(
     runTransformerParity(subfolder: "transformer", textLength: ditTextLength),
     "Ideogram4 conditional transformer parity failed")
-  requireParity(
-    runTransformerParity(subfolder: "unconditional_transformer", textLength: 0),
-    "Ideogram4 unconditional transformer parity failed")
 default:
   print(
     "Usage: ideogram4 [parity|parity-text|qwen-load-text|parity-transformer|export-text|export-dit|export]"

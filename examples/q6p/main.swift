@@ -4,8 +4,8 @@ import NNC
 let graph = DynamicGraph()
 
 private let imatrixPath = "/slow/Data/"  // qwen_3.5_9b_ud_q5_k_xl_quantization.csv"
-private let inputPath = "/slow/Data/krea_2_raw_f16.ckpt"  // qwen_3.6_27b_mtp_f16.ckpt"
-private let outputPath = "/slow/Data/krea_2_raw_i8x.ckpt"  // qwen_3.6_27b_mtp_i8x.ckpt"
+private let inputPath = "/slow/Data/anima_turbo_1.0_f16.ckpt"  // qwen_3.6_27b_mtp_f16.ckpt"
+private let outputPath = "/slow/Data/anima_turbo_1.0_q8p.ckpt"  // qwen_3.6_27b_mtp_i8x.ckpt"
 
 private struct QuantizationEntry {
   let format: String
@@ -201,6 +201,9 @@ graph.openStore(
         || key.contains("_pad_token")  // Z-Image related.
         || key.contains("_registers") || key.contains("_connector") || key.contains("_extractor")  // LTX-2 related.
         || key.contains("token_embedding")  // Anima related.
+        || key.contains("norm1_") || key.contains("norm2_") || key.contains("norm3_")  // Anima related.
+        || key.contains("time_linear_1")  // Anima related.
+        || key.contains("time_shift") || key.contains("time_scale") || key.contains("time_gate")  // Anima related.
         || key.contains("positive_embedding")  // SeedVR2 related.
         || key.contains("negative_embedding")  // SeedVR2 related.
         || key.contains("indicator_embedding")  // Ideogram 4 related.
@@ -274,12 +277,12 @@ graph.openStore(
       }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7], imatrix: imatrix)
         } else {
-          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
+          $0.write(key, tensor: tensor, codec: [.q8p, .ezm7], imatrix: imatrix)
         }
       } else if shape.count == 4 && n > 1 {
-        $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
+        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7], imatrix: imatrix)
       } else {
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
