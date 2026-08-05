@@ -1234,6 +1234,39 @@ swift_binary(
 )
 
 swift_binary(
+    name = "minimax_h3",
+    srcs = [
+        "minimax_h3/main.swift",
+        "minimax_h3/models.swift",
+    ],
+    data = [
+        "minimax_h3_assets/merges.txt",
+        "minimax_h3_assets/vocab.json",
+    ],
+    deps = [
+        "//:diffusion",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+    ],
+)
+
+swift_binary(
+    name = "minimax_h3_converter",
+    srcs = ["minimax_h3_converter/main.swift"],
+    data = [
+    ],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@SwiftNumerics//:Numerics",
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "zimage",
     srcs = ["zimage/main.swift"],
     data = [
