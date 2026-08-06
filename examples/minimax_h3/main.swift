@@ -18,6 +18,7 @@ struct H3RuntimeOptions {
   var output = "minimax_h3_output"
   var dryRun = false
   var textOnly = false
+  var saveLatentsOnly = false
 }
 
 func parseOptions() -> H3RuntimeOptions {
@@ -41,6 +42,7 @@ func parseOptions() -> H3RuntimeOptions {
     case "--output": options.output = value()
     case "--dry-run": options.dryRun = true
     case "--text-only": options.textOnly = true
+    case "--save-latents-only": options.saveLatentsOnly = true
     default: preconditionFailure("Unknown argument: \(argument)")
     }
     index += 1
@@ -48,7 +50,7 @@ func parseOptions() -> H3RuntimeOptions {
   precondition(options.height % 32 == 0 && options.width % 32 == 0)
   precondition(options.steps >= 2)
   options.frames = alignFrameCount(options.frames)
-  precondition(options.frames >= 124 && options.frames <= 364, "H3 supports 5-15 second clips")
+  precondition(options.frames >= 22 && options.frames <= 364, "H3 supports 22-364 aligned frames")
   return options
 }
 
@@ -225,8 +227,16 @@ func runDenoiser(text: Tensor<BlockFloat>) -> (Tensor<Float>, Tensor<Float>) {
     let textTensor = graph.variable(
       text.reshaped(.HWC(1, text.shape[0], text.shape[1])).toGPU(deviceID))
     let rotary = graph.variable(h3RotaryTensor(positionIDs: layout.positionIDs).toGPU(deviceID))
-    var adalnCPU = Tensor<BlockFloat>(.CPU, .WC(layout.sequenceLength, 6))
-    var timestepCPU = Tensor<BlockFloat>(.CPU, .WC(layout.sequenceLength, 2))
+    var adalnCPU = Tensor<Float>(.CPU, .WC(layout.sequenceLength, 6))
+    var timestepCPU = Tensor<Float>(.CPU, .WC(layout.sequenceLength, 2))
+    for row in 0..<layout.sequenceLength {
+      for column in 0..<6 {
+        adalnCPU[row, column] = 0
+      }
+      for column in 0..<2 {
+        timestepCPU[row, column] = 0
+      }
+    }
     for row in layout.textRange {
       adalnCPU[row, 1] = 1
       timestepCPU[row, 0] = 1
@@ -263,7 +273,7 @@ func runDenoiser(text: Tensor<BlockFloat>) -> (Tensor<Float>, Tensor<Float>) {
       let audioTimestep = 1 - audioSigmas[step]
       let frequencies = graph.variable(
         timestepFrequencies([videoTimestep, audioTimestep]).toGPU(deviceID))
-      let temb = timeModel(inputs: frequencies)[0].as(of: Float.self)
+      let temb = timeModel(inputs: frequencies)[0].as(of: Float.self).copied()
       let velocity = dit(
         inputs: video, audio, textTensor, rotary, adaln, timestepSelection, temb)
       let videoVelocity = velocity[0].as(of: Float.self)
@@ -281,6 +291,29 @@ func runDenoiser(text: Tensor<BlockFloat>) -> (Tensor<Float>, Tensor<Float>) {
       audioCPU
     )
   }
+}
+
+struct Float32TensorMetadata: Codable {
+  let dtype: String
+  let shape: [Int]
+  let data: String
+}
+
+func writeFloat32Tensor(_ tensor: Tensor<Float>, name: String, outputDirectory: String) {
+  let data = tensor.withUnsafeBytes { bytes in
+    Data(bytes: bytes.baseAddress!, count: bytes.count)
+  }
+  let dataPath = outputDirectory + "/" + name + ".f32"
+  try! data.write(to: URL(fileURLWithPath: dataPath))
+  let shape = (0..<tensor.shape.count).map { tensor.shape[$0] }
+  let metadata = Float32TensorMetadata(
+    dtype: "float32", shape: shape, data: name + ".f32")
+  let encoder = JSONEncoder()
+  encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+  let metadataData = try! encoder.encode(metadata)
+  try! metadataData.write(
+    to: URL(fileURLWithPath: outputDirectory + "/" + name + ".json"))
+  print("MiniMax-H3 saved", dataPath, "shape", tensor.shape)
 }
 
 let videoLatentMean: [Float] = [
@@ -637,7 +670,6 @@ if options.height < 768 && !options.dryRun {
 if options.dryRun {
   exit(0)
 }
-
 try! FileManager.default.createDirectory(
   atPath: options.output, withIntermediateDirectories: true)
 let text = encodePrompt(options.prompt)
@@ -646,6 +678,11 @@ if options.textOnly {
   exit(0)
 }
 let (videoLatents, audioRows) = runDenoiser(text: text)
+if options.saveLatentsOnly {
+  writeFloat32Tensor(videoLatents, name: "video_latents", outputDirectory: options.output)
+  writeFloat32Tensor(audioRows, name: "audio_latents", outputDirectory: options.output)
+  exit(0)
+}
 decodeAudio(audioRows, outputDirectory: options.output)
 decodeVideo(videoLatents, outputDirectory: options.output)
 muxOutput(outputDirectory: options.output)
