@@ -386,12 +386,24 @@ func h3DebugActivation(_ input: Model.IO, label: String) -> Model.IO {
   guard environment["H3_DEBUG_ACTIVATIONS"] == "1" else {
     return input
   }
+  let blockOutput =
+    environment["H3_DEBUG_BLOCK_OUTPUTS"] == "1"
+    && label.hasPrefix("transformer_blocks.") && label.hasSuffix(".output")
+  let suffixMatch = environment["H3_DEBUG_ACTIVATION_SUFFIX"].map(label.hasSuffix) ?? false
   if let prefix = environment["H3_DEBUG_ACTIVATION_PREFIX"],
     !label.hasPrefix(prefix) && !label.hasPrefix("dit.") && !label.hasPrefix("time_embedder.")
+      && !blockOutput && !suffixMatch
   {
     return input
   }
   return input.debug { tensors, _ in
+    let call = h3ActivationDebugCounts[label, default: 0]
+    h3ActivationDebugCounts[label] = call + 1
+    if let requestedCall = environment["H3_DEBUG_ACTIVATION_CALL"].flatMap(Int.init),
+      call != requestedCall
+    {
+      return
+    }
     let tensor = Tensor<Float>(from: tensors[0]!).toCPU()
     var maximumMagnitude: Float = 0
     var squaredSum: Double = 0
@@ -411,8 +423,6 @@ func h3DebugActivation(_ input: Model.IO, label: String) -> Model.IO {
         }
       }
     }
-    let call = h3ActivationDebugCounts[label, default: 0]
-    h3ActivationDebugCounts[label] = call + 1
     let rms = finiteCount > 0 ? sqrt(squaredSum / Double(finiteCount)) : .infinity
     print(
       "H3_ACT label=\(label) call=\(call) max=\(maximumMagnitude) rms=\(rms) "
@@ -421,63 +431,113 @@ func h3DebugActivation(_ input: Model.IO, label: String) -> Model.IO {
 }
 
 func H3Attention(
-  prefix: String, sequenceLength: Int, rotary: Bool
+  prefix: String, sequenceLength: Int, rotary: Bool, useFloat16: Bool = false, name: String = ""
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let rot = rotary ? Input() : nil
-  let toQ = Dense(count: H3Config.innerAttentionSize, noBias: true, name: "q")
-  let toK = Dense(count: H3Config.innerAttentionSize, noBias: true, name: "k")
-  let toV = Dense(count: H3Config.innerAttentionSize, noBias: true, name: "v")
-  let normQ = RMSNorm(epsilon: H3Config.normEpsilon, axis: [3], name: "norm_q")
-  let normK = RMSNorm(epsilon: H3Config.normEpsilon, axis: [3], name: "norm_k")
-  let qRaw = toQ(x.to(.Float32)).reshaped(
+  let toQ = Dense(
+    count: H3Config.innerAttentionSize, noBias: true,
+    flags: useFloat16 ? [.Float16] : [], name: name.isEmpty ? "q" : "\(name)_q")
+  let toK = Dense(
+    count: H3Config.innerAttentionSize, noBias: true,
+    flags: useFloat16 ? [.Float16] : [], name: name.isEmpty ? "k" : "\(name)_k")
+  let toV = Dense(
+    count: H3Config.innerAttentionSize, noBias: true,
+    flags: useFloat16 ? [.Float16] : [], name: name.isEmpty ? "v" : "\(name)_v")
+  let normQ = RMSNorm(
+    epsilon: H3Config.normEpsilon, axis: [3], name: name.isEmpty ? "norm_q" : "\(name)_norm_q")
+  let normK = RMSNorm(
+    epsilon: H3Config.normEpsilon, axis: [3], name: name.isEmpty ? "norm_k" : "\(name)_norm_k")
+  let projectionInput = useFloat16 ? x.to(.Float16) : x.to(.Float32)
+  let qProjected = toQ(projectionInput)
+  let kProjected = toK(projectionInput)
+  let vProjected = toV(projectionInput)
+  let qRaw = (useFloat16 ? qProjected.to(.Float32) : qProjected).reshaped(
     .NHWC(1, sequenceLength, H3Config.heads, H3Config.headDim))
-  let kRaw = toK(x.to(.Float32)).reshaped(
+  let kRaw = (useFloat16 ? kProjected.to(.Float32) : kProjected).reshaped(
     .NHWC(1, sequenceLength, H3Config.heads, H3Config.headDim))
   var q = normQ(h3DebugActivation(qRaw, label: "\(prefix).q_raw"))
   var k = normK(h3DebugActivation(kRaw, label: "\(prefix).k_raw"))
   let v = h3DebugActivation(
-    toV(x.to(.Float32)).reshaped(
+    vProjected.reshaped(
       .NHWC(1, sequenceLength, H3Config.heads, H3Config.headDim)),
     label: "\(prefix).v")
-  if let rot {
-    q = Functional.cmul(left: q, right: rot.to(.Float32))
-    k = Functional.cmul(left: k, right: rot.to(.Float32))
+  if useFloat16 {
+    q = q.to(.Float16)
+    k = k.to(.Float16)
   }
-  // Only fused attention operates in BF16; the rest of the block remains FP32.
+  if let rot {
+    let typedRotary = useFloat16 ? rot.to(.Float16) : rot.to(.Float32)
+    q = Functional.cmul(left: q, right: typedRotary)
+    k = Functional.cmul(left: k, right: typedRotary)
+  }
   let attention = ScaledDotProductAttention(
-    scale: 1 / Float(H3Config.headDim).squareRoot())
+    scale: 1 / Float(H3Config.headDim).squareRoot(),
+    flags: useFloat16 ? [.Float16] : [])
+  let attentionOutput: Model.IO
+  if useFloat16 {
+    attentionOutput = attention(q, k, v).to(.Float32)
+  } else {
+    // The FP32 control uses BF16 only inside fused attention.
+    attentionOutput = attention(q.to(.BFloat16), k.to(.BFloat16), v.to(.BFloat16)).to(.Float32)
+  }
   let attended = h3DebugActivation(
-    attention(q.to(.BFloat16), k.to(.BFloat16), v.to(.BFloat16)).to(.Float32)
-      .reshaped([1, sequenceLength, H3Config.innerAttentionSize]),
+    attentionOutput.reshaped([1, sequenceLength, H3Config.innerAttentionSize]),
     label: "\(prefix).attended")
-  let out = Dense(count: H3Config.hiddenSize, noBias: true, name: "o")
+  let out = Dense(
+    count: H3Config.hiddenSize, noBias: true,
+    flags: useFloat16 ? [.Float16] : [], name: name.isEmpty ? "o" : "\(name)_o")
+  let projected = out(useFloat16 ? attended.to(.Float16) : attended)
+  let projectedOutput = useFloat16 ? projected.to(.Float32) : projected
   let reader: (PythonObject) -> Void = { _ in }
   if let rot {
     return (
-      Model([x, rot], [h3DebugActivation(out(attended), label: "\(prefix).out_proj")]),
+      Model([x, rot], [h3DebugActivation(projectedOutput, label: "\(prefix).out_proj")]),
       reader
     )
   }
-  return (Model([x], [h3DebugActivation(out(attended), label: "\(prefix).out_proj")]), reader)
+  return (
+    Model([x], [h3DebugActivation(projectedOutput, label: "\(prefix).out_proj")]), reader
+  )
 }
 
-func H3SwiGLU(prefix: String) -> (Model, (PythonObject) -> Void) {
+func H3SwiGLU(
+  prefix: String, scaleFactor: Float? = nil, useFloat16: Bool = false, name: String = ""
+) -> (Model, (PythonObject) -> Void) {
   let x = Input()
-  let up = Dense(count: H3Config.intermediateSize, noBias: true, name: "up")
-  let gate = Dense(count: H3Config.intermediateSize, noBias: true, name: "gate")
-  let down = Dense(count: H3Config.hiddenSize, noBias: true, name: "down")
-  let input = x.to(.Float32)
-  let upOut = up(input)
+  let up = Dense(
+    count: H3Config.intermediateSize, noBias: true,
+    flags: useFloat16 ? [.Float16] : [], name: name.isEmpty ? "up" : "\(name)_up")
+  let gate = Dense(
+    count: H3Config.intermediateSize, noBias: true,
+    flags: useFloat16 ? [.Float16] : [], name: name.isEmpty ? "gate" : "\(name)_gate")
+  let down = Dense(
+    count: H3Config.hiddenSize, noBias: true,
+    flags: useFloat16 ? [.Float16] : [], name: name.isEmpty ? "down" : "\(name)_down")
+  let input = useFloat16 ? x.to(.Float16) : x.to(.Float32)
+  let upOut = scaleFactor.map { up((1 / $0) * input) } ?? up(input)
   let gateOut = gate(input)
   let product = h3DebugActivation(upOut .* gateOut.swish(), label: "\(prefix).product")
-  let out = h3DebugActivation(down(product), label: "\(prefix).down")
+  let downOutput = down(product)
+  let out = h3DebugActivation(
+    useFloat16 ? downOutput.to(.Float32) : downOutput, label: "\(prefix).down")
   let reader: (PythonObject) -> Void = { _ in }
   return (Model([x], [out]), reader)
 }
 
+func h3FFNScaleFactor(layer: Int) -> Float? {
+  // Measured on the complete 20-evaluation 256x256 T2VA trajectory. The restored
+  // FP32 residual is unchanged; these factors only protect the FP16 FFN matmuls.
+  if layer >= 45 { return 64 }
+  if layer >= 39 { return 32 }
+  if layer >= 36 { return 8 }
+  if layer >= 12 { return 4 }
+  return nil
+}
+
 func H3TransformerBlock(
-  prefix: String, sequenceLength: Int, timestepCount: Int
+  prefix: String, sequenceLength: Int, timestepCount: Int,
+  scaleFactor: Float? = nil, useFloat16: Bool = false
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let rot = Input()
@@ -518,49 +578,72 @@ func H3TransformerBlock(
   }
   let norm1 = RMSNorm(epsilon: H3Config.normEpsilon, axis: [2], name: "norm1")
   let (attention, attentionReader) = H3Attention(
-    prefix: "\(prefix).attn", sequenceLength: sequenceLength, rotary: true)
+    prefix: "\(prefix).attn", sequenceLength: sequenceLength, rotary: true,
+    useFloat16: useFloat16)
   let normed1 = norm1(x.to(.Float32))
   let scale1 = 1 + modulations[1]
   var out = h3DebugActivation(
     normed1 .* scale1 + modulations[0], label: "\(prefix).attn_input")
-  out = x.to(.Float32) + modulations[2] .* attention(out, rot)
+  let attentionInput = useFloat16 ? out.to(.Float16) : out
+  out = x.to(.Float32) + modulations[2] .* attention(attentionInput, rot)
   out = h3DebugActivation(out, label: "\(prefix).post_attn")
   let residual = out
   let norm2 = RMSNorm(epsilon: H3Config.normEpsilon, axis: [2], name: "norm2")
-  let (feedForward, feedForwardReader) = H3SwiGLU(prefix: "\(prefix).ff")
+  let (feedForward, feedForwardReader) = H3SwiGLU(
+    prefix: "\(prefix).ff", scaleFactor: scaleFactor, useFloat16: useFloat16)
   let normed2 = norm2(out)
   let scale2 = 1 + modulations[4]
   out = normed2 .* scale2 + modulations[3]
-  out = residual + modulations[5] .* feedForward(out)
+  let feedForwardInput = useFloat16 ? out.to(.Float16) : out
+  let feedForwardOutput = modulations[5] .* feedForward(feedForwardInput)
+  if let scaleFactor {
+    out = residual + scaleFactor * feedForwardOutput
+  } else {
+    out = residual + feedForwardOutput
+  }
   out = h3DebugActivation(out, label: "\(prefix).output")
   let reader: (PythonObject) -> Void = { _ in }
   return (Model([x, rot, selection, activatedTimestep], [out]), reader)
 }
 
-func H3TokenRefinerBlock(prefix: String, sequenceLength: Int) -> (Model, (PythonObject) -> Void) {
+func H3TokenRefinerBlock(
+  prefix: String, sequenceLength: Int, useFloat16: Bool = false
+) -> (Model, (PythonObject) -> Void) {
   let x = Input()
-  let norm1 = RMSNorm(epsilon: H3Config.normEpsilon, axis: [2], name: "norm1")
+  let norm1 = RMSNorm(epsilon: H3Config.normEpsilon, axis: [2], name: "refiner_norm1")
   let (attention, attentionReader) = H3Attention(
-    prefix: "\(prefix).attn", sequenceLength: sequenceLength, rotary: false)
-  var out = x.to(.Float32) + attention(norm1(x.to(.Float32)))
-  let norm2 = RMSNorm(epsilon: H3Config.normEpsilon, axis: [2], name: "norm2")
-  let (feedForward, feedForwardReader) = H3SwiGLU(prefix: "\(prefix).ff")
-  out = out + feedForward(norm2(out))
+    prefix: "\(prefix).attn", sequenceLength: sequenceLength, rotary: false,
+    useFloat16: useFloat16, name: "refiner")
+  let attentionInput = h3DebugActivation(
+    norm1(x.to(.Float32)), label: "\(prefix).attn_input")
+  let attentionOutput = attention(useFloat16 ? attentionInput.to(.Float16) : attentionInput)
+  var out = h3DebugActivation(
+    x.to(.Float32) + attentionOutput, label: "\(prefix).post_attn")
+  let norm2 = RMSNorm(epsilon: H3Config.normEpsilon, axis: [2], name: "refiner_norm2")
+  let (feedForward, feedForwardReader) = H3SwiGLU(
+    prefix: "\(prefix).ff", useFloat16: useFloat16, name: "refiner")
+  let feedForwardInput = h3DebugActivation(norm2(out), label: "\(prefix).ff_input")
+  let feedForwardOutput = feedForward(
+    useFloat16 ? feedForwardInput.to(.Float16) : feedForwardInput)
+  out = h3DebugActivation(out + feedForwardOutput, label: "\(prefix).output")
   let reader: (PythonObject) -> Void = { _ in }
   return (Model([x], [out]), reader)
 }
 
-func H3TokenRefiner(sequenceLength: Int) -> (Model, (PythonObject) -> Void) {
+func H3TokenRefiner(
+  sequenceLength: Int, useFloat16: Bool = false
+) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   var out: Model.IO = x
   var readers = [(PythonObject) -> Void]()
   for layer in 0..<H3Config.refinerLayers {
     let (block, reader) = H3TokenRefinerBlock(
-      prefix: "token_refiner.refiner_blocks.\(layer)", sequenceLength: sequenceLength)
+      prefix: "token_refiner.refiner_blocks.\(layer)", sequenceLength: sequenceLength,
+      useFloat16: useFloat16)
     out = block(out)
     readers.append(reader)
   }
-  let norm = RMSNorm(epsilon: H3Config.normEpsilon, axis: [2], name: "final_norm")
+  let norm = RMSNorm(epsilon: H3Config.normEpsilon, axis: [2], name: "refiner_final_norm")
   out = norm(out)
   let reader: (PythonObject) -> Void = { _ in }
   return (Model([x], [out]), reader)
@@ -568,8 +651,9 @@ func H3TokenRefiner(sequenceLength: Int) -> (Model, (PythonObject) -> Void) {
 
 func H3TimestepEmbedding(timestepCount: Int) -> (Model, (PythonObject) -> Void) {
   let frequencies = Input()
-  let linear1 = Dense(count: H3Config.timestepHiddenSize, name: "linear_1")
-  let linear2 = Dense(count: H3Config.timestepSize, name: "linear_2")
+  let linear1 = Dense(
+    count: H3Config.timestepHiddenSize, name: "time_embedder_linear_1")
+  let linear2 = Dense(count: H3Config.timestepSize, name: "time_embedder_linear_2")
   let out = h3DebugActivation(
     linear2(linear1(frequencies).swish()), label: "time_embedder.output")
   let reader: (PythonObject) -> Void = { _ in }
@@ -578,7 +662,7 @@ func H3TimestepEmbedding(timestepCount: Int) -> (Model, (PythonObject) -> Void) 
 
 func H3JointTransformer(
   textLength: Int, audioLength: Int, videoLength: Int, timestepCount: Int,
-  layers: Int = H3Config.layers, includeHidden: Bool = false
+  layers: Int = H3Config.layers, includeHidden: Bool = false, useFloat16: Bool = false
 ) -> (Model, (PythonObject) -> Void) {
   let video = Input()
   let audio = Input()
@@ -586,17 +670,35 @@ func H3JointTransformer(
   let rot = Input()
   let adalnSelection = Input()
   let timestepSelection = Input()
-  let temb = Input()
+  let timestepFrequencies = Input()
   let sequenceLength = textLength + audioLength + videoLength
 
-  // The checkpoint intentionally keeps these two projections in FP32.
-  let videoInput = Dense(count: H3Config.hiddenSize, name: "proj_in")
-  let audioInput = Dense(count: H3Config.hiddenSize, name: "audio_proj_in")
-  let textInput = Dense(count: H3Config.hiddenSize, name: "context_embedder")
-  let (refiner, refinerReader) = H3TokenRefiner(sequenceLength: textLength)
-  let textRows = refiner(textInput(text.to(.Float32)))
-  let audioRows = audioInput(audio)
-  let videoRows = videoInput(video)
+  let (timeEmbedding, timeEmbeddingReader) = H3TimestepEmbedding(timestepCount: timestepCount)
+  let temb = timeEmbedding(timestepFrequencies)
+
+  // Production uses scaled FP16 input projections and restores their outputs to FP32.
+  let videoInput = Dense(
+    count: H3Config.hiddenSize, flags: useFloat16 ? [.Float16] : [], name: "proj_in")
+  let audioInput = Dense(
+    count: H3Config.hiddenSize, flags: useFloat16 ? [.Float16] : [], name: "audio_proj_in")
+  let textInput = Dense(
+    count: H3Config.hiddenSize, flags: useFloat16 ? [.Float16] : [], name: "context_embedder")
+  let inputProjectionScale: Float = useFloat16 ? 4 : 1
+  let (refiner, refinerReader) = H3TokenRefiner(
+    sequenceLength: textLength, useFloat16: useFloat16)
+  let rawTextProjected = textInput(useFloat16 ? text.to(.Float16) : text.to(.Float32))
+  let textProjected = h3DebugActivation(
+    useFloat16 ? inputProjectionScale * rawTextProjected.to(.Float32) : rawTextProjected,
+    label: "token_refiner.text_projection")
+  let rawAudioProjected = audioInput(useFloat16 ? audio.to(.Float16) : audio)
+  let rawVideoProjected = videoInput(useFloat16 ? video.to(.Float16) : video)
+  let audioProjected =
+    useFloat16 ? inputProjectionScale * rawAudioProjected.to(.Float32) : rawAudioProjected
+  let videoProjected =
+    useFloat16 ? inputProjectionScale * rawVideoProjected.to(.Float32) : rawVideoProjected
+  let textRows = refiner(useFloat16 ? textProjected.to(.Float32) : textProjected)
+  let audioRows = h3DebugActivation(audioProjected, label: "dit.audio_input")
+  let videoRows = h3DebugActivation(videoProjected, label: "dit.video_input")
   var out = h3DebugActivation(
     Functional.concat(axis: 1, textRows, audioRows, videoRows), label: "dit.input")
   let activatedTemb = h3DebugActivation(temb.swish().to(.Float32), label: "dit.temb_activated")
@@ -604,7 +706,9 @@ func H3JointTransformer(
   for layer in 0..<layers {
     let (block, reader) = H3TransformerBlock(
       prefix: "transformer_blocks.\(layer)", sequenceLength: sequenceLength,
-      timestepCount: timestepCount)
+      timestepCount: timestepCount,
+      scaleFactor: useFloat16 ? h3FFNScaleFactor(layer: layer) : nil,
+      useFloat16: useFloat16)
     out = block(out, rot, adalnSelection, activatedTemb)
     readers.append(reader)
   }
@@ -640,7 +744,7 @@ func H3JointTransformer(
     : [projectedVideo, projectedAudio]
   return (
     Model(
-      [video, audio, text, rot, adalnSelection, timestepSelection, temb], outputs),
+      [video, audio, text, rot, adalnSelection, timestepSelection, timestepFrequencies], outputs),
     reader
   )
 }

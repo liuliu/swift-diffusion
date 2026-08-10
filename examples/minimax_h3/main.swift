@@ -56,6 +56,8 @@ func parseOptions() -> H3RuntimeOptions {
 
 let options = parseOptions()
 let environment = ProcessInfo.processInfo.environment
+// The production path is FP16. Set this to 0 only for the FP32 / BF16-SDPA control.
+let useFloat16DiT = environment["MINIMAX_H3_DIT_FP16"] != "0"
 let textStore =
   environment["MINIMAX_H3_QWEN_STORE"]
   ?? "/slow/Data/minimax_h3_qwen_3_vl_f16.ckpt"
@@ -131,7 +133,19 @@ func shiftedSigmas(points: Int, shift: Float) -> [Float] {
 
 // Load and move one parameter at a time. This matches the Flux.2 converter pattern and avoids
 // ever requiring the complete Qwen or DiT checkpoint to fit in device memory first.
-func loadUnified(_ key: String, model: Model, storePath: String) {
+func isH3Float16DiTParameter(_ name: String) -> Bool {
+  let prefixes = [
+    "t-context_embedder-", "t-proj_in-", "t-audio_proj_in-",
+    "t-q-", "t-k-", "t-v-", "t-o-", "t-gate-", "t-up-", "t-down-",
+    "t-refiner_q-", "t-refiner_k-", "t-refiner_v-", "t-refiner_o-",
+    "t-refiner_gate-", "t-refiner_up-", "t-refiner_down-",
+  ]
+  return prefixes.contains { name.hasPrefix($0) }
+}
+
+func loadUnified(
+  _ key: String, model: Model, storePath: String, float16DiT: Bool = false
+) {
   graph.openStore(storePath, flags: [.readOnly]) { store in
     let count = model.parameters.count
     for index in 0..<model.parameters.count {
@@ -140,7 +154,23 @@ func loadUnified(_ key: String, model: Model, storePath: String) {
       guard let tensor = store.read(tensorKey, kind: .CPU) else {
         preconditionFailure("Missing checkpoint parameter \(tensorKey)")
       }
-      parameter.copy(from: tensor)
+      if float16DiT && isH3Float16DiTParameter(parameter.name) {
+        var floatTensor = Tensor<Float>(from: tensor)
+        if parameter.name.hasPrefix("t-context_embedder-")
+          || parameter.name.hasPrefix("t-proj_in-")
+          || parameter.name.hasPrefix("t-audio_proj_in-")
+        {
+          floatTensor.withUnsafeMutableBytes { bytes in
+            let values = bytes.baseAddress!.assumingMemoryBound(to: Float.self)
+            for element in 0..<(bytes.count / MemoryLayout<Float>.stride) {
+              values[element] *= 0.25
+            }
+          }
+        }
+        parameter.copy(from: Tensor<Float16>(from: floatTensor))
+      } else {
+        parameter.copy(from: tensor)
+      }
       parameter.to(.unifiedMemory)
       if (index + 1) % 100 == 0 || index + 1 == count {
         print("MiniMax-H3 loaded \(key) parameter \(index + 1)/\(count)")
@@ -205,6 +235,28 @@ func unpatchVideoRows(
   return latents
 }
 
+func printH3LatentStats(_ tensor: DynamicGraph.Tensor<Float>, label: String) {
+  let cpu = tensor.rawValue.toCPU()
+  var maximumMagnitude: Float = 0
+  var finiteCount = 0
+  var nonfiniteCount = 0
+  cpu.withUnsafeBytes { bytes in
+    let values = bytes.baseAddress!.assumingMemoryBound(to: Float.self)
+    for index in 0..<(bytes.count / MemoryLayout<Float>.stride) {
+      let value = values[index]
+      if value.isFinite {
+        maximumMagnitude = max(maximumMagnitude, abs(value))
+        finiteCount += 1
+      } else {
+        nonfiniteCount += 1
+      }
+    }
+  }
+  print(
+    "H3_LATENT label=\(label) max=\(maximumMagnitude) finite=\(finiteCount) nonfinite=\(nonfiniteCount)"
+  )
+}
+
 func runDenoiser(text: Tensor<BlockFloat>) -> (Tensor<Float>, Tensor<Float>) {
   let latentFrames = videoLatentFrameCount(options.frames)
   let latentHeight = options.height / H3Config.videoSpatialCompression
@@ -251,20 +303,14 @@ func runDenoiser(text: Tensor<BlockFloat>) -> (Tensor<Float>, Tensor<Float>) {
     }
     let adaln = graph.variable(adalnCPU.toGPU(deviceID))
     let timestepSelection = graph.variable(timestepCPU.toGPU(deviceID))
-    let initialTemb = graph.variable(
-      .GPU(deviceID), .WC(2, H3Config.timestepSize), of: Float.self)
+    let initialFrequencies = graph.variable(timestepFrequencies([0, 0]).toGPU(deviceID))
     let (dit, _) = H3JointTransformer(
       textLength: text.shape[0], audioLength: audioLength, videoLength: videoLength,
-      timestepCount: 2)
+      timestepCount: 2, useFloat16: useFloat16DiT)
     dit.maxConcurrency = .limit(1)
-    dit.compile(inputs: video, audio, textTensor, rotary, adaln, timestepSelection, initialTemb)
-    loadUnified("dit", model: dit, storePath: ditStore)
-
-    let initialFrequencies = graph.variable(timestepFrequencies([0, 0]).toGPU(deviceID))
-    let (timeModel, _) = H3TimestepEmbedding(timestepCount: 2)
-    timeModel.maxConcurrency = .limit(1)
-    timeModel.compile(inputs: initialFrequencies)
-    loadUnified("time_embedder", model: timeModel, storePath: ditStore)
+    dit.compile(
+      inputs: video, audio, textTensor, rotary, adaln, timestepSelection, initialFrequencies)
+    loadUnified("dit", model: dit, storePath: ditStore, float16DiT: useFloat16DiT)
 
     let videoSigmas = shiftedSigmas(points: options.steps, shift: H3Config.videoFlowShift)
     let audioSigmas = shiftedSigmas(points: options.steps, shift: H3Config.audioFlowShift)
@@ -273,16 +319,24 @@ func runDenoiser(text: Tensor<BlockFloat>) -> (Tensor<Float>, Tensor<Float>) {
       let audioTimestep = 1 - audioSigmas[step]
       let frequencies = graph.variable(
         timestepFrequencies([videoTimestep, audioTimestep]).toGPU(deviceID))
-      let temb = timeModel(inputs: frequencies)[0].as(of: Float.self).copied()
       let velocity = dit(
-        inputs: video, audio, textTensor, rotary, adaln, timestepSelection, temb)
+        inputs: video, audio, textTensor, rotary, adaln, timestepSelection, frequencies)
       let videoVelocity = velocity[0].as(of: Float.self)
       let audioVelocity = velocity[1].as(of: Float.self)
       let videoDelta = (1 - videoSigmas[step + 1] / videoSigmas[step]) * videoSigmas[step]
       let audioDelta = (1 - audioSigmas[step + 1] / audioSigmas[step]) * audioSigmas[step]
       video = video + videoDelta * videoVelocity
       audio = audio + audioDelta * audioVelocity
+      if environment["H3_DEBUG_LATENTS"] == "1" {
+        printH3LatentStats(video, label: "video.step_\(step + 1)")
+        printH3LatentStats(audio, label: "audio.step_\(step + 1)")
+      }
       print("MiniMax-H3 denoise step \(step + 1)/\(options.steps - 1)")
+      if let stopAfterStep = environment["H3_STOP_AFTER_STEP"].flatMap(Int.init),
+        step + 1 >= stopAfterStep
+      {
+        break
+      }
     }
     let videoCPU = video.rawValue.toCPU().reshaped(.WC(videoLength, H3Config.videoPatchSize))
     let audioCPU = audio.rawValue.toCPU().reshaped(.WC(audioLength, H3Config.audioChannels))
@@ -664,6 +718,7 @@ print(
   "MiniMax-H3 T2VA plan: \(options.width)x\(options.height), \(options.frames) frames,",
   "\(latentFrames)x\(latentHeight)x\(latentWidth) video latents, \(audioLatents) audio latents,",
   "\(options.steps - 1) denoiser evaluations")
+print("MiniMax-H3 DiT precision:", useFloat16DiT ? "FP16 scaled" : "FP32 / BF16 SDPA")
 if options.height < 768 && !options.dryRun {
   print("MiniMax-H3 warning: the released checkpoint is intended for a 768-pixel short edge")
 }
