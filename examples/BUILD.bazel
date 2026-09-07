@@ -1253,8 +1253,13 @@ swift_binary(
 
 swift_binary(
     name = "minimax_h3_converter",
-    srcs = ["minimax_h3_converter/main.swift"],
+    srcs = [
+        "minimax_h3/qwen_vision.swift",
+        "minimax_h3_converter/main.swift",
+        "minimax_h3_converter/qwen_vision_parity.swift",
+    ],
     data = [
+        "minimax_h3_assets/qwen_vision_reference.py",
     ],
     deps = [
         "//:diffusion",

@@ -50,7 +50,9 @@ func parseOptions() -> H3RuntimeOptions {
   precondition(options.height % 32 == 0 && options.width % 32 == 0)
   precondition(options.steps >= 2)
   options.frames = alignFrameCount(options.frames)
-  precondition(options.frames >= 22 && options.frames <= 364, "H3 supports 22-364 aligned frames")
+  precondition(
+    options.frames == 1 || (options.frames >= 22 && options.frames <= 364),
+    "H3 supports a single image or 22-364 aligned video frames")
   return options
 }
 
@@ -180,17 +182,21 @@ func loadUnified(
 }
 
 func encodePrompt(_ prompt: String) -> Tensor<BlockFloat> {
+  // Keep Qwen on its own graph so its 32-GB-class parameter set and compiled arena are
+  // destroyed before the main DiT is materialized.
+  let textGraph = DynamicGraph()
+  textGraph.maxConcurrency = .limit(1)
   let tokenizer = TiktokenTokenizer(
     vocabulary: resourcePath("vocab.json"), merges: resourcePath("merges.txt"),
     specialTokens: specialTokens)
   let tokens = tokenizer.tokenize(text: prompt, addSpecialTokens: false).0
   precondition(!tokens.isEmpty, "Prompt tokenized to an empty sequence")
   print("MiniMax-H3 prompt tokens:", tokens.count)
-  return graph.withNoGrad {
+  return textGraph.withNoGrad {
     var tokenCPU = Tensor<Int32>(.CPU, .C(tokens.count))
     for index in tokens.indices { tokenCPU[index] = tokens[index] }
-    let tokenTensor = graph.variable(tokenCPU.toGPU(deviceID))
-    let rotary = graph.variable(qwenRotary(sequenceLength: tokens.count).toGPU(deviceID))
+    let tokenTensor = textGraph.variable(tokenCPU.toGPU(deviceID))
+    let rotary = textGraph.variable(qwenRotary(sequenceLength: tokens.count).toGPU(deviceID))
     let (textModel, _) = H3QwenExportModel(sequenceLength: tokens.count)
     textModel.maxConcurrency = .limit(1)
     textModel.compile(inputs: tokenTensor, rotary)
@@ -576,6 +582,70 @@ func decodeVideo(_ normalizedLatents: Tensor<Float>, outputDirectory: String) {
   let latentFrames = latents.shape[1]
   let latentHeight = latents.shape[2]
   let latentWidth = latents.shape[3]
+  if options.frames == 1 {
+    precondition(latentFrames == 1)
+    let decodeGraph = DynamicGraph()
+    decodeGraph.maxConcurrency = .limit(1)
+    decodeGraph.withNoGrad {
+      let yPlan = splitVideoTiles(length: options.height)
+      let xPlan = splitVideoTiles(length: options.width)
+      let firstTileHeight = yPlan.lengths[0] / H3Config.videoSpatialCompression
+      let firstTileWidth = xPlan.lengths[0] / H3Config.videoSpatialCompression
+      let numPatches = firstTileHeight * firstTileWidth
+      let dummy = decodeGraph.variable(
+        .GPU(deviceID), .HWC(1, numPatches, H3Config.videoChannels), of: VideoFloat.self)
+      let decoderRotary = decodeGraph.variable(
+        videoDecoderRotary(
+          latentFrames: 1, latentHeight: firstTileHeight, latentWidth: firstTileWidth
+        ).toGPU(deviceID))
+      let zero = decodeGraph.variable(
+        .GPU(deviceID), .HWC(1, 1, H3VideoDecoderConfig.width), of: Float.self)
+      zero.full(0)
+      let (decoder, _) = H3VideoDecoder(numPatches: numPatches, deviceID: deviceID)
+      decoder.maxConcurrency = .limit(1)
+      decoder.compile(inputs: dummy, decoderRotary, zero)
+      loadUnified("video_decoder", model: decoder, storePath: vaeStore)
+
+      var tileRows = [[Tensor<Float>]]()
+      for (tileY, yStartPixels) in yPlan.starts.enumerated() {
+        var row = [Tensor<Float>]()
+        for (tileX, xStartPixels) in xPlan.starts.enumerated() {
+          let tileHeight = yPlan.lengths[tileY] / H3Config.videoSpatialCompression
+          let tileWidth = xPlan.lengths[tileX] / H3Config.videoSpatialCompression
+          precondition(tileHeight == firstTileHeight && tileWidth == firstTileWidth)
+          let input = makeVideoDecoderInput(
+            latents, temporalStart: 0, temporalCount: 1,
+            yStart: yStartPixels / H3Config.videoSpatialCompression,
+            xStart: xStartPixels / H3Config.videoSpatialCompression,
+            tileHeight: tileHeight, tileWidth: tileWidth)
+          let variable = decodeGraph.variable(input.toGPU(deviceID))
+          let rows = Tensor<Float>(
+            from: decoder(inputs: variable, decoderRotary, zero)[0].as(of: VideoFloat.self)
+              .rawValue.toCPU()
+          ).reshaped(
+            .WC(
+              numPatches,
+              3 * H3VideoDecoderConfig.temporalPatch * H3VideoDecoderConfig.spatialPatch
+                * H3VideoDecoderConfig.spatialPatch))
+          row.append(
+            unpatchifyVideoDecoderRows(
+              rows, latentFrames: 1, latentHeight: tileHeight, latentWidth: tileWidth))
+        }
+        tileRows.append(row)
+      }
+      let decoded = stitchVideoTiles(
+        tileRows, yPlan: yPlan, xPlan: xPlan,
+        frames: H3VideoDecoderConfig.temporalPatch,
+        height: options.height, width: options.width)
+      // `decode_base(..., process_image: true, frame_num: 1)` trims from the end
+      // because this checkpoint's encoder is causal.
+      writePNGFrame(
+        H3VideoDecoderConfig.temporalPatch - 1, from: decoded, outputIndex: 0,
+        outputDirectory: outputDirectory)
+    }
+    print("MiniMax-H3 wrote", outputDirectory + "/frame_0000.png")
+    return
+  }
   let temporalPlan = videoTemporalDecodePlan(latentFrames: latentFrames)
   precondition(!temporalPlan.clipStarts.isEmpty, "At least seven video latent frames are required")
   var padded = latents
@@ -728,14 +798,42 @@ if options.dryRun {
 try! FileManager.default.createDirectory(
   atPath: options.output, withIntermediateDirectories: true)
 let text = encodePrompt(options.prompt)
+if environment["H3_DEBUG_TEXT_FEATURE"] == "1" {
+  print("MiniMax-H3 text feature passed to the main model:")
+  var textFeatureDebug = ""
+  debugPrint(text, to: &textFeatureDebug)
+  print(textFeatureDebug)
+  let textFeaturePath = options.output + "/text_feature_debug.txt"
+  try! textFeatureDebug.write(
+    to: URL(fileURLWithPath: textFeaturePath), atomically: true, encoding: .utf8)
+  print("MiniMax-H3 wrote", textFeaturePath)
+  // NNC's BFloat16 debug formatter currently leaves value fields empty. Float32 can
+  // represent every BFloat16 value exactly, so this is an inspectable view of the same feature.
+  var textFeatureFloatDebug = ""
+  debugPrint(Tensor<Float>(from: text), to: &textFeatureFloatDebug)
+  print("MiniMax-H3 text feature as an exact Float32 view:")
+  print(textFeatureFloatDebug)
+  let textFeatureFloatPath = options.output + "/text_feature_f32_debug.txt"
+  try! textFeatureFloatDebug.write(
+    to: URL(fileURLWithPath: textFeatureFloatPath), atomically: true, encoding: .utf8)
+  print("MiniMax-H3 wrote", textFeatureFloatPath)
+}
+graph.garbageCollect()
 if options.textOnly {
   print("MiniMax-H3 text embedding shape:", text.shape)
   exit(0)
 }
 let (videoLatents, audioRows) = runDenoiser(text: text)
+graph.garbageCollect()
 if options.saveLatentsOnly {
   writeFloat32Tensor(videoLatents, name: "video_latents", outputDirectory: options.output)
   writeFloat32Tensor(audioRows, name: "audio_latents", outputDirectory: options.output)
+  exit(0)
+}
+if options.frames == 1 {
+  writeFloat32Tensor(videoLatents, name: "video_latents", outputDirectory: options.output)
+  writeFloat32Tensor(audioRows, name: "audio_latents", outputDirectory: options.output)
+  decodeVideo(videoLatents, outputDirectory: options.output)
   exit(0)
 }
 decodeAudio(audioRows, outputDirectory: options.output)

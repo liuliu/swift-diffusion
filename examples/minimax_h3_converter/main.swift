@@ -426,6 +426,14 @@ func tokenParityMetrics(_ actual: Tensor<Float>, _ expected: Tensor<Float>) -> T
   precondition(actual.shape == expected.shape && actual.shape.count == 2)
   let tokenCount = actual.shape[0]
   let featureCount = actual.shape[1]
+  // Bulk-copy CPU values once. Scalar Tensor subscripting dominates large
+  // vision parity checks in debug builds; the reductions below are unchanged.
+  let actualValues = actual.toCPU().contiguous().withUnsafeBytes {
+    Array($0.bindMemory(to: Float.self))
+  }
+  let expectedValues = expected.toCPU().contiguous().withUnsafeBytes {
+    Array($0.bindMemory(to: Float.self))
+  }
   var maximumAbsoluteDifference: Float = 0
   var maximumReferenceMagnitude: Float = 0
   var minimumCosine: Float = 1
@@ -445,8 +453,8 @@ func tokenParityMetrics(_ actual: Tensor<Float>, _ expected: Tensor<Float>) -> T
     var actualSquared: Double = 0
     var expectedSquared: Double = 0
     for feature in 0..<featureCount {
-      let lhs = actual[token, feature]
-      let rhs = expected[token, feature]
+      let lhs = actualValues[token * featureCount + feature]
+      let rhs = expectedValues[token * featureCount + feature]
       if !lhs.isFinite || !rhs.isFinite {
         allFinite = false
         continue
@@ -4078,6 +4086,10 @@ case "parity-qwen-block":
   precondition(runQwenBlockParity(), "MiniMax-H3 Qwen block parity failed")
 case "export-qwen":
   exportQwenTextModel()
+case "parity-qwen-vision":
+  runH3QwenVisionParity()
+case "export-qwen-vision":
+  runH3QwenVisionParity(export: true)
 case "export-dit":
   exportMainDiT(requireFullParity: true)
 case "export-ref2va-dit":

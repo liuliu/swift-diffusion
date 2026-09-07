@@ -96,6 +96,9 @@ struct H3PackedLayout {
 
 func alignFrameCount(_ requested: Int) -> Int {
   precondition(requested > 0)
+  // A single image is encoded / decoded directly by the official VAE rather than going
+  // through its 17-frame temporal chunking path.
+  if requested == 1 { return 1 }
   var count = requested
   while count % H3Config.framesPerChunk != H3Config.latentsPerChunk {
     count += 1
@@ -104,6 +107,7 @@ func alignFrameCount(_ requested: Int) -> Int {
 }
 
 func videoLatentFrameCount(_ frames: Int) -> Int {
+  if frames == 1 { return 1 }
   precondition(frames % H3Config.framesPerChunk == H3Config.latentsPerChunk)
   return (frames - H3Config.latentsPerChunk) / H3Config.framesPerChunk
     * H3Config.latentsPerChunk + 2
