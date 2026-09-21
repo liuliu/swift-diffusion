@@ -1234,6 +1234,27 @@ swift_binary(
 )
 
 swift_binary(
+    name = "qwen_image21",
+    srcs = [
+        "qwen_image21/dit.swift",
+        "qwen_image21/edit.swift",
+        "qwen_image21/generation.swift",
+        "qwen_image21/main.swift",
+        "qwen_image21/text.swift",
+        "qwen_image21/vae.swift",
+        "qwen_image21/vision.swift",
+    ],
+    # Preprocessing scripts and assets are resolved next to the source by the runner.
+    data = [],
+    deps = [
+        "//:diffusion",
+        "@PythonKit",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "minimax_h3",
     srcs = [
         "minimax_h3/main.swift",
