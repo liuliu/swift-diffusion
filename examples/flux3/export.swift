@@ -4,17 +4,48 @@ import NNC
 import NNCPythonConversion
 import PythonKit
 
+// Preserve the original values in these underflow-sensitive projections.
+let flux3FP32StorageWeights = [
+  "time_in.out_layer.weight": "__dit__[t-t_2-0-0]",
+  "ref_time_in.out_layer.weight": "__dit__[t-next_t_2-0-0]",
+  "final_layer.image.adaLN_modulation.1.weight": "__dit__[t-final_modulation-0-0]",
+]
+
 // Export is an explicit mode; normal parity runs never write checkpoint weights.
-let exporting = ["export", "export-dit"].contains(CommandLine.arguments.dropFirst().first ?? "")
-let checkpoints = Flux3Checkpoints()
+let exportingFP16 = CommandLine.arguments.dropFirst().first == "export-dit-f16"
+let exporting =
+  exportingFP16 || ["export", "export-dit"].contains(CommandLine.arguments.dropFirst().first ?? "")
+let checkpoints: Flux3Checkpoints = {
+  var environment = env
+  if exportingFP16 && environment["FLUX3_DIT_CHECKPOINT"] == nil {
+    environment["FLUX3_DIT_CHECKPOINT"] = "/slow/Data/flux_3_image_klein_dit_f16.ckpt"
+  }
+  return Flux3Checkpoints(environment: environment)
+}()
 
 func exportAndVerify<T: TensorNumeric>(
   _ type: T.Type, key: String, model: Model, fresh: Model,
-  inputs: [DynamicGraph.AnyTensor], expected: [DynamicGraph.AnyTensor]
+  inputs: [DynamicGraph.AnyTensor], expected: [DynamicGraph.AnyTensor], fp16Storage: Bool = false
 ) {
   let exportStorePath = checkpoints.path(for: key) + ".partial"
   print("Exporting", key, "to", exportStorePath)
-  try! graph.openStore(exportStorePath) { try! $0.write(key, model: model, strict: true) }.get()
+  try! graph.openStore(exportStorePath) { store in
+    if fp16Storage {
+      // Validate FP16-rounded weights with FP32 arithmetic before exporting.
+      // FP16 activation scaling is a separate change; the unscaled residuals overflow.
+      try! store.write(key, model: model, strict: true) { name, tensor in
+        let value = Tensor<Float>(from: tensor).toCPU()
+        if flux3FP32StorageWeights.values.contains(name) {
+          try! store.write(name, tensor: value, strict: true)
+        } else {
+          try! store.write(name, tensor: Tensor<Float16>(from: value), strict: true)
+        }
+        return .skip
+      }
+    } else {
+      try! store.write(key, model: model, strict: true)
+    }
+  }.get()
   fresh.maxConcurrency = .limit(1)
   fresh.compile(inputs: inputs)
   try! graph.openStore(exportStorePath, flags: .readOnly) {
@@ -63,9 +94,16 @@ func exportDiTCheckpoint() {
   precondition(
     !FileManager.default.fileExists(atPath: exportStorePath),
     "Remove the incomplete .partial export before retrying")
-  runDiT(BFloat16.self, name: "bfloat16")
+  if exportingFP16 {
+    runDiT(Float.self, name: "float32", fp16Weights: true)
+  } else {
+    runDiT(BFloat16.self, name: "bfloat16")
+  }
   verifyDiTStoreNames()
-  reference.finish("export-dit")
+  if exportingFP16 {
+    reference.verify_dit_storage(exportStorePath, Array(flux3FP32StorageWeights.values))
+  }
+  reference.finish(exportingFP16 ? "export-dit-f16" : "export-dit")
   let status = rename(exportStorePath, checkpoints.dit)
   precondition(status == 0, "Cannot replace checkpoint")
   print("DiT export complete:", checkpoints.dit)

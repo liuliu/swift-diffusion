@@ -13,6 +13,9 @@ enum Flux3Config {
   static let ropeAxes = [32, 32, 32, 32]
   static let ropeTheta: Double = 10_000
   static let epsilon: Float = 1e-6
+  // Power-of-two compensation keeps the FP16 projection outputs in range.
+  static let fp16TextScale: Float = 4
+  static let fp16FFNScale: Float = 8
 }
 
 struct Flux3Binding {
@@ -40,6 +43,11 @@ func flux3ModulatedNorm<T: TensorNumeric>(
   _ x: Model.IO, scale: Model.IO, shift: Model.IO, type: T.Type
 ) -> Model.IO {
   let norm = LayerNorm(epsilon: Flux3Config.epsilon, axis: [2], elementwiseAffine: false)
+  if T.dataType == .Float16 {
+    // Residuals, normalization, and AdaLN stay in FP32 until the projections.
+    return ((1 + scale.to(.Float32)) .* norm(x.to(.Float32)) + shift.to(.Float32))
+      .to(.Float16)
+  }
   if T.dataType == .BFloat16 {
     // The native sampler's autocast promotes layer_norm and modulation to FP32.
     // 1 + scale is still rounded in BF16; the following linear rounds its input.
@@ -95,7 +103,18 @@ func Flux3Block<T: TensorNumeric>(
   let w1 = Dense(count: 9_216, noBias: true, name: "\(name)_w1")
   let w3 = Dense(count: 9_216, noBias: true, name: "\(name)_w3")
   let w2 = Dense(count: 3_072, noBias: true, name: "\(name)_w2")
-  let result = x + gate .* (output(attended) + w2(w3(u) .* flux3SiLU(w1(u), type)))
+  let result: Model.IO
+  if T.dataType == .Float16 {
+    // Both FFN projections are bias-free. Scale the gated product before w2,
+    // then restore its magnitude only after converting the output to FP32.
+    let product = Functional.swishMul(
+      value: w3(u), gate: w1(u), scale: 1 / Flux3Config.fp16FFNScale)
+    let ffn = w2(product).to(.Float32) * Flux3Config.fp16FFNScale
+    let update = gate.to(.Float32) .* (output(attended).to(.Float32) + ffn)
+    result = x.to(.Float32) + update
+  } else {
+    result = x + gate .* (output(attended) + w2(w3(u) .* flux3SiLU(w1(u), type)))
+  }
   return (
     // Like FLUX.2 and Z Image, names belong to the parameterized leaf models.
     // The store supplies occurrence indices for repeated block projections.
@@ -129,12 +148,15 @@ func Flux3DiT<T: TensorNumeric>(
   var bindings = [Flux3Binding]()
   func dense(_ count: Int, _ key: String, _ name: String) -> Model {
     let layer = Dense(count: count, noBias: true, name: name)
-    bindings.append(.init(model: layer, key: key + ".weight"))
+    let keepFP32 = T.dataType == .Float16 && ["t_2", "next_t_2", "final_modulation"].contains(name)
+    bindings.append(
+      .init(model: layer, key: key + ".weight", transform: keepFP32 ? "float32" : "identity"))
     return layer
   }
   let time0 = dense(3_072, "time_in.in_layer", "t_0")
   let time2 = dense(3_072, "time_in.out_layer", "t_2")
-  let embeddedTime = time2(flux3SiLU(time0(time), type))
+  let timeHidden = flux3SiLU(time0(time), type)
+  let embeddedTime = time2(T.dataType == .Float16 ? timeHidden.to(.Float32) : timeHidden)
   func timeRow(_ i: Int) -> Model.IO {
     embeddedTime.reshaped([1, 3_072], offset: [i, 0], strides: [3_072, 1]).contiguous()
   }
@@ -143,12 +165,13 @@ func Flux3DiT<T: TensorNumeric>(
   if flowMap {
     let next0 = dense(3_072, "ref_time_in.in_layer", "next_t_0")
     let next2 = dense(3_072, "ref_time_in.out_layer", "next_t_2")
-    let vector = next2(flux3SiLU(next0(nextTime), type))
+    let hidden = flux3SiLU(next0(nextTime), type)
+    let vector = next2(T.dataType == .Float16 ? hidden.to(.Float32) : hidden)
     xVector = xVector + vector
     cVector = cVector + vector
   }
   func modulation(_ vector: Model.IO, _ key: String, _ name: String) -> [Model.IO] {
-    let projected = dense(9_216, key + ".lin", name)(flux3SiLU(vector, type))
+    let projected = dense(9_216, key + ".lin", name)(flux3SiLU(vector, type).to(T.dataType))
     return (0..<3).map {
       projected.reshaped(
         [1, 1, 3_072], offset: [0, 0, $0 * 3_072],
@@ -167,7 +190,15 @@ func Flux3DiT<T: TensorNumeric>(
       strides: [length * 128, 128, 128, 1]
     ).contiguous()
   }
-  var c = dense(3_072, "txt_in", "context_embedder")(context)
+  let contextEmbedder = dense(3_072, "txt_in", "context_embedder")
+  var c: Model.IO
+  if T.dataType == .Float16 {
+    c =
+      contextEmbedder(context * (1 / Flux3Config.fp16TextScale)).to(.Float32)
+      * Flux3Config.fp16TextScale
+  } else {
+    c = contextEmbedder(context)
+  }
   var image = dense(3_072, "emb_in.image", "x_embedder")(x)
   let cr = rotarySlice(0, textLength)
   let xr = rotarySlice(textLength, imageLength)
@@ -195,8 +226,10 @@ func Flux3DiT<T: TensorNumeric>(
   capture("x_refiner", image)
   var h = Functional.concat(axis: 1, c, image)
   // Broadcast the modality modulation before joining the sequence.
+  let residualType = T.dataType == .Float16 ? DataType.Float32 : T.dataType
   var mods = (0..<3).map { i in
-    Functional.concat(axis: 1, cs[i] + c * 0, xs[i] + image * 0)
+    Functional.concat(
+      axis: 1, cs[i].to(residualType) + c * 0, xs[i].to(residualType) + image * 0)
   }
   if referenceLength > 0 {
     let rm = modulation(cVector, "early_stream_modulations.image_cond", "ref_refiner_modulation")
@@ -212,7 +245,9 @@ func Flux3DiT<T: TensorNumeric>(
     }
     capture("ref_refiner", r)
     h = Functional.concat(axis: 1, h, r)
-    mods = (0..<3).map { Functional.concat(axis: 1, mods[$0], rs[$0] + r * 0) }
+    mods = (0..<3).map {
+      Functional.concat(axis: 1, mods[$0], rs[$0].to(residualType) + r * 0)
+    }
   }
   for i in 0..<Flux3Config.layers {
     let (block, weights) = Flux3Block(

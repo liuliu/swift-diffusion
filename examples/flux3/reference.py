@@ -57,6 +57,46 @@ def state(component):
     return load_file(str(ROOT / ("model.safetensors" if component == "dit" else "ae.safetensors")))
 
 
+def fp16_state(weights, device, keep_float32=()):
+    """Audit storage conversion, preserving selected projections from the source."""
+    keep_float32 = set(keep_float32)
+    assert keep_float32 <= set(weights.keys()), sorted(keep_float32 - set(weights.keys()))
+    converted, rows = {}, []
+    for name, value in weights.items():
+        x = value.to(device=f"cuda:{device}", dtype=torch.float32)
+        stored = x if name in keep_float32 else x.half()
+        back = stored.float()
+        row = dict(name=name, source_dtype=str(value.dtype), storage_dtype=str(stored.dtype),
+                   shape=list(value.shape), count=x.numel(),
+                   max_abs=float(x.abs().max()), nonfinite=int((~x.isfinite()).sum()),
+                   overflow=int((x.isfinite() & ~stored.isfinite()).sum()),
+                   underflow_to_zero=int(((x != 0) & (stored == 0)).sum()),
+                   subnormal=int(((stored != 0) & (back.abs() < torch.finfo(stored.dtype).tiny)).sum()),
+                   max_abs_error=float((x-back).abs().max()))
+        rows.append(row)
+        converted[name] = stored.cpu()
+    totals = {key: sum(r[key] for r in rows) for key in
+              ["count", "nonfinite", "overflow", "underflow_to_zero", "subnormal"]}
+    report = dict(tensors=rows, totals=totals, keep_float32=sorted(keep_float32),
+                  max_abs=max(r["max_abs"] for r in rows))
+    (ARTIFACTS / "fp16-weight-audit.json").write_text(json.dumps(report, indent=2) + "\n")
+    print("FP16 weight audit:", json.dumps(totals), flush=True)
+    assert not totals["nonfinite"] and not totals["overflow"], "Non-finite FP16 weights"
+    return converted
+
+
+def verify_dit_storage(path, keep_float32):
+    """Check SQLite dtype metadata before publishing the mixed-storage export."""
+    import sqlite3
+    with sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True) as db:
+        dtypes = dict(db.execute("SELECT name, datatype FROM tensors"))
+    keep_float32 = set(keep_float32)
+    assert len(dtypes) == 402 and keep_float32 <= dtypes.keys()
+    assert all(dtype == (16384 if name in keep_float32 else 131072)
+               for name, dtype in dtypes.items()), "Unexpected DiT storage dtype"
+    print(f"Verified SQLite dtypes: {len(keep_float32)} FP32, {len(dtypes)-len(keep_float32)} FP16", flush=True)
+
+
 def weight(weights, key, transform="identity", heads=0):
     w = weights[key]
     if transform == "qk":
@@ -193,7 +233,62 @@ def dit_case(text_length, height, width, references, seed, precision="float32", 
                 reference=rand(len(ref_ids), 128), ids=ids.numpy(), time=time, target=target)
 
 
-def dit_reference(weights, case, precision, device, flow_map=True, debug=True):
+def configure_fp16_dit(model, text_scale, ffn_scale, keep_float32):
+    """Reference for the compensated FP16 graph; retain upstream module weights."""
+    import types
+    import torch.nn.functional as F
+    import flux3.dit as module
+
+    def norm(x, scale, shift):
+        return (1. + scale.float()) * F.layer_norm(x.float(), (x.shape[-1],), eps=1e-6) + shift.float()
+
+    def fp32_linear(self, x):
+        with torch.autocast("cuda", enabled=False):
+            return F.linear(x.float(), self.weight.float())
+
+    def text_linear(self, x):
+        return F.linear(x / text_scale, self.weight).float() * text_scale
+
+    def block(self, x, freqs, bounds, mod):
+        shift, scale, gate = mod
+        u = norm(x, scale, shift).half()
+        split = lambda t: t.reshape(1, t.shape[0], self.heads, -1).transpose(1, 2)
+        q, k = self.norm(split(self.q_proj(u)), split(self.k_proj(u)), freqs)
+        attn = module.packed_attention(q, k, split(self.v_proj(u)).to(q.dtype), bounds)
+        g, up = self.mlp_in(u).chunk(2, dim=-1)
+        # Match the fused swishMul kernel's FP32 intermediates and FP16 output.
+        product = (up.float() * (g.float() * torch.sigmoid(g.float())) / ffn_scale).half()
+        ffn = self.mlp_out(product).float() * ffn_scale
+        return x.float() + gate.float() * (self.attn_out(attn).float() + ffn)
+
+    def last(self, x, vec):
+        shift, scale = self.adaLN_modulation(vec).chunk(2, dim=-1)
+        return self.linear(norm(x, scale, shift).half())
+
+    for name, child in model.named_modules():
+        if isinstance(child, module.Block):
+            child.forward = types.MethodType(block, child)
+        elif isinstance(child, module.LastLayer):
+            child.forward = types.MethodType(last, child)
+        elif name + ".weight" in keep_float32:
+            child.forward = types.MethodType(fp32_linear, child)
+    model.txt_in.forward = types.MethodType(text_linear, model.txt_in)
+
+
+def dit_prompt_case(device, precision="float16"):
+    prompt = ("A red ceramic teapot on a wooden table beside a window, soft morning light, "
+              "a small white cup and a folded linen napkin, realistic photograph.")
+    text = text_case(prompt)
+    features = text_reference(state("text"), text, "float16", device)
+    context = concatenate_features([features[f"hidden_{i}"] for i in [4,8,12,16,20,24,28,32]])
+    context = torch.from_numpy(context).bfloat16().float().numpy()
+    case = dit_case(len(context), 32, 32, [], 42, precision, 1., 6.93 * (15/16) / (1 + 5.93 * (15/16)))
+    case["context"] = context
+    return case
+
+
+def dit_reference(weights, case, precision, device, flow_map=True, debug=True,
+                  fp16_scales=None, keep_float32=()):
     import flux3.dit as module
     original_attention = module.packed_attention
     if precision == "float32":
@@ -211,10 +306,14 @@ def dit_reference(weights, case, precision, device, flow_map=True, debug=True):
     try:
         with torch.device("meta"):
             model = module.DiT(flow_map)
-        sd = {k: v.to(dtype(precision)) for k, v in weights.items()
+        sd = {k: v.to(torch.float32 if fp16_scales and k in keep_float32 else dtype(precision))
+              for k, v in weights.items()
               if flow_map or not k.startswith("ref_time_in.")}
         model.load_state_dict(sd, strict=True, assign=True)
         model = model.to(f"cuda:{device}").eval()
+        if fp16_scales:
+            assert precision == "float16"
+            configure_fp16_dit(model, *fp16_scales, keep_float32)
         result = {}
         nc, nx, nr = len(case["context"]), len(case["x"]), len(case["reference"])
         def hook(name, shared=False):

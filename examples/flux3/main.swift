@@ -89,17 +89,44 @@ func runText<T: TensorNumeric>(_ type: T.Type, name: String) {
   }
 }
 
-func runDiT<T: TensorNumeric>(_ type: T.Type, name: String) {
-  let state = reference.state("dit")
+func runDiT<T: TensorNumeric>(_ type: T.Type, name: String, fp16Weights: Bool = false) {
+  let original = reference.state("dit")
+  let state =
+    fp16Weights
+    ? reference.fp16_state(original, pythonDevice, Array(flux3FP32StorageWeights.keys)) : original
   // Different aspect ratios, no reference, multiple references, and destination times.
-  let cases: [(Int, Int, [[Int]], Float, Float)] = [
+  var cases: [(Int, Int, [[Int]], Float, Float)] = [
     (2, 3, [], 0.75, 0.5), (3, 2, [[2, 2], [1, 3]], 0.625, 0.12345),
   ]
+  if T.dataType == .Float16 { cases.append((32, 32, [], 1, 0)) }
   for (index, spec) in cases.enumerated() {
-    let textLength = 16
-    let pack = reference.dit_case(
-      textLength, spec.0, spec.1, spec.2, 42 + index, name, spec.3, spec.4)
-    let expected = reference.dit_reference(state, pack, name, pythonDevice)
+    let pack =
+      index == 2
+      ? reference.dit_prompt_case(pythonDevice, name)
+      : reference.dit_case(16, spec.0, spec.1, spec.2, 42 + index, name, spec.3, spec.4)
+    let textLength = Int(pack["context"].shape[0])!
+    let expected: PythonObject
+    if T.dataType == .Float16 {
+      expected = reference.dit_reference(
+        state, pack, name, pythonDevice,
+        fp16_scales: [Flux3Config.fp16TextScale, Flux3Config.fp16FFNScale],
+        keep_float32: Array(flux3FP32StorageWeights.keys))
+    } else {
+      expected = reference.dit_reference(state, pack, name, pythonDevice)
+    }
+    let baseline =
+      fp16Weights
+      ? reference.dit_reference(original, pack, "float32", pythonDevice) : Python.None
+    if fp16Weights {
+      for key in expected.keys() {
+        precondition(
+          Bool(
+            reference.metrics(
+              "fp16_\(T.dataType == .Float16 ? "activations" : "weights")/case\(index)/\(key)",
+              expected[key], baseline[key], T.dataType == .Float16 ? 0.03 : 0.001))!,
+          "FP16 output exceeds parity tolerance")
+      }
+    }
     let refLength = spec.2.reduce(0) { $0 + $1[0] * $1[1] }
     graph.withNoGrad {
       let x = graph.variable(Tensor<T>(from: cpu(pack["x"])).toGPU(device))
@@ -128,9 +155,21 @@ func runDiT<T: TensorNumeric>(_ type: T.Type, name: String) {
       load(type, bindings, state)
       let results = model(inputs: x, Array(inputs.dropFirst()))
       for (i, output) in results.enumerated() {
-        compare(
-          "dit/\(name)/case\(index)/\(names[i])", output.as(of: T.self), expected[names[i]],
-          tolerance: name == "float32" ? 0.001 : 0.05)
+        let label = "dit/\(name)/case\(index)/\(names[i])"
+        if T.dataType == .Float16 && names[i] != "output" {
+          compare(label, output.as(of: Float.self), expected[names[i]], tolerance: 0.01)
+        } else {
+          compare(
+            label, output.as(of: T.self), expected[names[i]],
+            // The two FP16 GEMM / attention backends accumulate rounding drift.
+            // Also compare Swift directly with the original FP32 control below.
+            tolerance: name == "float32" ? 0.001 : (name == "float16" ? 0.02 : 0.05))
+        }
+        if T.dataType == .Float16 && names[i] == "output" {
+          compare(
+            "dit/float16_vs_float32/case\(index)/output", output.as(of: T.self),
+            baseline["output"], tolerance: 0.03)
+        }
       }
       if exporting && index == cases.count - 1 {
         let (fresh, _, _) = Flux3DiT(
@@ -138,7 +177,7 @@ func runDiT<T: TensorNumeric>(_ type: T.Type, name: String) {
           imageLength: spec.0 * spec.1, referenceLength: refLength, debug: true)
         exportAndVerify(
           type, key: "dit", model: model, fresh: fresh,
-          inputs: inputs, expected: results)
+          inputs: inputs, expected: results, fp16Storage: fp16Weights)
       }
     }
   }
@@ -295,14 +334,14 @@ switch mode {
 case "export":
   exportCheckpoint()
   exit(0)
-case "export-dit":
+case "export-dit", "export-dit-f16":
   exportDiTCheckpoint()
   exit(0)
 case "parity-dit":
-  precondition(
-    precision != "float16", "Use FP32 or BF16 for DiT until activation scaling is implemented")
   if precision == "bfloat16" {
     runDiT(BFloat16.self, name: precision)
+  } else if precision == "float16" {
+    runDiT(Float16.self, name: precision, fp16Weights: true)
   } else {
     runDiT(Float.self, name: "float32")
   }
@@ -323,10 +362,13 @@ case "parity":
   runPipeline()
 case "--help", "help":
   print(
-    "Usage: bash examples/flux3/run.sh [export|export-dit|parity|parity-text|parity-vae|parity-dit|parity-pipeline]"
+    "Usage: bash examples/flux3/run.sh [export|export-dit|export-dit-f16|parity|parity-text|parity-vae|parity-dit|parity-pipeline]"
   )
-  print("FLUX3_DTYPE=float32|bfloat16 for DiT; float32|float16|bfloat16 for text.")
+  print("FLUX3_DTYPE=float32|float16|bfloat16 for DiT and text.")
   print("FLUX3_DEVICE=1, FLUX3_REFERENCE_DEVICE=0; export reruns parity before writing.")
+  print(
+    "export-dit-f16 validates FP16 weights with FP32 arithmetic; unscaled FP16 activations overflow."
+  )
   print(
     "FLUX3_TEXT_CHECKPOINT, FLUX3_DIT_CHECKPOINT, FLUX3_VAE_CHECKPOINT override the three files.")
   exit(0)
