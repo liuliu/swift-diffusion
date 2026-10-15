@@ -1189,6 +1189,42 @@ swift_binary(
 )
 
 swift_binary(
+    name = "flux3",
+    srcs = [
+        "flux3/dit.swift",
+        "flux3/export.swift",
+        "flux3/main.swift",
+        "flux3/runtime.swift",
+        "flux3/text.swift",
+        "flux3/tokenizer.swift",
+        "flux3/vae.swift",
+    ],
+    # The runner resolves preprocessing and parity scripts next to the source.
+    data = [],
+    deps = [
+        "@PythonKit",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
+    name = "flux3_generate",
+    srcs = [
+        "flux3/dit.swift",
+        "flux3/generate.swift",
+        "flux3/runtime.swift",
+        "flux3/text.swift",
+        "flux3/tokenizer.swift",
+        "flux3/vae.swift",
+    ],
+    deps = [
+        "@SwiftPNG//:PNG",
+        "@s4nnc//nnc",
+    ],
+)
+
+swift_binary(
     name = "flux2",
     srcs = ["flux2/main.swift"],
     data = [
