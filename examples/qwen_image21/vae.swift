@@ -14,47 +14,74 @@ struct Q21VAEBinding {
   var norm = false
 }
 
-// Single-image specialization of the released VAE. All convolutions are 2D;
-// temporal resampling convolutions are inactive for the first/single frame.
-func Q21VAE(encoder: Bool, height: Int, width: Int, device: Int = 1)
+// Single-image specialization: temporal resampling is inactive. FP16 uses
+// temporal-kernel-one convolutions for cuDNN FP32 accumulation.
+func Q21VAE(
+  encoder: Bool, height: Int, width: Int, device: Int = 1, precision: DataType = .Float32
+)
   -> (Model, [Q21VAEBinding])
 {
+  precondition(precision == .Float32 || precision == .Float16)
   let input = Input()
   var bindings = [Q21VAEBinding]()
   var h = height
   var w = width
-  func conv(_ key: String, _ channels: Int, kernel: Int = 3, down: Bool = false) -> Model {
-    let border = kernel / 2
+  func conv(
+    _ key: String, _ channels: Int, from: Int, kernel: Int = 3,
+    down: Bool = false, up: Bool = false
+  ) -> (Model.IO) -> Model.IO {
+    let border = down ? 0 : kernel / 2
+    let stride = down ? 2 : 1
+    let spatialScale = up ? 2 : 1
+    let inputHeight = h * spatialScale + (down ? 1 : 0)
+    let inputWidth = w * spatialScale + (down ? 1 : 0)
+    let outputHeight = h * spatialScale / stride
+    let outputWidth = w * spatialScale / stride
+    let half = precision == .Float16
     let model = Convolution(
-      groups: 1, filters: channels, filterSize: [kernel, kernel],
+      groups: 1, filters: channels, filterSize: half ? [1, kernel, kernel] : [kernel, kernel],
       hint: Hint(
-        stride: [down ? 2 : 1, down ? 2 : 1],
+        stride: half ? [1, stride, stride] : [stride, stride],
         border: Hint.Border(
-          begin: [down ? 0 : border, down ? 0 : border],
-          end: [down ? 0 : border, down ? 0 : border])),
+          begin: half ? [0, border, border] : [border, border],
+          end: half ? [0, border, border] : [border, border])),
       name: key.replacingOccurrences(of: ".", with: "_"))
     bindings.append(.init(model: model, key: key))
-    return model
+    return { x in
+      if half {
+        return model(x.reshaped([1, from, 1, inputHeight, inputWidth]))
+          .reshaped([1, channels, outputHeight, outputWidth])
+      }
+      return model(x)
+    }
   }
   func channelNorm(_ x: Model.IO, _ key: String, channels: Int) -> Model.IO {
-    let gamma = Parameter<Float>(
-      .GPU(device), .NCHW(1, channels, 1, 1), name: key.replacingOccurrences(of: ".", with: "_"))
+    let name = key.replacingOccurrences(of: ".", with: "_")
+    let gamma: Model
+    if precision == .Float16 {
+      gamma = Parameter<Float16>(.GPU(device), .NCHW(1, channels, 1, 1), name: name)
+    } else {
+      gamma = Parameter<Float>(.GPU(device), .NCHW(1, channels, 1, 1), name: name)
+    }
     bindings.append(.init(model: gamma, key: key, norm: true))
-    let sum = (x .* x).reduced(.sum, axis: [1])
+    // Normalize in FP32, then round before applying scale/gamma, as in PyTorch.
+    let normalizedInput = x.to(.Float32)
+    let sum = (normalizedInput .* normalizedInput).reduced(.sum, axis: [1])
     let inverse = sum.clamped(1e-24...).pow(-0.5)
-    return (x .* inverse) * Float(channels).squareRoot() .* gamma()
+    return (normalizedInput .* inverse).to(precision) * Float(channels).squareRoot() .* gamma()
   }
+  func silu(_ x: Model.IO) -> Model.IO { x.to(.Float32).swish().to(precision) }
   func residual(_ x: Model.IO, _ key: String, from: Int, to: Int) -> Model.IO {
-    let shortcut = from == to ? x : conv(key + ".conv_shortcut", to, kernel: 1)(x)
-    let a = conv(key + ".conv1", to)(channelNorm(x, key + ".norm1", channels: from).swish())
-    let b = conv(key + ".conv2", to)(channelNorm(a, key + ".norm2", channels: to).swish())
+    let shortcut = from == to ? x : conv(key + ".conv_shortcut", to, from: from, kernel: 1)(x)
+    let a = conv(key + ".conv1", to, from: from)(
+      silu(channelNorm(x, key + ".norm1", channels: from)))
+    let b = conv(key + ".conv2", to, from: to)(silu(channelNorm(a, key + ".norm2", channels: to)))
     return b + shortcut
   }
   func attention(_ x: Model.IO, _ key: String, channels: Int) -> Model.IO {
     let normalized = channelNorm(x, key + ".norm", channels: channels)
-    let qkv = conv(key + ".to_qkv", 3 * channels, kernel: 1)(normalized).reshaped([
-      3 * channels, h * w,
-    ])
+    let qkv = conv(key + ".to_qkv", 3 * channels, from: channels, kernel: 1)(normalized)
+      .to(.Float32).reshaped([3 * channels, h * w])
     let chunks = (0..<3).map { i in
       qkv.reshaped([channels, h * w], offset: [i * channels, 0], strides: [h * w, 1]).contiguous()
     }
@@ -64,7 +91,7 @@ func Q21VAE(encoder: Bool, height: Int, width: Int, device: Int = 1)
     let attended = Matmul(transposeB: (0, 1))(chunks[2], probabilities).reshaped([
       1, channels, h, w,
     ])
-    return x + conv(key + ".proj", channels, kernel: 1)(attended)
+    return x + conv(key + ".proj", channels, from: channels, kernel: 1)(attended.to(precision))
   }
   func middle(_ x: Model.IO, _ key: String, channels: Int) -> Model.IO {
     let a = residual(x, key + ".resnets.0", from: channels, to: channels)
@@ -101,7 +128,7 @@ func Q21VAE(encoder: Bool, height: Int, width: Int, device: Int = 1)
   }
   var x: Model.IO
   if encoder {
-    x = conv("encoder.conv_in", 96)(input)
+    x = conv("encoder.conv_in", 96, from: 4)(input)
     var channels = 96
     for (stage, next) in Q21VAEConfig.encoderChannels.enumerated() {
       let key = "encoder.down_blocks.\(stage)"
@@ -113,7 +140,7 @@ func Q21VAE(encoder: Bool, height: Int, width: Int, device: Int = 1)
         x = residual(x, key + ".resnets.\(block)", from: block == 0 ? channels : next, to: next)
       }
       if down {
-        x = conv(key + ".downsampler.resample.1", next, down: true)(
+        x = conv(key + ".downsampler.resample.1", next, from: next, down: true)(
           x.padded(.zero, begin: [0, 0, 0, 0], end: [0, 0, 1, 1]))
       }
       x = x + shortcut
@@ -124,12 +151,12 @@ func Q21VAE(encoder: Bool, height: Int, width: Int, device: Int = 1)
       }
     }
     x = middle(x, "encoder.mid_block", channels: channels)
-    x = conv("encoder.conv_out", 128)(
-      channelNorm(x, "encoder.norm_out", channels: channels).swish())
-    x = conv("quant_conv", 128, kernel: 1)(x)
+    x = conv("encoder.conv_out", 128, from: channels)(
+      silu(channelNorm(x, "encoder.norm_out", channels: channels)))
+    x = conv("quant_conv", 128, from: 128, kernel: 1)(x)
   } else {
-    x = conv("post_quant_conv", 64, kernel: 1)(input)
-    x = conv("decoder.conv_in", 1_152)(x)
+    x = conv("post_quant_conv", 64, from: 64, kernel: 1)(input)
+    x = conv("decoder.conv_in", 1_152, from: 64)(x)
     x = middle(x, "decoder.mid_block", channels: 1_152)
     var channels = 1_152
     for (stage, next) in Q21VAEConfig.decoderChannels.enumerated() {
@@ -140,7 +167,7 @@ func Q21VAE(encoder: Bool, height: Int, width: Int, device: Int = 1)
         x = residual(x, key + ".resnets.\(block)", from: block == 0 ? channels : next, to: next)
       }
       if up {
-        x = conv(key + ".upsampler.resample.1", next)(
+        x = conv(key + ".upsampler.resample.1", next, from: next, up: true)(
           Upsample(.nearest, widthScale: 2, heightScale: 2)(x))
         x = x + shortcut!
         h *= 2
@@ -148,7 +175,8 @@ func Q21VAE(encoder: Bool, height: Int, width: Int, device: Int = 1)
       }
       channels = next
     }
-    x = conv("decoder.conv_out", 4)(channelNorm(x, "decoder.norm_out", channels: channels).swish())
+    x = conv("decoder.conv_out", 4, from: channels)(
+      silu(channelNorm(x, "decoder.norm_out", channels: channels)))
   }
   return (Model([input], [x]), bindings)
 }

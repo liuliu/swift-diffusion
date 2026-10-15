@@ -23,7 +23,9 @@ func q21VisionForward<T: TensorNumeric>(
     let (model, _) = Q21VisionModel(type, grids: grids)
     model.maxConcurrency = .limit(1)
     model.compile(inputs: x, ids, weights, rotary)
-    graph.openStore(textCheckpoint) { try! $0.read("vision_model", model: model, strict: true) }
+    graph.openStore(textCheckpoint, flags: .readOnly) {
+      try! $0.read("vision_model", model: model, strict: true)
+    }
     let results = model(inputs: x, ids, weights, rotary).map {
       Tensor<Float>(from: $0.as(of: T.self).rawValue.toCPU())
     }
@@ -54,7 +56,9 @@ func q21EncodeEdit(paths: [String], prompt: String, resolution: Int)
     model.maxConcurrency = .limit(1)
     let mask = graph.variable(q21AttentionMask(text: length, pixels: 0).toGPU(device))
     model.compile(inputs: [tokens, rotary] + features + [mask])
-    graph.openStore(textCheckpoint) { try! $0.read("text_model", model: model, strict: true) }
+    graph.openStore(textCheckpoint, flags: .readOnly) {
+      try! $0.read("text_model", model: model, strict: true)
+    }
     let output = Tensor<Float>(
       from: model(inputs: tokens, rotary, features[0], features[1], features[2], features[3], mask)[
         0
@@ -89,12 +93,18 @@ func q21Edit() {
       let tensor = cpu(image)
       let h = tensor.shape[2]
       let w = tensor.shape[3]
-      let input = graph.variable(tensor.reshaped(.NCHW(1, 4, h, w)).toGPU(device))
-      let (encoder, _) = Q21VAE(encoder: true, height: h, width: w, device: device)
+      let input = graph.variable(
+        Tensor<Float16>(from: tensor.reshaped(.NCHW(1, 4, h, w)).toGPU(device)))
+      let (encoder, _) = Q21VAE(
+        encoder: true, height: h, width: w, device: device, precision: .Float16)
       encoder.maxConcurrency = .limit(1)
       encoder.compile(inputs: input)
-      graph.openStore(vaeCheckpoint) { try! $0.read("encoder", model: encoder, strict: true) }
-      let moments = encoder(inputs: input)[0].as(of: Float.self).rawValue.toCPU().makeNumpyArray()
+      graph.openStore(vaeCheckpoint, flags: .readOnly) {
+        try! $0.read("encoder", model: encoder, strict: true)
+      }
+      let moments = Tensor<Float>(
+        from: encoder(inputs: input)[0].as(of: Float16.self).rawValue.toCPU()
+      ).makeNumpyArray()
       normalizedLatents.append(reference.normalize_image_latent(moments))
     }
   }
@@ -116,7 +126,9 @@ func q21Edit() {
       layout: segments)
     model.maxConcurrency = .limit(1)
     model.compile(inputs: Functional.concat(axis: 0, source, x), context, time, rotary, mask)
-    graph.openStore(ditCheckpoint) { try! $0.read("dit", model: model, strict: true) }
+    graph.openStore(ditCheckpoint, flags: .readOnly) {
+      try! $0.read("dit", model: model, strict: true)
+    }
     for step in 0..<steps {
       let timestep = Float(inputs["timesteps"][step])!
       let time = graph.variable(q21TimeEmbedding(timestep).toGPU(device))

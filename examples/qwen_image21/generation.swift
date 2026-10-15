@@ -13,7 +13,9 @@ func q21EncodePrompt(_ prompt: String) -> Tensor<Float> {
     let (model, _) = Q21Text(Float16.self, length: length)
     model.maxConcurrency = .limit(1)
     model.compile(inputs: tokens, rotary)
-    graph.openStore(textCheckpoint) { try! $0.read("text_model", model: model, strict: true) }
+    graph.openStore(textCheckpoint, flags: .readOnly) {
+      try! $0.read("text_model", model: model, strict: true)
+    }
     let output = Tensor<Float>(
       from: model(inputs: tokens, rotary)[0].as(of: Float16.self).rawValue.toCPU()
     ).makeNumpyArray()
@@ -50,7 +52,9 @@ func q21Generate() {
       mixedPrecision: true)
     model.maxConcurrency = .limit(1)
     model.compile(inputs: x, context, time, rotary)
-    graph.openStore(ditCheckpoint) { try! $0.read("dit", model: model, strict: true) }
+    graph.openStore(ditCheckpoint, flags: .readOnly) {
+      try! $0.read("dit", model: model, strict: true)
+    }
     for step in 0..<steps {
       let timestep = Float(inputs["timesteps"][step])!
       let time = graph.variable(q21TimeEmbedding(timestep).toGPU(device))
@@ -75,13 +79,18 @@ func q21DecodeGeneration(
   let latentInput = reference.generation_latent_input(latent.makeNumpyArray(), height, width)
   graph.withNoGrad {
     let input = graph.variable(
-      cpu(latentInput).reshaped(.NCHW(1, 64, height / 16, width / 16)).toGPU(device))
+      Tensor<Float16>(
+        from: cpu(latentInput).reshaped(.NCHW(1, 64, height / 16, width / 16)).toGPU(device)))
     let (decoder, _) = Q21VAE(
-      encoder: false, height: height / 16, width: width / 16, device: device)
+      encoder: false, height: height / 16, width: width / 16, device: device, precision: .Float16)
     decoder.maxConcurrency = .limit(1)
     decoder.compile(inputs: input)
-    graph.openStore(vaeCheckpoint) { try! $0.read("decoder", model: decoder, strict: true) }
-    let actual = decoder(inputs: input)[0].as(of: Float.self).rawValue.toCPU().makeNumpyArray()
+    graph.openStore(vaeCheckpoint, flags: .readOnly) {
+      try! $0.read("decoder", model: decoder, strict: true)
+    }
+    let actual = Tensor<Float>(
+      from: decoder(inputs: input)[0].as(of: Float16.self).rawValue.toCPU()
+    ).makeNumpyArray()
     reference.save_rgba(actual, outputDirectory + "/swift.png")
   }
   print("Generation images:", outputDirectory)

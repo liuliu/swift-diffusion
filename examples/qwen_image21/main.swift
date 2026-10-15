@@ -15,9 +15,9 @@ let graph = DynamicGraph()
 graph.maxConcurrency = .limit(1)
 let device = 1
 let pythonDevice = 0
-let textCheckpoint = "/slow/Data/qwen_image_2.1_qwen_3_vl_8b.ckpt"
-let ditCheckpoint = "/slow/Data/qwen_image_2.1_dit_f16.ckpt"
-let vaeCheckpoint = "/slow/Data/qwen_image_2.1_vae_f32.ckpt"
+let textCheckpoint = "/slow/Data/qwen_3_vl_8b_instruct_f16.ckpt"
+let ditCheckpoint = "/slow/Data/qwen_image_2.1_f16.ckpt"
+let vaeCheckpoint = "/slow/Data/qwen_image_2.1_vae_texture_fix_f16.ckpt"
 
 func cpu(_ object: PythonObject) -> Tensor<Float> { try! Tensor<Float>(numpy: object) }
 

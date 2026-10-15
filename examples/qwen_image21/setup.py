@@ -9,6 +9,7 @@ from huggingface_hub import snapshot_download
 ROOT = Path(__file__).resolve().parent
 MODEL_REVISION = "b3179ad355be050328e483a9dfdd9e60cd62adfa"
 DIFFUSERS_REVISION = "80c7ed262aeffbeb43ef13ae04baeb9b84515a69"
+TEXTURE_VAE_REVISION = "702909b4d408912c7a28fadea06e8b7fdb38ef0c"
 
 
 def main():
@@ -28,6 +29,14 @@ def main():
     (reference / "revision.json").write_text(json.dumps({"diffusers": DIFFUSERS_REVISION, "model": MODEL_REVISION}, indent=2) + "\n")
     patterns = None if args.component == "all" else [f"{args.component}/*", "*.json", "LICENSE", "README.md", "processor/*"]
     snapshot_download("Qwen/Qwen-Image-2.1", revision=MODEL_REVISION, local_dir=ROOT / "artifacts/model", allow_patterns=patterns, max_workers=4)
+    if args.component in ("all", "vae"):
+        snapshot_download(
+            "madebyollin/texture-fix-vae-for-qwen-image-2.1",
+            revision=TEXTURE_VAE_REVISION,
+            local_dir=ROOT / "artifacts/texture_fix_vae",
+            allow_patterns=["config.json", "diffusion_pytorch_model.safetensors", "LICENSE", "NOTICE", "README.md"],
+            max_workers=4,
+        )
 
 
 if __name__ == "__main__":

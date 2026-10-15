@@ -4,8 +4,8 @@ import NNC
 let graph = DynamicGraph()
 
 private let imatrixPath = "/slow/Data/"  // qwen_3.5_9b_ud_q5_k_xl_quantization.csv"
-private let inputPath = "/slow/Data/minimax_h3_qwen_3_vl_with_vision_f16.ckpt"  // qwen_3.6_27b_mtp_f16.ckpt"
-private let outputPath = "/slow/Data/qwen_3_vl_32b_50_vision_i8x.ckpt"  // qwen_3.6_27b_mtp_i8x.ckpt"
+private let inputPath = "/slow/Data/qwen_image_2.1_turbo_f16.ckpt"  // qwen_3.6_27b_mtp_f16.ckpt"
+private let outputPath = "/slow/Data/qwen_image_2.1_turbo_i4x_rot.ckpt"  // qwen_3.6_27b_mtp_i8x.ckpt"
 
 private struct QuantizationEntry {
   let format: String
@@ -277,14 +277,20 @@ graph.openStore(
         $0.write(key, tensor: tensor, codec: [.q8p, .ezm7], imatrix: imatrix)
         continue
       }
+      if n > 1 && (key.contains("proj_in")) {
+        $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
+        continue
+      }
       if (shape.count == 2 || shape.count == 3) && n > 1 {
         if shape.count == 2 {
-          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
+          $0.write(
+            key, tensor: tensor, codec: [.i8x([.q4k, .hadamard256]), .ezm7], imatrix: imatrix)
         } else {
-          $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
+          $0.write(
+            key, tensor: tensor, codec: [.i8x([.q4k, .hadamard256]), .ezm7], imatrix: imatrix)
         }
       } else if shape.count == 4 && n > 1 {
-        $0.write(key, tensor: tensor, codec: [.q8p, .ezm7], imatrix: imatrix)
+        $0.write(key, tensor: tensor, codec: [.i8x, .ezm7], imatrix: imatrix)
       } else {
         $0.write(key, tensor: tensor, codec: [.ezm7])
       }
