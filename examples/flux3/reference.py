@@ -14,14 +14,25 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import load_file
 
-ROOT = Path(os.environ.get("FLUX3_MODEL", "/slow/Data/flux-3-image-klein"))
-ARTIFACTS = Path(__file__).resolve().parent / "artifacts"
-ARTIFACTS.mkdir(exist_ok=True)
-sys.path.insert(0, str(ROOT / "reference/src"))
-MODEL_REVISION = "8454017f9ebaada30c998fccd9f67a80c7580f68"
+VARIANT = os.environ.get("FLUX3_VARIANT", "distilled")
+assert VARIANT in ("distilled", "base"), "Unknown FLUX3_VARIANT"
+SHARED_ROOT = Path("/slow/Data/flux-3-image-klein")
+ROOT = Path(os.environ.get("FLUX3_MODEL", str(SHARED_ROOT) + ("-base" if VARIANT == "base" else "")))
+# The Hub hashes match for the Base and distilled text encoder / VAE files.
+COMPONENT_ROOT = SHARED_ROOT if VARIANT == "base" else ROOT
+REFERENCE_ROOT = SHARED_ROOT / "reference" if VARIANT == "base" else ROOT / "reference"
+ARTIFACTS = Path(os.environ.get("FLUX3_ARTIFACTS", Path(__file__).resolve().parent / "artifacts"))
+if VARIANT == "base":
+    ARTIFACTS = ARTIFACTS / "base"
+ARTIFACTS.mkdir(parents=True, exist_ok=True)
+sys.path.insert(0, str(REFERENCE_ROOT / "src"))
+MODEL_REVISION = {
+    "distilled": "8454017f9ebaada30c998fccd9f67a80c7580f68",
+    "base": "1469d27cfb9bb1bd81d3a93f5a023b39dbf136e4",
+}[VARIANT]
 REFERENCE_REVISION = "45e57c9fb06f9751cdced29a65c5d2171003be05"
 assert json.loads((ROOT / "DOWNLOAD_MANIFEST.json").read_text())["revision"] == MODEL_REVISION
-assert json.loads((ROOT / "reference/SOURCE_REVISION.json").read_text())["commit"] == REFERENCE_REVISION
+assert json.loads((REFERENCE_ROOT / "SOURCE_REVISION.json").read_text())["commit"] == REFERENCE_REVISION
 torch.set_grad_enabled(False)
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -53,8 +64,8 @@ class ShardedState:
 
 def state(component):
     if component == "text":
-        return ShardedState(ROOT / "text_encoder")
-    return load_file(str(ROOT / ("model.safetensors" if component == "dit" else "ae.safetensors")))
+        return ShardedState(COMPONENT_ROOT / "text_encoder")
+    return load_file(str(ROOT / "model.safetensors" if component == "dit" else COMPONENT_ROOT / "ae.safetensors"))
 
 
 def fp16_state(weights, device, keep_float32=()):
@@ -85,19 +96,19 @@ def fp16_state(weights, device, keep_float32=()):
     return converted
 
 
-def verify_dit_storage(path, keep_float32):
+def verify_dit_storage(path, keep_float32, tensor_count=415):
     """Check SQLite dtype metadata before publishing the mixed-storage export."""
     import sqlite3
     with sqlite3.connect(Path(path).as_uri() + "?mode=ro", uri=True) as db:
         dtypes = dict(db.execute("SELECT name, datatype FROM tensors"))
     keep_float32 = set(keep_float32)
-    assert len(dtypes) == 402 and keep_float32 <= dtypes.keys()
+    assert len(dtypes) == tensor_count and keep_float32 <= dtypes.keys()
     assert all(dtype == (16384 if name in keep_float32 else 131072)
                for name, dtype in dtypes.items()), "Unexpected DiT storage dtype"
     print(f"Verified SQLite dtypes: {len(keep_float32)} FP32, {len(dtypes)-len(keep_float32)} FP16", flush=True)
 
 
-def weight(weights, key, transform="identity", heads=0):
+def weight(weights, key, transform="identity", heads=0, row_start=0, row_count=0):
     w = weights[key]
     if transform == "qk":
         w = w.reshape(int(heads), 2, 64, -1).transpose(1, 2).reshape(w.shape)
@@ -107,6 +118,9 @@ def weight(weights, key, transform="identity", heads=0):
         w = w[:w.shape[0] // 2]
     elif transform == "second_half":
         w = w[w.shape[0] // 2:]
+    if row_count:
+        assert row_start >= 0 and row_start + row_count <= w.shape[0], key
+        w = w[row_start:row_start + row_count]
     return array(w)
 
 
@@ -146,11 +160,19 @@ def metrics(label, actual, expected, tolerance):
 
 def finish(name):
     assert REPORT and all(r["passed"] for r in REPORT), "Numeric parity failed"
-    result = dict(model_revision=MODEL_REVISION, reference_revision=REFERENCE_REVISION,
+    result = dict(variant=VARIANT, model_revision=MODEL_REVISION, reference_revision=REFERENCE_REVISION,
                   torch=torch.__version__, results=REPORT)
     path = ARTIFACTS / f"{name}.json"
     path.write_text(json.dumps(result, indent=2) + "\n")
     print("PARITY PASSED:", path, flush=True)
+
+
+def dump_dit(index, actual, expected, baseline):
+    """Preserve complete activations for investigating a failed parity check."""
+    values = {f"{origin}/{key}": value for origin, outputs in
+              [("swift", actual), ("fp16", expected), ("fp32", baseline)]
+              for key, value in outputs.items()}
+    np.savez(ARTIFACTS / f"dit-case{index}-diagnostic.npz", **values)
 
 
 def release():
@@ -165,7 +187,7 @@ def text_case(kind, length=80, seed=42):
         attention = torch.ones_like(tokens)
     else:
         from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(ROOT / "text_encoder", local_files_only=True)
+        processor = AutoProcessor.from_pretrained(COMPONENT_ROOT / "text_encoder", local_files_only=True)
         text = processor.apply_chat_template(
             [{"role": "user", "content": kind}], tokenize=False, add_generation_prompt=True)
         tokenizer = processor.tokenizer
@@ -184,7 +206,7 @@ def text_case(kind, length=80, seed=42):
 def text_reference(weights, case, precision, device, complete=False):
     from transformers import AutoConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel, Qwen3VLTextRotaryEmbedding
-    config = AutoConfig.from_pretrained(ROOT / "text_encoder", local_files_only=True).text_config
+    config = AutoConfig.from_pretrained(COMPONENT_ROOT / "text_encoder", local_files_only=True).text_config
     config._attn_implementation = "eager" if precision == "float32" else "sdpa"
     with torch.device("meta"):
         model = Qwen3VLTextModel(config)
@@ -388,7 +410,7 @@ def concatenate_features(features):
     return np.ascontiguousarray(np.concatenate([np.asarray(x) for x in features], axis=-1))
 
 
-def pipeline_case(device, steps=2, height=64, width=96):
+def pipeline_case(device, steps=2, height=64, width=96, flow_map=True, guidance=3.5):
     """FP32 control of the complete edited-image path, with BF16-rounded initial noise."""
     from flux3.sampling import timesteps
     from flux3.autoencoder import AutoEncoder, latent_ids
@@ -396,6 +418,12 @@ def pipeline_case(device, steps=2, height=64, width=96):
     text_state = state("text")
     text_result = text_reference(text_state, text, "float32", device)
     context = concatenate_features([text_result[f"hidden_{i}"] for i in [4,8,12,16,20,24,28,32]])
+    unconditional_text, unconditional_context = None, None
+    if not flow_map:
+        unconditional_text = text_case("")
+        result = text_reference(text_state, unconditional_text, "float32", device)
+        unconditional_context = concatenate_features([result[f"hidden_{i}"] for i in [4,8,12,16,20,24,28,32]])
+        assert unconditional_context.shape == context.shape
     vae_state = state("vae")
     vae = AutoEncoder().eval().to(f"cuda:{device}")
     vae.load_state_dict(vae_state)
@@ -415,7 +443,11 @@ def pipeline_case(device, steps=2, height=64, width=96):
     velocities, latents = [], []
     for t,r in zip(schedule[:-1],schedule[1:]):
         case["time"],case["target"] = float(t),float(r)
-        velocity = dit_reference(dit_state,case,"float32",device,debug=False)["output"][0]
+        velocity = dit_reference(dit_state,case,"float32",device,flow_map=flow_map,debug=False)["output"][0]
+        if not flow_map:
+            negative_case = dict(case, context=unconditional_context)
+            negative = dit_reference(dit_state,negative_case,"float32",device,flow_map=False,debug=False)["output"][0]
+            velocity = negative + guidance * (velocity - negative)
         case["x"] = case["x"] + float(r-t) * velocity
         velocities.append(velocity.copy()); latents.append(case["x"].copy())
     del dit_state
@@ -425,7 +457,8 @@ def pipeline_case(device, steps=2, height=64, width=96):
                                latent_ids(height//16,width//16,f"cuda:{device}"))[None])
     del vae
     release()
-    return dict(text=text,context=context,reference_image=array(reference_image),
+    return dict(text=text,context=context,unconditional_text=unconditional_text,
+                unconditional_context=unconditional_context,reference_image=array(reference_image),
                 reference_tokens=reference_tokens,initial=initial,ids=case["ids"],schedule=schedule,
                 velocities=velocities,latents=latents,decoded=decoded,height=height,width=width)
 

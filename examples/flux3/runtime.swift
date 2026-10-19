@@ -1,6 +1,25 @@
 import Foundation
 import NNC
 
+enum Flux3Variant: String {
+  case distilled
+  case base
+
+  init(environment: [String: String]) {
+    guard let variant = Self(rawValue: environment["FLUX3_VARIANT"] ?? "distilled") else {
+      preconditionFailure("FLUX3_VARIANT must be distilled or base")
+    }
+    self = variant
+  }
+
+  var flowMap: Bool { self == .distilled }
+  var defaultSteps: Int { self == .base ? 50 : 16 }
+  var defaultGuidance: Float { self == .base ? 3.5 : 1 }
+  var checkpointStem: String {
+    self == .base ? "flux_3_image_klein_base" : "flux_3_image_klein"
+  }
+}
+
 struct Flux3Checkpoints {
   let dit: String
   let vae: String
@@ -8,7 +27,9 @@ struct Flux3Checkpoints {
   var tokenizer: String { text + ".tokenizer.json" }
 
   init(environment: [String: String] = ProcessInfo.processInfo.environment) {
-    dit = environment["FLUX3_DIT_CHECKPOINT"] ?? "/slow/Data/flux_3_image_klein_dit_bf16.ckpt"
+    let variant = Flux3Variant(environment: environment)
+    dit =
+      environment["FLUX3_DIT_CHECKPOINT"] ?? "/slow/Data/\(variant.checkpointStem)_dit_bf16.ckpt"
     vae = environment["FLUX3_VAE_CHECKPOINT"] ?? "/slow/Data/flux_3_image_klein_vae_f32.ckpt"
     text =
       environment["FLUX3_TEXT_CHECKPOINT"] ?? "/slow/Data/flux_3_image_klein_text_model_f16.ckpt"

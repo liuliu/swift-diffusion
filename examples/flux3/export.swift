@@ -5,11 +5,19 @@ import NNCPythonConversion
 import PythonKit
 
 // Preserve the original values in these underflow-sensitive projections.
-let flux3FP32StorageWeights = [
-  "time_in.out_layer.weight": "__dit__[t-t_2-0-0]",
-  "ref_time_in.out_layer.weight": "__dit__[t-next_t_2-0-0]",
-  "final_layer.image.adaLN_modulation.1.weight": "__dit__[t-final_modulation-0-0]",
-]
+let flux3FP32StorageWeights: [String: [String]] = {
+  var weights = [
+    "time_in.out_layer.weight": ["__dit__[t-time_embedder_2-0-0]"],
+    "final_layer.image.adaLN_modulation.1.weight": [
+      "__dit__[t-final_ada_ln_0-0-0]", "__dit__[t-final_ada_ln_1-0-0]",
+    ],
+  ]
+  if variant.flowMap {
+    weights["ref_time_in.out_layer.weight"] = ["__dit__[t-next_time_embedder_2-0-0]"]
+  }
+  return weights
+}()
+let flux3FP32StoreNames = Set(flux3FP32StorageWeights.values.flatMap { $0 })
 
 // Export is an explicit mode; normal parity runs never write checkpoint weights.
 let exportingFP16 = CommandLine.arguments.dropFirst().first == "export-dit-f16"
@@ -18,7 +26,7 @@ let exporting =
 let checkpoints: Flux3Checkpoints = {
   var environment = env
   if exportingFP16 && environment["FLUX3_DIT_CHECKPOINT"] == nil {
-    environment["FLUX3_DIT_CHECKPOINT"] = "/slow/Data/flux_3_image_klein_dit_f16.ckpt"
+    environment["FLUX3_DIT_CHECKPOINT"] = "/slow/Data/\(variant.checkpointStem)_dit_f16.ckpt"
   }
   return Flux3Checkpoints(environment: environment)
 }()
@@ -35,7 +43,7 @@ func exportAndVerify<T: TensorNumeric>(
       // FP16 activation scaling is a separate change; the unscaled residuals overflow.
       try! store.write(key, model: model, strict: true) { name, tensor in
         let value = Tensor<Float>(from: tensor).toCPU()
-        if flux3FP32StorageWeights.values.contains(name) {
+        if flux3FP32StoreNames.contains(name) {
           try! store.write(name, tensor: value, strict: true)
         } else {
           try! store.write(name, tensor: Tensor<Float16>(from: value), strict: true)
@@ -63,11 +71,18 @@ func exportAndVerify<T: TensorNumeric>(
 func verifyDiTStoreNames() {
   var expected = Set(
     [
-      "t_0", "t_2", "next_t_0", "next_t_2",
-      "context_refiner_modulation", "x_refiner_modulation", "ref_refiner_modulation",
-      "context_modulation", "x_modulation", "ref_modulation",
-      "context_embedder", "x_embedder", "ref_embedder", "final_modulation", "linear",
+      "time_embedder_0", "time_embedder_2",
+      "context_embedder", "x_embedder", "ref_embedder", "linear",
     ].map { "__dit__[t-\($0)-0-0]" })
+  if variant.flowMap {
+    expected.formUnion(
+      ["__dit__[t-next_time_embedder_0-0-0]", "__dit__[t-next_time_embedder_2-0-0]"])
+  }
+  for name in ["context_refiner", "x_refiner", "ref_refiner", "context", "x", "ref", "final"] {
+    for i in 0..<(name == "final" ? 2 : 3) {
+      expected.insert("__dit__[t-\(name)_ada_ln_\(i)-0-0]")
+    }
+  }
   for (name, count) in [
     ("context_refiner", Flux3Config.refinerLayers), ("x_refiner", Flux3Config.refinerLayers),
     ("ref_refiner", Flux3Config.refinerLayers), ("x", Flux3Config.layers),
@@ -101,7 +116,8 @@ func exportDiTCheckpoint() {
   }
   verifyDiTStoreNames()
   if exportingFP16 {
-    reference.verify_dit_storage(exportStorePath, Array(flux3FP32StorageWeights.values))
+    reference.verify_dit_storage(
+      exportStorePath, Array(flux3FP32StoreNames), variant.flowMap ? 415 : 413)
   }
   reference.finish(exportingFP16 ? "export-dit-f16" : "export-dit")
   let status = rename(exportStorePath, checkpoints.dit)
@@ -121,7 +137,7 @@ func exportCheckpoint() {
   }
   precondition(
     !FileManager.default.fileExists(atPath: checkpoints.tokenizer), "Tokenizer already exists")
-  let tokenizerRoot = String(Python.str(reference.ROOT))!
+  let tokenizerRoot = String(Python.str(reference.COMPONENT_ROOT))!
   let tokenizer = try! Flux3Tokenizer(path: tokenizerRoot + "/text_encoder/tokenizer.json")
   for prompt in [
     "A red ceramic teapot on a wooden table.",

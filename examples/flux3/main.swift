@@ -6,6 +6,7 @@ import PythonKit
 
 setbuf(stdout, nil)
 let env = ProcessInfo.processInfo.environment
+let variant = Flux3Variant(environment: env)
 let sys = Python.import("sys")
 let site = Python.import("site")
 for path in [String(site.getusersitepackages())!, "/usr/lib/python3/dist-packages"] {
@@ -25,7 +26,10 @@ func cpu(_ value: PythonObject) -> Tensor<Float> { try! Tensor<Float>(numpy: val
 
 func load<T: TensorNumeric>(_ type: T.Type, _ bindings: [Flux3Binding], _ state: PythonObject) {
   for binding in bindings {
-    let value = cpu(reference.weight(state, binding.key, binding.transform, binding.heads))
+    let value = cpu(
+      reference.weight(
+        state, binding.key, binding.transform, binding.heads,
+        row_start: binding.rows?.lowerBound ?? 0, row_count: binding.rows?.count ?? 0))
     if binding.isBias {
       binding.model.bias.copy(from: Tensor<T>(from: value))
     } else if binding.transform == "float32" {
@@ -100,6 +104,7 @@ func runDiT<T: TensorNumeric>(_ type: T.Type, name: String, fp16Weights: Bool = 
   ]
   if T.dataType == .Float16 { cases.append((32, 32, [], 1, 0)) }
   for (index, spec) in cases.enumerated() {
+    if !exporting, let selected = env["FLUX3_DIT_CASE"], Int(selected) != index { continue }
     let pack =
       index == 2
       ? reference.dit_prompt_case(pythonDevice, name)
@@ -108,15 +113,16 @@ func runDiT<T: TensorNumeric>(_ type: T.Type, name: String, fp16Weights: Bool = 
     let expected: PythonObject
     if T.dataType == .Float16 {
       expected = reference.dit_reference(
-        state, pack, name, pythonDevice,
+        state, pack, name, pythonDevice, flow_map: variant.flowMap,
         fp16_scales: [Flux3Config.fp16TextScale, Flux3Config.fp16FFNScale],
         keep_float32: Array(flux3FP32StorageWeights.keys))
     } else {
-      expected = reference.dit_reference(state, pack, name, pythonDevice)
+      expected = reference.dit_reference(state, pack, name, pythonDevice, flow_map: variant.flowMap)
     }
     let baseline =
       fp16Weights
-      ? reference.dit_reference(original, pack, "float32", pythonDevice) : Python.None
+      ? reference.dit_reference(original, pack, "float32", pythonDevice, flow_map: variant.flowMap)
+      : Python.None
     if fp16Weights {
       for key in expected.keys() {
         precondition(
@@ -144,20 +150,39 @@ func runDiT<T: TensorNumeric>(_ type: T.Type, name: String, fp16Weights: Bool = 
           graph.variable(Tensor<T>(from: cpu(pack["reference"])).toGPU(device))
             .reshaped(.HWC(1, refLength, 128)))
       }
-      inputs += [rot, time, target]
+      inputs += [rot, time]
+      if variant.flowMap { inputs.append(target) }
       let (model, bindings, names) = Flux3DiT(
         type, textLength: textLength,
-        imageLength: spec.0 * spec.1, referenceLength: refLength, debug: true)
+        imageLength: spec.0 * spec.1, referenceLength: refLength,
+        flowMap: variant.flowMap, debug: true)
       model.maxConcurrency = .limit(1)
       model.compile(inputs: inputs)
       reference.check_keys(state, bindings.map { $0.key }, "dit", refLength > 0)
       print("Loading DiT weights:", name, "case", index)
       load(type, bindings, state)
       let results = model(inputs: x, Array(inputs.dropFirst()))
+      if T.dataType == .Float16 && env["FLUX3_DUMP_DIT"] == "1" {
+        let actual = Python.dict()
+        for (i, output) in results.enumerated() {
+          let value =
+            names[i] == "output"
+            ? Tensor<Float>(from: output.as(of: T.self).rawValue.toCPU())
+            : output.as(of: Float.self).rawValue.toCPU()
+          actual[names[i]] = value.makeNumpyArray()
+        }
+        reference.dump_dit(index, actual, expected, baseline)
+      }
       for (i, output) in results.enumerated() {
         let label = "dit/\(name)/case\(index)/\(names[i])"
         if T.dataType == .Float16 && names[i] != "output" {
-          compare(label, output.as(of: Float.self), expected[names[i]], tolerance: 0.01)
+          // Base's final text update amplifies FP16 backend rounding in opposite
+          // directions. Judge its residual accuracy against the original FP32
+          // control, keeping the same 1% limit and the established distilled check.
+          compare(
+            variant.flowMap ? label : "dit/float16_vs_float32/case\(index)/\(names[i])",
+            output.as(of: Float.self), (variant.flowMap ? expected : baseline)[names[i]],
+            tolerance: 0.01)
         } else {
           compare(
             label, output.as(of: T.self), expected[names[i]],
@@ -174,7 +199,8 @@ func runDiT<T: TensorNumeric>(_ type: T.Type, name: String, fp16Weights: Bool = 
       if exporting && index == cases.count - 1 {
         let (fresh, _, _) = Flux3DiT(
           type, textLength: textLength,
-          imageLength: spec.0 * spec.1, referenceLength: refLength, debug: true)
+          imageLength: spec.0 * spec.1, referenceLength: refLength,
+          flowMap: variant.flowMap, debug: true)
         exportAndVerify(
           type, key: "dit", model: model, fresh: fresh,
           inputs: inputs, expected: results, fp16Storage: fp16Weights)
@@ -258,12 +284,23 @@ func swiftTextFeatures(_ pack: PythonObject) -> Tensor<Float> {
 func runPipeline() {
   print(
     "Full pipeline FP32 reference: padded prompt, reference image, two denoising steps, decoder")
-  let pack = reference.pipeline_case(pythonDevice)
+  let pack = reference.pipeline_case(
+    pythonDevice, flow_map: variant.flowMap, guidance: variant.defaultGuidance)
   let height = Int(pack["height"])!
   let width = Int(pack["width"])!
   let context = swiftTextFeatures(pack["text"])
   precondition(
     Bool(reference.metrics("pipeline/context", context.makeNumpyArray(), pack["context"], 0.001))!)
+  let unconditionalContext: Tensor<Float>? =
+    variant.flowMap
+    ? nil : swiftTextFeatures(pack["unconditional_text"])
+  if let unconditionalContext = unconditionalContext {
+    precondition(
+      Bool(
+        reference.metrics(
+          "pipeline/unconditional_context", unconditionalContext.makeNumpyArray(),
+          pack["unconditional_context"], 0.001))!)
+  }
   let vaeState = reference.state("vae")
   let referenceTokens: Tensor<Float> = graph.withNoGrad {
     let image = graph.variable(cpu(pack["reference_image"]).toGPU(device)).reshaped(
@@ -294,14 +331,27 @@ func runPipeline() {
     let r = graph.variable(flux3Time([schedule[1]]).toGPU(device))
     let (model, bindings, _) = Flux3DiT(
       Float.self, textLength: context.shape[0],
-      imageLength: imageLength, referenceLength: referenceTokens.shape[0])
-    model.compile(inputs: x, text, refs, rotary, t, r)
+      imageLength: imageLength, referenceLength: referenceTokens.shape[0], flowMap: variant.flowMap)
+    var inputs: [DynamicGraph.AnyTensor] = [x, text, refs, rotary, t]
+    if variant.flowMap { inputs.append(r) }
+    model.compile(inputs: inputs)
     load(Float.self, bindings, state)
+    let negativeText = unconditionalContext.map {
+      graph.variable($0.toGPU(device)).reshaped(.HWC(1, $0.shape[0], 20_480))
+    }
     var current = x
     for i in 0..<(schedule.shape[0] - 1) {
       let time = graph.variable(flux3Time([schedule[i], 0]).toGPU(device))
       let target = graph.variable(flux3Time([schedule[i + 1]]).toGPU(device))
-      let velocity = model(inputs: current, text, refs, rotary, time, target)[0].as(of: Float.self)
+      let velocity: DynamicGraph.Tensor<Float>
+      if let negativeText = negativeText {
+        let unconditional = model(inputs: current, negativeText, refs, rotary, time)[0].as(
+          of: Float.self)
+        let conditional = model(inputs: current, text, refs, rotary, time)[0].as(of: Float.self)
+        velocity = unconditional + (conditional - unconditional) * variant.defaultGuidance
+      } else {
+        velocity = model(inputs: current, text, refs, rotary, time, target)[0].as(of: Float.self)
+      }
       compare(
         "pipeline/velocity_\(i)", velocity.reshaped(.NC(imageLength, 128)),
         pack["velocities"][i], tolerance: 0.002)
@@ -365,6 +415,7 @@ case "--help", "help":
     "Usage: bash examples/flux3/run.sh [export|export-dit|export-dit-f16|parity|parity-text|parity-vae|parity-dit|parity-pipeline]"
   )
   print("FLUX3_DTYPE=float32|float16|bfloat16 for DiT and text.")
+  print("FLUX3_VARIANT=distilled|base selects the weights, graph, and export filename.")
   print("FLUX3_DEVICE=1, FLUX3_REFERENCE_DEVICE=0; export reruns parity before writing.")
   print(
     "export-dit-f16 validates FP16 weights with FP32 arithmetic; unscaled FP16 activations overflow."

@@ -9,14 +9,16 @@ enum Flux3Generate {
   static func main() throws {
     setbuf(stdout, nil)
     let env = ProcessInfo.processInfo.environment
+    let variant = Flux3Variant(environment: env)
     let checkpoints = Flux3Checkpoints(environment: env)
-    let output = env["FLUX3_OUTPUT"] ?? "/slow/Data/flux_3_image_klein_swift.png"
+    let output = env["FLUX3_OUTPUT"] ?? "/slow/Data/\(variant.checkpointStem)_swift.png"
     let prompt =
       env["FLUX3_PROMPT"]
       ?? "A red ceramic teapot on a wooden table beside a window, soft morning light, a small white cup and a folded linen napkin, realistic photograph."
     let width = Int(env["FLUX3_WIDTH"] ?? "512")!
     let height = Int(env["FLUX3_HEIGHT"] ?? "512")!
-    let steps = Int(env["FLUX3_STEPS"] ?? "16")!
+    let steps = Int(env["FLUX3_STEPS"] ?? "\(variant.defaultSteps)")!
+    let guidance = Float(env["FLUX3_GUIDANCE"] ?? "\(variant.defaultGuidance)")!
     let seed = UInt64(env["FLUX3_SEED"] ?? "42")!
     let device = Int(env["FLUX3_DEVICE"] ?? "1")!
     let precision = env["FLUX3_DTYPE"] ?? "bfloat16"
@@ -34,16 +36,23 @@ enum Flux3Generate {
     graph.maxConcurrency = .limit(1)
     let context = encode(
       graph: graph, device: device, checkpoint: checkpoints.text, encoded: encoded)
+    let unconditional =
+      variant.flowMap
+      ? nil
+      : encode(
+        graph: graph, device: device, checkpoint: checkpoints.text, encoded: tokenizer.prompt(""))
     let latent: Tensor<Float>
     if precision == "float16" {
       latent = denoise(
         Float16.self, precision: precision, graph: graph, device: device,
         checkpoint: checkpoints.dit, context: context,
+        unconditional: unconditional, variant: variant, guidance: guidance,
         width: width, height: height, steps: steps, seed: seed)
     } else {
       latent = denoise(
         BFloat16.self, precision: precision, graph: graph, device: device,
         checkpoint: checkpoints.dit, context: context,
+        unconditional: unconditional, variant: variant, guidance: guidance,
         width: width, height: height, steps: steps, seed: seed)
     }
     let decoded = decode(
@@ -55,6 +64,7 @@ enum Flux3Generate {
       "checkpoints": ["text": checkpoints.text, "dit": checkpoints.dit, "vae": checkpoints.vae],
       "tokenizer": checkpoints.tokenizer, "prompt": prompt, "width": width,
       "height": height, "steps": steps, "seed": seed, "seconds": elapsed,
+      "variant": variant.rawValue, "guidance": guidance,
       "python": false, "text_dtype": "float16", "dit_dtype": precision, "vae_dtype": "float32",
       "dit_residual_dtype": precision == "float16" ? "float32" : precision,
       "dit_text_scale": precision == "float16" ? Flux3Config.fp16TextScale : 1,
@@ -101,7 +111,8 @@ enum Flux3Generate {
 
   static func denoise<T: TensorNumeric>(
     _ type: T.Type, precision: String, graph: DynamicGraph, device: Int, checkpoint: String,
-    context: Tensor<BFloat16>, width: Int, height: Int, steps: Int, seed: UInt64
+    context: Tensor<BFloat16>, unconditional: Tensor<BFloat16>?, variant: Flux3Variant,
+    guidance: Float, width: Int, height: Int, steps: Int, seed: UInt64
   ) -> Tensor<Float> {
     graph.withNoGrad {
       let count = width / 16 * (height / 16)
@@ -109,39 +120,81 @@ enum Flux3Generate {
       let schedule = flux3Schedule(steps: steps)
       let noise = Tensor<T>(from: flux3Noise(seed: seed, count: count))
       var current = graph.variable(noise.toGPU(device))
+      // Keep Base's Euler state in FP32; perform CFG there as well.
+      var fullCurrent = graph.variable(
+        Tensor<Float>(from: Tensor<BFloat16>(from: flux3Noise(seed: seed, count: count))).toGPU(
+          device))
+      if !variant.flowMap { current = DynamicGraph.Tensor<T>(from: fullCurrent) }
       let text = graph.variable(Tensor<T>(from: Tensor<Float>(from: context)).toGPU(device))
       let rotary = graph.variable(
         flux3Rotary(flux3IDs(text: length, height: height / 16, width: width / 16)).toGPU(device))
       func time(_ values: [Float]) -> DynamicGraph.Tensor<T> {
         graph.variable(
-          Tensor<T>(from: flux3Time(values, precision: precision)).toGPU(device))
+          Tensor<T>(from: flux3Time(values, precision: precision))
+            .toGPU(device))
       }
       let t = time([schedule[0], 0])
       let r = time([schedule[1]])
-      let (model, _, _) = Flux3DiT(
-        type, textLength: length, imageLength: count, referenceLength: 0)
-      model.maxConcurrency = .limit(1)
-      model.compile(inputs: current, text, rotary, t, r)
-      try! graph.openStore(checkpoint, flags: .readOnly) { store in
-        try! store.read("dit", model: model, strict: true) { name, dataType, _, _ in
-          guard let tensor = store.read(name) else { return .fail }
-          if tensor.dataType == dataType { return .final(tensor) }
-          // The store's automatic conversion only supports FP16 <-> FP32.
-          let value = Tensor<Float>(from: tensor).toCPU()
-          if dataType == .BFloat16 { return .final(Tensor<BFloat16>(from: value)) }
-          if dataType == .Float16 { return .final(Tensor<Float16>(from: value)) }
-          precondition(dataType == .Float32)
-          return .final(value)
-        }
-      }.get()
+      func makeModel(
+        _ text: DynamicGraph.Tensor<T>, _ rotary: DynamicGraph.Tensor<Float>, _ length: Int
+      ) -> Model {
+        let (model, _, _) = Flux3DiT(
+          type, textLength: length, imageLength: count, referenceLength: 0, flowMap: variant.flowMap
+        )
+        model.maxConcurrency = .limit(1)
+        var inputs: [DynamicGraph.AnyTensor] = [current, text, rotary, t]
+        if variant.flowMap { inputs.append(r) }
+        model.compile(inputs: inputs)
+        try! graph.openStore(checkpoint, flags: .readOnly) { store in
+          try! store.read("dit", model: model, strict: true) { name, dataType, _, _ in
+            guard let tensor = store.read(name) else { return .fail }
+            if tensor.dataType == dataType { return .final(tensor) }
+            // The store's automatic conversion only supports FP16 <-> FP32.
+            let value = Tensor<Float>(from: tensor).toCPU()
+            if dataType == .BFloat16 { return .final(Tensor<BFloat16>(from: value)) }
+            if dataType == .Float16 { return .final(Tensor<Float16>(from: value)) }
+            precondition(dataType == .Float32)
+            return .final(value)
+          }
+        }.get()
+        return model
+      }
+      let model = makeModel(text, rotary, length)
+      var negative: (Model, DynamicGraph.Tensor<T>, DynamicGraph.Tensor<Float>)?
+      if let unconditional = unconditional {
+        let negativeText = graph.variable(
+          Tensor<T>(from: Tensor<Float>(from: unconditional)).toGPU(device))
+        let negativeLength = unconditional.shape[1]
+        let negativeRotary = graph.variable(
+          flux3Rotary(flux3IDs(text: negativeLength, height: height / 16, width: width / 16)).toGPU(
+            device))
+        // Preserve the empty prompt's own padded length, as in the reference.
+        let negativeModel =
+          negativeLength == length ? model : makeModel(negativeText, negativeRotary, negativeLength)
+        negative = (negativeModel, negativeText, negativeRotary)
+      }
       for i in 0..<steps {
         let begin = Date()
-        let velocity = model(
-          inputs: current, text, rotary, time([schedule[i], 0]), time([schedule[i + 1]]))[0].as(
-            of: T.self)
-        current = current + velocity * (schedule[i + 1] - schedule[i])
+        let t = time([schedule[i], 0])
+        if let (negativeModel, negativeText, negativeRotary) = negative {
+          let uncond = DynamicGraph.Tensor<Float>(
+            from:
+              negativeModel(inputs: current, negativeText, negativeRotary, t)[0].as(of: T.self))
+          let cond = DynamicGraph.Tensor<Float>(
+            from:
+              model(inputs: current, text, rotary, t)[0].as(of: T.self))
+          let velocity = uncond + (cond - uncond) * guidance
+          fullCurrent = fullCurrent + velocity * (schedule[i + 1] - schedule[i])
+          current = DynamicGraph.Tensor<T>(from: fullCurrent)
+        } else {
+          let velocity = model(
+            inputs: current, text, rotary, t, time([schedule[i + 1]]))[0].as(of: T.self)
+          current = current + velocity * (schedule[i + 1] - schedule[i])
+        }
         // Synchronize and record a finite sample at every step.
-        let sample = Tensor<Float>(from: current.rawValue.toCPU())
+        let sample =
+          variant.flowMap
+          ? Tensor<Float>(from: current.rawValue.toCPU()) : fullCurrent.rawValue.toCPU()
         var peak: Float = 0
         for token in 0..<count {
           for c in 0..<128 {
@@ -153,7 +206,8 @@ enum Flux3Generate {
           "Step", i + 1, "/", steps, "t", schedule[i], "->", schedule[i + 1],
           "peak", peak, "seconds", String(format: "%.2f", Date().timeIntervalSince(begin)))
       }
-      return Tensor<Float>(from: current.rawValue.toCPU())
+      return variant.flowMap
+        ? Tensor<Float>(from: current.rawValue.toCPU()) : fullCurrent.rawValue.toCPU()
     }
   }
 

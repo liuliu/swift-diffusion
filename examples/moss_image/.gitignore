@@ -1,0 +1,3 @@
+__pycache__/
+artifacts/*.npy
+artifacts/*.npz

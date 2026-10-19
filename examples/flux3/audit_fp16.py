@@ -43,8 +43,9 @@ def main():
     ref.release()
 
     weights = ref.state("dit")
+    flow_map = ref.VARIANT == "distilled"
     with torch.device("meta"):
-        model = module.DiT(True)
+        model = module.DiT(flow_map)
     model.load_state_dict({k: v.half() for k, v in weights.items()}, strict=True, assign=True)
     model = model.to(device).eval()
     stack, module_inputs, records = [], {}, []
@@ -97,7 +98,8 @@ def main():
         pack = module.Packed(data, ids, times, {m: [(0, len(x))] for m, x in data.items()})
         try:
             with Inspect(), torch.autocast("cuda", dtype=torch.float16):
-                out = model(pack, torch.tensor([case["target"]], device=device))
+                target = torch.tensor([case["target"]], device=device) if flow_map else None
+                out = model(pack, target)
             records.append(dict(case=label, finite=True, max_abs=float(out.abs().max())))
         except ActivationOverflow:
             records[-1]["case"] = label

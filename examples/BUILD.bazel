@@ -1189,6 +1189,22 @@ swift_binary(
 )
 
 swift_binary(
+    name = "moss_image",
+    srcs = [
+        "moss_image/common.swift",
+        "moss_image/dit.swift",
+        "moss_image/generate.swift",
+        "moss_image/main.swift",
+        "moss_image/text.swift",
+    ],
+    deps = [
+        "@PythonKit",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "flux3",
     srcs = [
         "flux3/dit.swift",

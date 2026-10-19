@@ -4,8 +4,8 @@ import NNC
 let graph = DynamicGraph()
 
 private let imatrixPath = "/slow/Data/"  // qwen_3.5_9b_ud_q5_k_xl_quantization.csv"
-private let inputPath = "/slow/Data/qwen_image_2.1_turbo_f16.ckpt"  // qwen_3.6_27b_mtp_f16.ckpt"
-private let outputPath = "/slow/Data/qwen_image_2.1_turbo_i4x_rot.ckpt"  // qwen_3.6_27b_mtp_i8x.ckpt"
+private let inputPath = "/slow/Data/flux_3_klein_f16.ckpt"  // qwen_3.6_27b_mtp_f16.ckpt"
+private let outputPath = "/slow/Data/flux_3_klein_i4x_rot.ckpt"  // qwen_3.6_27b_mtp_i8x.ckpt"
 
 private struct QuantizationEntry {
   let format: String
@@ -198,7 +198,8 @@ graph.openStore(
         || key.contains("-proj_out-") || key.contains("-audio_proj_out-")
         || key.contains("_embeddings") || key.contains("register_tokens")
         || (key.contains("refiner_") && !key.contains("noise_refiner_")
-          && !key.contains("context_refiner_"))
+          && !key.contains("context_refiner_") && !key.contains("x_refiner_")
+          && !key.contains("ref_refiner_"))
         || key.contains("position_embedding") || key.contains("-shared-")
         || key.contains("_pad_token")  // Z-Image related.
         || key.contains("_registers") || key.contains("_connector") || key.contains("_extractor")  // LTX-2 related.

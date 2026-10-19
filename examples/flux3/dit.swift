@@ -24,6 +24,7 @@ struct Flux3Binding {
   var transform = "identity"
   var heads = 0
   var isBias = false
+  var rows: Range<Int>? = nil
 }
 
 func flux3SiLU<T: TensorNumeric>(_ x: Model.IO, _ type: T.Type) -> Model.IO {
@@ -148,13 +149,14 @@ func Flux3DiT<T: TensorNumeric>(
   var bindings = [Flux3Binding]()
   func dense(_ count: Int, _ key: String, _ name: String) -> Model {
     let layer = Dense(count: count, noBias: true, name: name)
-    let keepFP32 = T.dataType == .Float16 && ["t_2", "next_t_2", "final_modulation"].contains(name)
+    let keepFP32 =
+      T.dataType == .Float16 && ["time_embedder_2", "next_time_embedder_2"].contains(name)
     bindings.append(
       .init(model: layer, key: key + ".weight", transform: keepFP32 ? "float32" : "identity"))
     return layer
   }
-  let time0 = dense(3_072, "time_in.in_layer", "t_0")
-  let time2 = dense(3_072, "time_in.out_layer", "t_2")
+  let time0 = dense(3_072, "time_in.in_layer", "time_embedder_0")
+  let time2 = dense(3_072, "time_in.out_layer", "time_embedder_2")
   let timeHidden = flux3SiLU(time0(time), type)
   let embeddedTime = time2(T.dataType == .Float16 ? timeHidden.to(.Float32) : timeHidden)
   func timeRow(_ i: Int) -> Model.IO {
@@ -163,26 +165,34 @@ func Flux3DiT<T: TensorNumeric>(
   var xVector = timeRow(0)
   var cVector = timeRow(1)
   if flowMap {
-    let next0 = dense(3_072, "ref_time_in.in_layer", "next_t_0")
-    let next2 = dense(3_072, "ref_time_in.out_layer", "next_t_2")
+    let next0 = dense(3_072, "ref_time_in.in_layer", "next_time_embedder_0")
+    let next2 = dense(3_072, "ref_time_in.out_layer", "next_time_embedder_2")
     let hidden = flux3SiLU(next0(nextTime), type)
     let vector = next2(T.dataType == .Float16 ? hidden.to(.Float32) : hidden)
     xVector = xVector + vector
     cVector = cVector + vector
   }
-  func modulation(_ vector: Model.IO, _ key: String, _ name: String) -> [Model.IO] {
-    let projected = dense(9_216, key + ".lin", name)(flux3SiLU(vector, type).to(T.dataType))
-    return (0..<3).map {
-      projected.reshaped(
-        [1, 1, 3_072], offset: [0, 0, $0 * 3_072],
-        strides: [9_216, 9_216, 1]
-      ).contiguous()
+  func modulation(
+    _ vector: Model.IO, _ key: String, _ name: String,
+    count: Int = 3, keepFP32: Bool = false
+  ) -> [Model.IO] {
+    let float32 = keepFP32 && T.dataType == .Float16
+    let activated = flux3SiLU(vector, type).to(float32 ? .Float32 : T.dataType)
+    // Split source rows at load time, like FLUX.2 / Z Image. Each Dense directly
+    // produces shift, scale, or gate; the forward graph needs no output slicing.
+    return (0..<count).map { i in
+      let layer = Dense(count: 3_072, noBias: true, name: "\(name)_ada_ln_\(i)")
+      bindings.append(
+        .init(
+          model: layer, key: key + ".weight", transform: float32 ? "float32" : "identity",
+          rows: (i * 3_072)..<((i + 1) * 3_072)))
+      return layer(activated).reshaped([1, 1, 3_072])
     }
   }
-  let cm = modulation(cVector, "early_stream_modulations.txt", "context_refiner_modulation")
-  let xm = modulation(xVector, "early_stream_modulations.image", "x_refiner_modulation")
-  let cs = modulation(cVector, "single_stream_modulations.txt", "context_modulation")
-  let xs = modulation(xVector, "single_stream_modulations.image", "x_modulation")
+  let cm = modulation(cVector, "early_stream_modulations.txt.lin", "context_refiner")
+  let xm = modulation(xVector, "early_stream_modulations.image.lin", "x_refiner")
+  let cs = modulation(cVector, "single_stream_modulations.txt.lin", "context")
+  let xs = modulation(xVector, "single_stream_modulations.image.lin", "x")
   let length = textLength + imageLength + referenceLength
   func rotarySlice(_ offset: Int, _ count: Int) -> Model.IO {
     rotary.reshaped(
@@ -232,8 +242,8 @@ func Flux3DiT<T: TensorNumeric>(
       axis: 1, cs[i].to(residualType) + c * 0, xs[i].to(residualType) + image * 0)
   }
   if referenceLength > 0 {
-    let rm = modulation(cVector, "early_stream_modulations.image_cond", "ref_refiner_modulation")
-    let rs = modulation(cVector, "single_stream_modulations.image_cond", "ref_modulation")
+    let rm = modulation(cVector, "early_stream_modulations.image_cond.lin", "ref_refiner")
+    let rs = modulation(cVector, "single_stream_modulations.image_cond.lin", "ref")
     var r = dense(3_072, "emb_in.image_cond", "ref_embedder")(reference)
     let rr = rotarySlice(textLength + imageLength, referenceLength)
     for i in 0..<Flux3Config.refinerLayers {
@@ -261,15 +271,10 @@ func Flux3DiT<T: TensorNumeric>(
     [1, imageLength, 3_072], offset: [0, textLength, 0],
     strides: [length * 3_072, 3_072, 1]
   ).contiguous()
-  let finalMod = dense(6_144, "final_layer.image.adaLN_modulation.1", "final_modulation")(
-    flux3SiLU(xVector, type))
-  let shift = finalMod.reshaped([1, 1, 3_072], strides: [6_144, 6_144, 1]).contiguous()
-  let scale = finalMod.reshaped(
-    [1, 1, 3_072], offset: [0, 0, 3_072],
-    strides: [6_144, 6_144, 1]
-  ).contiguous()
+  let finalMod = modulation(
+    xVector, "final_layer.image.adaLN_modulation.1", "final", count: 2, keepFP32: true)
   let out = dense(128, "final_layer.image.linear", "linear")(
-    flux3ModulatedNorm(imageOut, scale: scale, shift: shift, type: type))
+    flux3ModulatedNorm(imageOut, scale: finalMod[1], shift: finalMod[0], type: type))
   outputs.append(out)
   names.append("output")
   return (
