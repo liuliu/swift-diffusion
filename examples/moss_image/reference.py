@@ -12,11 +12,17 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
-ROOT = Path('/slow/Data/MOSS-Image-SFT')
-REVISION = '2c7954437269461767f533b006823e8f85973a60'
+VARIANT = os.environ.get('MOSS_VARIANT', 'sft')
+assert VARIANT in ('sft', 'base'), VARIANT
+MODEL_NAME, REVISION = {
+    'sft': ('MOSS-Image-SFT', '2c7954437269461767f533b006823e8f85973a60'),
+    'base': ('MOSS-Image-Base', '32edbc8a53ff3117ed52af34ce27a031129f2d0e'),
+}[VARIANT]
+ROOT = Path('/slow/Data') / MODEL_NAME
 assert json.loads((ROOT / 'DOWNLOAD_MANIFEST.json').read_text())['revision'] == REVISION
-ARTIFACTS = Path(__file__).resolve().parent / 'artifacts'
-ARTIFACTS.mkdir(exist_ok=True)
+SHARED_ARTIFACTS = Path(__file__).resolve().parent / 'artifacts'
+ARTIFACTS = SHARED_ARTIFACTS if VARIANT == 'sft' else SHARED_ARTIFACTS / VARIANT
+ARTIFACTS.mkdir(parents=True, exist_ok=True)
 torch.set_grad_enabled(False)
 torch.set_num_threads(4)
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -184,6 +190,21 @@ def save_text_features(value, precision):
     np.save(ARTIFACTS / f'swift_prompt_features_{precision}.npy', np.asarray(value))
 
 
+def load_text_features(precision, swift=False):
+    name = f'{"swift_" if swift else ""}prompt_features_{precision}.npy'
+    path = ARTIFACTS / name
+    if not path.exists() and VARIANT == 'base':
+        # The pinned Base and SFT snapshots contain identical frozen encoders.
+        base = json.loads((ROOT / 'DOWNLOAD_MANIFEST.json').read_text())
+        sft = json.loads((Path('/slow/Data/MOSS-Image-SFT') / 'DOWNLOAD_MANIFEST.json').read_text())
+        def encoder_files(manifest):
+            return {f['path']: f['checksum'] for f in manifest['files']
+                    if f['path'].startswith(('text_encoder/', 'tokenizer/'))}
+        assert encoder_files(base) == encoder_files(sft), 'Cannot reuse different encoder features'
+        path = SHARED_ARTIFACTS / name
+    return np.load(path)
+
+
 def upstream():
     name = 'moss_image_upstream'
     if name not in sys.modules:
@@ -204,7 +225,7 @@ def dit_case(index, precision):
     if text_length:
         context = torch.randn((text_length, 4096), generator=generator).numpy()
     else:
-        context = np.load(ARTIFACTS / f'swift_prompt_features_{precision}.npy')
+        context = load_text_features(precision, swift=True)
     return dict(x=noise.flatten(2).transpose(1, 2)[0].numpy(), context=context,
                 height=height, width=width, timestep=timestep, skip_layers=skip)
 
@@ -286,7 +307,7 @@ def dit_reference(pack, precision, device, original_context=False):
         hooks.append(_DIT.layers[index].register_forward_hook(capture(f'layer_{index}')))
     context = pack['context']
     if original_context:
-        context = np.load(ARTIFACTS / f'prompt_features_{precision}.npy')
+        context = load_text_features(precision)
     context = torch.as_tensor(context, device=device, dtype=getattr(torch, precision))[None]
     height, width = int(pack['height']), int(pack['width'])
     x = torch.as_tensor(pack['x'], device=device).T.reshape(1, 128, height, width)
@@ -324,7 +345,8 @@ def metrics(label, actual, expected, max_relative_limit=1e-3, relative_l2_limit=
 
 
 def finish(name):
-    report = dict(model_revision=REVISION, torch=torch.__version__, results=REPORT)
+    report = dict(model=f'OpenMOSS-Team/{MODEL_NAME}', model_revision=REVISION,
+                  torch=torch.__version__, results=REPORT)
     (ARTIFACTS / f'{name}.json').write_text(json.dumps(report, indent=2) + '\n')
     assert REPORT and all(row['passed'] for row in REPORT), 'Numeric parity failed'
     print('PARITY PASSED:', ARTIFACTS / f'{name}.json', flush=True)

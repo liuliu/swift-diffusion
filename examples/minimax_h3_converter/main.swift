@@ -590,11 +590,13 @@ builtins.exec(
           self.root = root
           self.cached_name = None
           self.cached = None
+          self.accessed = set()
 
       def __contains__(self, key):
           return key in self.weight_map
 
       def __getitem__(self, key):
+          self.accessed.add(key)
           name = self.weight_map[key]
           if name != self.cached_name:
               self.cached = load_file(os.path.join(self.root, name), device="cpu")
@@ -757,9 +759,19 @@ builtins.exec(
           v = self.to_v(x).view(1, -1, HEADS, HEAD_DIM)
           if position_ids is not None:
               q, k = apply_rope(q, position_ids), apply_rope(k, position_ids)
-          out = F.scaled_dot_product_attention(
-              q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-              dropout_p=0.0, is_causal=False).transpose(1, 2)
+          # Match the Swift FP32 control: only fused SDPA is BF16. Existing
+          # BF16 reference callers keep their original behavior.
+          fp32_attention_control = os.environ.get("H3_FP32_ATTENTION_CONTROL") == "1"
+          if x.dtype == torch.float32 and not fp32_attention_control:
+              q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
+          if fp32_attention_control:
+              q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+              scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * (HEAD_DIM ** -0.5)
+              out = torch.matmul(scores.softmax(dim=-1), v.float()).transpose(1, 2).to(x.dtype)
+          else:
+              out = F.scaled_dot_product_attention(
+                  q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                  dropout_p=0.0, is_causal=False).transpose(1, 2).to(x.dtype)
           return self.to_out(out.reshape(1, -1, INNER))
 
   class Block(nn.Module):
@@ -965,7 +977,7 @@ builtins.exec(
           return self.norm(x) * (1 + scale.index_select(0, timestep_indices)[None]) + shift.index_select(0, timestep_indices)[None]
 
   class OneBlockShell(nn.Module):
-      def __init__(self):
+      def __init__(self, pdd_steps=1):
           super().__init__()
           self.proj_in = nn.Linear(96, HIDDEN, bias=True).float()
           self.audio_proj_in = nn.Linear(32, HIDDEN, bias=True).float()
@@ -973,8 +985,8 @@ builtins.exec(
           self.token_refiner = TokenRefiner().to(torch.bfloat16)
           self.block = Block().to(torch.bfloat16)
           self.norm_out = NormOut().to(torch.bfloat16)
-          self.proj_out = nn.Linear(HIDDEN, 96, bias=True).float()
-          self.audio_proj_out = nn.Linear(HIDDEN, 32, bias=True).float()
+          self.proj_out = nn.Linear(HIDDEN, 96 * pdd_steps, bias=True).float()
+          self.audio_proj_out = nn.Linear(HIDDEN, 32 * pdd_steps, bias=True).float()
 
       def forward(self, video, audio, text, temb, indices, timestep_indices, position_ids):
           text = self.token_refiner(self.context_embedder(text.to(torch.bfloat16)))
@@ -984,9 +996,12 @@ builtins.exec(
           text_len, audio_len = text.shape[1], audio.shape[1]
           return self.proj_out(x[:, text_len + audio_len:]), self.audio_proj_out(x[:, text_len:text_len + audio_len])
 
-  def load_one_block_shell(root, device, transformer_subdir="transformer"):
-      state = ShardedStateDict(os.path.join(root, transformer_subdir))
-      shell = OneBlockShell()
+  def load_one_block_shell(root, device, transformer_subdir="transformer", pdd_steps=1, fp32=False, state=None):
+      if state is None:
+          state = ShardedStateDict(os.path.join(root, transformer_subdir))
+      shell = OneBlockShell(pdd_steps)
+      if fp32:
+          shell = shell.float()
       mapped = {
           "proj_in.weight": state["proj_in.weight"], "proj_in.bias": state["proj_in.bias"],
           "audio_proj_in.weight": state["audio_proj_in.weight"], "audio_proj_in.bias": state["audio_proj_in.bias"],
@@ -1042,14 +1057,15 @@ builtins.exec(
       }
 
   @torch.no_grad()
-  def run_full_shell_case(pack, layers, seed, device):
+  def run_full_shell_case(pack, layers, seed, device, fp32=False, compression_gates=False):
       torch.manual_seed(seed)
       dev = torch.device(f"cuda:{device}")
       model, state = pack["model"], pack["state"]
       text_len, audio_len, video_len = 2, 2, 2
       video = torch.randn(1, video_len, 96, device=dev, dtype=torch.float32)
       audio = torch.randn(1, audio_len, 32, device=dev, dtype=torch.float32)
-      text = torch.randn(1, text_len, 5120, device=dev, dtype=torch.bfloat16)
+      dtype = torch.float32 if fp32 else torch.bfloat16
+      text = torch.randn(1, text_len, 5120, device=dev, dtype=dtype)
       frequencies, temb = representative_time_embedding(state, dev)
       tags = torch.tensor([1, 1, 2, 2, 0, 0], device=dev)
       timestep_indices = torch.tensor([1, 1, 0, 0, 0, 0], device=dev)
@@ -1057,15 +1073,26 @@ builtins.exec(
       positions = torch.randn(text_len + audio_len + video_len, 3, device=dev, dtype=torch.float64)
       text_rows = model.token_refiner(model.context_embedder(text))
       out = torch.cat((
-          text_rows, model.audio_proj_in(audio).to(torch.bfloat16),
-          model.proj_in(video).to(torch.bfloat16)), dim=1)
+          text_rows, model.audio_proj_in(audio).to(dtype),
+          model.proj_in(video).to(dtype)), dim=1)
+      gates = []
       for index in range(layers):
-          layer_model = Block().to(dtype=torch.bfloat16)
+          layer_model = Block().to(dtype=dtype)
           layer_model.load_state_dict(transformer_block_state(state, index), strict=True)
           layer_model = layer_model.to(dev).eval()
+          if compression_gates:
+              gate_weight = state[f"transformer_blocks.{index}.attn.to_gate_compress.weight"].to(device=dev, dtype=dtype)
+              def capture_gate(module, args):
+                  gates.append(F.linear(args[0], gate_weight)[0].float().cpu())
+              hook = layer_model.attn.register_forward_pre_hook(capture_gate)
           out = layer_model(out, temb, indices, positions)
+          if compression_gates:
+              hook.remove()
+              del gate_weight
           torch.cuda.synchronize(dev)
           del layer_model
+          if os.environ.get("H3_PARITY_PROGRESS") == "1":
+              print(f"H3 reference layer {index + 1}/{layers}", flush=True)
       pre_norm = out.float()
       out = model.norm_out(out, temb, timestep_indices).float()
       video_out = model.proj_out(out[:, text_len + audio_len:])
@@ -1073,11 +1100,12 @@ builtins.exec(
       return {
           "video": video.cpu(), "audio": audio.cpu(), "text": text.float().cpu(),
           "frequencies": frequencies.cpu(), "temb": temb.cpu(),
-          "adaln_selection": F.one_hot(indices, num_classes=6).to(torch.bfloat16).cpu(),
-          "timestep_selection": F.one_hot(timestep_indices, num_classes=2).to(torch.bfloat16).cpu(),
-          "rotary": rotary_tensor(positions.cpu()).to(torch.bfloat16),
+          "adaln_selection": F.one_hot(indices, num_classes=6).to(dtype).cpu(),
+          "timestep_selection": F.one_hot(timestep_indices, num_classes=2).to(dtype).cpu(),
+          "rotary": rotary_tensor(positions.cpu()).to(dtype),
           "pre_norm": pre_norm[0].cpu(), "hidden": out[0].cpu(),
           "video_output": video_out[0].cpu(), "audio_output": audio_out[0].cpu(),
+          "compression_gates": gates,
       }
 
   def release_one_block_shell(pack):
@@ -1764,7 +1792,17 @@ func H3Attention(
     scale: 1 / Float(H3Config.headDim).squareRoot(),
     flags: useFloat16 ? [.Float16] : [])
   let attentionOutput: Model.IO
-  if useFloat16 {
+  if !useFloat16 && environment["H3_FP32_ATTENTION_CONTROL"] == "1" {
+    // Small-sequence conversion diagnostic, using the existing Qwen vision FP32
+    // attention formulation. Production's fused BF16 / FP16 paths stay unchanged.
+    precondition(sequenceLength <= 256, "FP32 attention control is for small parity cases")
+    let scores =
+      Matmul(transposeB: (2, 3))(q.transposed(1, 2), k.transposed(1, 2))
+      * (1 / Float(H3Config.headDim).squareRoot())
+    let probabilities = scores.reshaped([H3Config.heads * sequenceLength, sequenceLength])
+      .softmax().reshaped([1, H3Config.heads, sequenceLength, sequenceLength])
+    attentionOutput = Matmul()(probabilities, v.transposed(1, 2)).transposed(1, 2)
+  } else if useFloat16 {
     attentionOutput = attention(q, k, v).to(.Float32)
   } else {
     // The FP32 control uses BF16 only inside fused attention.
@@ -1856,7 +1894,7 @@ func h3FFNScaleFactor(layer: Int) -> Float? {
 
 func H3TransformerBlock(
   prefix: String, sequenceLength: Int, timestepCount: Int,
-  scaleFactor: Float? = nil, useFloat16: Bool = false
+  scaleFactor: Float? = nil, useFloat16: Bool = false, includeCompressionGate: Bool = false
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let rot = Input()
@@ -1904,6 +1942,13 @@ func H3TransformerBlock(
   var out = h3DebugActivation(
     normed1 .* scale1 + modulations[0], label: "\(prefix).attn_input")
   let attentionInput = useFloat16 ? out.to(.Float16) : out
+  // The dense parity graph exposes this VSA projection as an auxiliary output.
+  // Keeping it connected preserves the trained weight in the same `dit` model;
+  // applying it to pooled attention belongs to the sparse runtime, not this test.
+  let compressionGate =
+    includeCompressionGate
+    ? Dense(count: H3Config.innerAttentionSize, noBias: true, name: "gate_compress") : nil
+  let compressionOutput = compressionGate.map { $0(attentionInput.to(.Float32)) }
   out = x.to(.Float32) + modulations[2] .* attention(attentionInput, rot)
   out = h3DebugActivation(out, label: "\(prefix).post_attn")
   let residual = out
@@ -1925,6 +1970,10 @@ func H3TransformerBlock(
     copyFloatNorm(norm1, state: state, "\(prefix).norm1.weight")
     copyFloatNorm(norm2, state: state, "\(prefix).norm2.weight")
     attentionReader(state)
+    if let compressionGate {
+      copyFloatDense(
+        compressionGate, state: state, weight: "\(prefix).attn.to_gate_compress.weight")
+    }
     feedForwardReader(state)
     let combinedWeight = state["\(prefix).adaln_proj.linear.weight"]
     let combinedBias = state["\(prefix).adaln_proj.linear.bias"]
@@ -1939,7 +1988,10 @@ func H3TransformerBlock(
       }
     }
   }
-  return (Model([x, rot, selection, activatedTimestep], [out]), reader)
+  return (
+    Model([x, rot, selection, activatedTimestep], [out] + (compressionOutput.map { [$0] } ?? [])),
+    reader
+  )
 }
 
 func H3TokenRefinerBlock(
@@ -2013,7 +2065,8 @@ func H3TimestepEmbedding(timestepCount: Int) -> (Model, (PythonObject) -> Void) 
 
 func H3JointTransformer(
   textLength: Int, audioLength: Int, videoLength: Int, timestepCount: Int,
-  layers: Int = H3Config.layers, includeHidden: Bool = false, useFloat16: Bool = false
+  layers: Int = H3Config.layers, includeHidden: Bool = false, useFloat16: Bool = false,
+  pddSteps: Int = 1, includeCompressionGates: Bool = false
 ) -> (Model, (PythonObject) -> Void) {
   let video = Input()
   let audio = Input()
@@ -2054,13 +2107,20 @@ func H3JointTransformer(
     Functional.concat(axis: 1, textRows, audioRows, videoRows), label: "dit.input")
   let activatedTemb = h3DebugActivation(temb.swish().to(.Float32), label: "dit.temb_activated")
   var readers = [(PythonObject) -> Void]()
+  var compressionOutputs = [Model.IO]()
   for layer in 0..<layers {
     let (block, reader) = H3TransformerBlock(
       prefix: "transformer_blocks.\(layer)", sequenceLength: sequenceLength,
       timestepCount: timestepCount,
       scaleFactor: useFloat16 ? h3FFNScaleFactor(layer: layer) : nil,
-      useFloat16: useFloat16)
-    out = block(out, rot, adalnSelection, activatedTemb)
+      useFloat16: useFloat16, includeCompressionGate: includeCompressionGates)
+    let blockOutputs = block(out, rot, adalnSelection, activatedTemb)
+    if includeCompressionGates {
+      out = blockOutputs[0]
+      compressionOutputs.append(blockOutputs[1])
+    } else {
+      out = blockOutputs
+    }
     readers.append(reader)
   }
   // Do not construct this diagnostic edge for export-only models. ccv counts every
@@ -2083,8 +2143,10 @@ func H3JointTransformer(
     [1, videoLength, H3Config.hiddenSize], offset: [0, textLength + audioLength, 0],
     strides: [sequenceLength * H3Config.hiddenSize, H3Config.hiddenSize, 1]
   ).contiguous().to(.Float32)
-  let videoOutput = Dense(count: H3Config.videoPatchSize, name: "proj_out")
-  let audioOutput = Dense(count: H3Config.audioChannels, name: "audio_proj_out")
+  // FastH3 Omni stores full, head-major PDD projections, not Comfy's base+delta
+  // representation. Preserve source row order and the existing projection names.
+  let videoOutput = Dense(count: H3Config.videoPatchSize * pddSteps, name: "proj_out")
+  let audioOutput = Dense(count: H3Config.audioChannels * pddSteps, name: "audio_proj_out")
 
   let reader: (PythonObject) -> Void = { state in
     timeEmbeddingReader(state)
@@ -2129,7 +2191,8 @@ func H3JointTransformer(
     : [projectedVideo, projectedAudio]
   return (
     Model(
-      [video, audio, text, rot, adalnSelection, timestepSelection, timestepFrequencies], outputs),
+      [video, audio, text, rot, adalnSelection, timestepSelection, timestepFrequencies],
+      outputs + compressionOutputs),
     reader
   )
 }
@@ -4096,6 +4159,18 @@ case "export-ref2va-dit":
   exportMainDiT(
     transformerSubdirectory: "transformer_ref", exportPath: ref2vaDitExportPath,
     requireFullParity: true)
+case "parity-fasth3-omni":
+  runFastH3OmniParity()
+case "parity-fasth3-heads":
+  runFastH3OmniParity(headsOnly: true)
+case "parity-fasth3-shell":
+  runFastH3OmniParity(layers: 2)
+case "export-fasth3-omni":
+  runFastH3OmniParity(export: true)
+case "parity-pika-h3-flex":
+  runPikaH3FlexParity()
+case "export-pika-h3-flex-f16":
+  runPikaH3FlexParity(export: true)
 case "export-video-decoder":
   exportVideoDecoder()
 case "export-video-encoder":

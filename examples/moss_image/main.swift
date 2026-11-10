@@ -6,6 +6,8 @@ import PythonKit
 
 setbuf(stdout, nil)
 let env = ProcessInfo.processInfo.environment
+let variant = env["MOSS_VARIANT"] ?? "sft"
+precondition(["sft", "base"].contains(variant), "Unknown MOSS_VARIANT: \(variant)")
 let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 let sys = Python.import("sys")
 let site = Python.import("site")
@@ -287,7 +289,8 @@ if mode == "export-dit" || mode == "export-dit-f16" {
   let path =
     env["MOSS_DIT_CHECKPOINT"]
     ?? (fp16Weights
-      ? "/slow/Data/moss_image_sft_f16.ckpt" : "/slow/Data/moss_image_sft_dit_f32.ckpt")
+      ? "/slow/Data/moss_image_\(variant)_f16.ckpt"
+      : "/slow/Data/moss_image_\(variant)_dit_f32.ckpt")
   precondition(
     !FileManager.default.fileExists(atPath: path + ".partial"),
     "Incomplete checkpoint already exists: \(path).partial")

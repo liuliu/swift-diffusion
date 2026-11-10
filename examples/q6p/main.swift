@@ -4,8 +4,8 @@ import NNC
 let graph = DynamicGraph()
 
 private let imatrixPath = "/slow/Data/"  // qwen_3.5_9b_ud_q5_k_xl_quantization.csv"
-private let inputPath = "/slow/Data/flux_3_klein_f16.ckpt"  // qwen_3.6_27b_mtp_f16.ckpt"
-private let outputPath = "/slow/Data/flux_3_klein_i4x_rot.ckpt"  // qwen_3.6_27b_mtp_i8x.ckpt"
+private let inputPath = "/slow/Data/pika_h3_flex_dit_f16.ckpt"  // qwen_3.6_27b_mtp_f16.ckpt"
+private let outputPath = "/slow/Data/pika_h3_flex_fl2va_i4x_rot.ckpt"  // qwen_3.6_27b_mtp_i8x.ckpt"
 
 private struct QuantizationEntry {
   let format: String

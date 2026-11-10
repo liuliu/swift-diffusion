@@ -1189,6 +1189,23 @@ swift_binary(
 )
 
 swift_binary(
+    name = "fibo2",
+    srcs = [
+        "fibo2/common.swift",
+        "fibo2/dit.swift",
+        "fibo2/main.swift",
+        "fibo2/text.swift",
+        "fibo2/vae.swift",
+        "fibo2/vision.swift",
+    ],
+    deps = [
+        "@PythonKit",
+        "@s4nnc//nnc",
+        "@s4nnc//nnc:nnc_python",
+    ],
+)
+
+swift_binary(
     name = "moss_image",
     srcs = [
         "moss_image/common.swift",
@@ -1328,10 +1345,14 @@ swift_binary(
     name = "minimax_h3_converter",
     srcs = [
         "minimax_h3/qwen_vision.swift",
+        "minimax_h3_converter/fasth3_omni.swift",
         "minimax_h3_converter/main.swift",
+        "minimax_h3_converter/pika_h3_flex.swift",
         "minimax_h3_converter/qwen_vision_parity.swift",
     ],
     data = [
+        "minimax_h3_assets/fasth3_omni_reference.py",
+        "minimax_h3_assets/pika_h3_reference.py",
         "minimax_h3_assets/qwen_vision_reference.py",
     ],
     deps = [

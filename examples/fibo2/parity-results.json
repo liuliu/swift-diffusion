@@ -1,0 +1,819 @@
+{
+  "status": "FP32 parity passed",
+  "checkpoint_exported": false,
+  "ccv_revision": "329ab6c52085dff8e0de931824f2ee1b6d64b937",
+  "s4nnc_revision": "5bb3fb70e0095290ce9cb0ac5090748af1d8e9a8",
+  "protocol": {
+    "compute_dtype": "float32",
+    "weight_values": "Original checkpoint values, promoted to float32 without quantization.",
+    "tf32": false,
+    "acceptance": "Equal shapes, finite outputs, max_abs/max_reference_abs <= 0.001 and relative L2 <= 0.001.",
+    "vae": "Seeds 42..44; 32x48, 64x64, 96x128; encoder moments, normalized posterior mode, decoder.",
+    "text": "Seeds 42..45; random IDs, real prompt, one image, two images; all 15 hidden taps and six bundles.",
+    "dit": "Seeds 42..44; zero/one/two references; raw latent 4x6, 6x4, 8x12; gist counts 256,256,320.",
+    "pipeline": "Seed 1042; 64x96 edit; native preprocessing; Swift vision/text/VAE conditioning; dev two steps with CFG=5 and turbo four steps with CFG=1; every velocity and latent, decoded pixels.",
+    "scope": "Single-item batches and small numerical fixtures; production-resolution performance and padded batches are not validated."
+  },
+  "runs": {
+    "dev/vae_float32": {
+      "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
+      "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+      "versions": {
+        "torch": "2.9.1",
+        "diffusers": "0.42.0.dev0",
+        "transformers": "5.20.1",
+        "huggingface_hub": "2.4.0",
+        "tokenizers": "0.23.3"
+      },
+      "checks": 9,
+      "max_absolute_error_across_all_taps": 1.430511474609375e-05,
+      "max_relative_l2_across_all_taps": 2.9472825887864587e-06,
+      "outputs": [
+        {
+          "label": "vae/case0/encoder",
+          "shape": [
+            1,
+            64,
+            4,
+            6
+          ],
+          "max_abs": 1.3753771781921387e-05,
+          "max_relative": 2.967419419420243e-06,
+          "relative_l2": 1.398097561063801e-06,
+          "cosine": 0.9999999999991253
+        },
+        {
+          "label": "vae/case0/normalized",
+          "shape": [
+            1,
+            32,
+            4,
+            6
+          ],
+          "max_abs": 7.621943950653076e-06,
+          "max_relative": 2.9101223145744024e-06,
+          "relative_l2": 2.497343344701009e-06,
+          "cosine": 0.9999999999969162
+        },
+        {
+          "label": "vae/case0/decoder",
+          "shape": [
+            1,
+            3,
+            32,
+            48
+          ],
+          "max_abs": 2.592802047729492e-06,
+          "max_relative": 4.566052835214407e-06,
+          "relative_l2": 2.596713863394143e-06,
+          "cosine": 0.9999999999970354
+        },
+        {
+          "label": "vae/case1/encoder",
+          "shape": [
+            1,
+            64,
+            8,
+            8
+          ],
+          "max_abs": 1.2695789337158203e-05,
+          "max_relative": 1.921467581215473e-06,
+          "relative_l2": 8.788505569120052e-07,
+          "cosine": 0.9999999999996158
+        },
+        {
+          "label": "vae/case1/normalized",
+          "shape": [
+            1,
+            32,
+            8,
+            8
+          ],
+          "max_abs": 7.033348083496094e-06,
+          "max_relative": 1.9048687865036623e-06,
+          "relative_l2": 1.639427498326163e-06,
+          "cosine": 0.9999999999986662
+        },
+        {
+          "label": "vae/case1/decoder",
+          "shape": [
+            1,
+            3,
+            64,
+            64
+          ],
+          "max_abs": 3.919005393981934e-06,
+          "max_relative": 6.976921616646648e-06,
+          "relative_l2": 2.47456749173957e-06,
+          "cosine": 0.9999999999971687
+        },
+        {
+          "label": "vae/case2/encoder",
+          "shape": [
+            1,
+            64,
+            12,
+            16
+          ],
+          "max_abs": 1.430511474609375e-05,
+          "max_relative": 2.3639883256800523e-06,
+          "relative_l2": 9.275847237570411e-07,
+          "cosine": 0.9999999999995718
+        },
+        {
+          "label": "vae/case2/normalized",
+          "shape": [
+            1,
+            32,
+            12,
+            16
+          ],
+          "max_abs": 7.867813110351562e-06,
+          "max_relative": 2.341315896158525e-06,
+          "relative_l2": 1.7837915490169929e-06,
+          "cosine": 0.9999999999984257
+        },
+        {
+          "label": "vae/case2/decoder",
+          "shape": [
+            1,
+            3,
+            96,
+            128
+          ],
+          "max_abs": 4.753470420837402e-06,
+          "max_relative": 9.458648626562708e-06,
+          "relative_l2": 2.9472825887864587e-06,
+          "cosine": 0.999999999996105
+        }
+      ],
+      "full_report": "artifacts/dev/vae_float32.json"
+    },
+    "dev/text_float32": {
+      "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
+      "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+      "versions": {
+        "torch": "2.9.1",
+        "diffusers": "0.42.0.dev0",
+        "transformers": "5.20.1",
+        "huggingface_hub": "2.4.0",
+        "tokenizers": "0.23.3"
+      },
+      "checks": 96,
+      "max_absolute_error_across_all_taps": 0.0078125,
+      "max_relative_l2_across_all_taps": 7.65860872457202e-06,
+      "outputs": [
+        {
+          "label": "text/float32/case0/bundle_5",
+          "shape": [
+            17,
+            7680
+          ],
+          "max_abs": 1.1444091796875e-05,
+          "max_relative": 2.342117105230697e-07,
+          "relative_l2": 8.916627853192535e-07,
+          "cosine": 0.9999999999996027
+        },
+        {
+          "label": "text/float32/case1/bundle_5",
+          "shape": [
+            22,
+            7680
+          ],
+          "max_abs": 1.33514404296875e-05,
+          "max_relative": 2.7335756426851115e-07,
+          "relative_l2": 8.407373139201921e-07,
+          "cosine": 0.9999999999996471
+        },
+        {
+          "label": "text/float32/case2/bundle_5",
+          "shape": [
+            34,
+            7680
+          ],
+          "max_abs": 0.0005016326904296875,
+          "max_relative": 1.0270433398231018e-05,
+          "relative_l2": 7.570186860873809e-06,
+          "cosine": 0.9999999999713467
+        },
+        {
+          "label": "text/float32/case3/bundle_5",
+          "shape": [
+            49,
+            7680
+          ],
+          "max_abs": 0.00014150142669677734,
+          "max_relative": 2.897101816468683e-06,
+          "relative_l2": 4.502444263780192e-06,
+          "cosine": 0.9999999999898639
+        }
+      ],
+      "full_report": "artifacts/dev/text_float32.json"
+    },
+    "dev/dit_float32": {
+      "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
+      "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+      "versions": {
+        "torch": "2.9.1",
+        "diffusers": "0.42.0.dev0",
+        "transformers": "5.20.1",
+        "huggingface_hub": "2.4.0",
+        "tokenizers": "0.23.3"
+      },
+      "checks": 156,
+      "max_absolute_error_across_all_taps": 0.0019683837890625,
+      "max_relative_l2_across_all_taps": 7.405698467045808e-06,
+      "outputs": [
+        {
+          "label": "dit/float32/case0/output",
+          "shape": [
+            6,
+            128
+          ],
+          "max_abs": 1.2099742889404297e-05,
+          "max_relative": 3.3080461721114824e-06,
+          "relative_l2": 3.263367680042373e-06,
+          "cosine": 0.9999999999948292
+        },
+        {
+          "label": "dit/float32/case1/output",
+          "shape": [
+            6,
+            128
+          ],
+          "max_abs": 2.4124979972839355e-05,
+          "max_relative": 5.545686813478911e-06,
+          "relative_l2": 5.9479773392934145e-06,
+          "cosine": 0.9999999999823166
+        },
+        {
+          "label": "dit/float32/case2/output",
+          "shape": [
+            24,
+            128
+          ],
+          "max_abs": 1.0281801223754883e-05,
+          "max_relative": 2.7413855970365955e-06,
+          "relative_l2": 2.694984152634438e-06,
+          "cosine": 0.9999999999963698
+        }
+      ],
+      "full_report": "artifacts/dev/dit_float32.json"
+    },
+    "turbo/dit_float32": {
+      "model_revision": "9a24ee6810a782dd6aad4639fadcf48db0957ef4",
+      "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+      "versions": {
+        "torch": "2.9.1",
+        "diffusers": "0.42.0.dev0",
+        "transformers": "5.20.1",
+        "huggingface_hub": "2.4.0",
+        "tokenizers": "0.23.3"
+      },
+      "checks": 156,
+      "max_absolute_error_across_all_taps": 0.002471923828125,
+      "max_relative_l2_across_all_taps": 1.157037362751267e-05,
+      "outputs": [
+        {
+          "label": "dit/float32/case0/output",
+          "shape": [
+            6,
+            128
+          ],
+          "max_abs": 3.218650817871094e-05,
+          "max_relative": 9.91989792645476e-06,
+          "relative_l2": 7.220388098707138e-06,
+          "cosine": 0.9999999999739773
+        },
+        {
+          "label": "dit/float32/case1/output",
+          "shape": [
+            6,
+            128
+          ],
+          "max_abs": 2.7198344469070435e-05,
+          "max_relative": 7.925822654580051e-06,
+          "relative_l2": 8.950539137847245e-06,
+          "cosine": 0.9999999999599448
+        },
+        {
+          "label": "dit/float32/case2/output",
+          "shape": [
+            24,
+            128
+          ],
+          "max_abs": 1.3530254364013672e-05,
+          "max_relative": 3.4016296653275935e-06,
+          "relative_l2": 2.6644118498987947e-06,
+          "cosine": 0.9999999999964582
+        }
+      ],
+      "full_report": "artifacts/turbo/dit_float32.json"
+    },
+    "dev/pipeline_float32": {
+      "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
+      "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+      "versions": {
+        "torch": "2.9.1",
+        "diffusers": "0.42.0.dev0",
+        "transformers": "5.20.1",
+        "huggingface_hub": "2.4.0",
+        "tokenizers": "0.23.3"
+      },
+      "checks": 59,
+      "max_absolute_error_across_all_taps": 0.003692626953125,
+      "max_relative_l2_across_all_taps": 4.136552660440861e-05,
+      "outputs": [
+        {
+          "label": "text/float32/case2/bundle_5",
+          "shape": [
+            34,
+            7680
+          ],
+          "max_abs": 0.0005016326904296875,
+          "max_relative": 1.0270433398231018e-05,
+          "relative_l2": 7.570186860873809e-06,
+          "cosine": 0.9999999999713467
+        },
+        {
+          "label": "text/float32/case4/bundle_5",
+          "shape": [
+            46,
+            7680
+          ],
+          "max_abs": 1.52587890625e-05,
+          "max_relative": 3.1240862047851003e-07,
+          "relative_l2": 1.0198474873703664e-06,
+          "cosine": 0.9999999999994802
+        },
+        {
+          "label": "pipeline/encoder",
+          "shape": [
+            1,
+            64,
+            8,
+            12
+          ],
+          "max_abs": 1.2874603271484375e-05,
+          "max_relative": 1.8362051922578244e-06,
+          "relative_l2": 9.400045191093635e-07,
+          "cosine": 0.9999999999995629
+        },
+        {
+          "label": "pipeline/decoded",
+          "shape": [
+            1,
+            3,
+            64,
+            96
+          ],
+          "max_abs": 0.00010578334331512451,
+          "max_relative": 8.657005420975576e-05,
+          "relative_l2": 4.136552660440861e-05,
+          "cosine": 0.9999999991895775
+        },
+        {
+          "label": "pipeline/pixels",
+          "shape": [
+            1,
+            3,
+            64,
+            96
+          ],
+          "max_abs": 5.2869319915771484e-05,
+          "max_relative": 5.2869319915771484e-05,
+          "relative_l2": 1.5043474365778894e-05,
+          "cosine": 0.9999999998993443
+        }
+      ],
+      "full_report": "artifacts/dev/pipeline_float32.json"
+    },
+    "turbo/pipeline_float32": {
+      "model_revision": "9a24ee6810a782dd6aad4639fadcf48db0957ef4",
+      "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+      "versions": {
+        "torch": "2.9.1",
+        "diffusers": "0.42.0.dev0",
+        "transformers": "5.20.1",
+        "huggingface_hub": "2.4.0",
+        "tokenizers": "0.23.3"
+      },
+      "checks": 39,
+      "max_absolute_error_across_all_taps": 0.003692626953125,
+      "max_relative_l2_across_all_taps": 7.77778218422967e-06,
+      "outputs": [
+        {
+          "label": "text/float32/case2/bundle_5",
+          "shape": [
+            34,
+            7680
+          ],
+          "max_abs": 0.0005016326904296875,
+          "max_relative": 1.0270433398231018e-05,
+          "relative_l2": 7.570186860873809e-06,
+          "cosine": 0.9999999999713467
+        },
+        {
+          "label": "pipeline/encoder",
+          "shape": [
+            1,
+            64,
+            8,
+            12
+          ],
+          "max_abs": 1.2874603271484375e-05,
+          "max_relative": 1.8362051922578244e-06,
+          "relative_l2": 9.400045191093635e-07,
+          "cosine": 0.9999999999995629
+        },
+        {
+          "label": "pipeline/decoded",
+          "shape": [
+            1,
+            3,
+            64,
+            96
+          ],
+          "max_abs": 6.183981895446777e-05,
+          "max_relative": 2.7703084032812842e-05,
+          "relative_l2": 7.77778218422967e-06,
+          "cosine": 0.9999999999697713
+        },
+        {
+          "label": "pipeline/pixels",
+          "shape": [
+            1,
+            3,
+            64,
+            96
+          ],
+          "max_abs": 3.0934810638427734e-05,
+          "max_relative": 3.0934810638427734e-05,
+          "relative_l2": 3.4800744877930954e-06,
+          "cosine": 0.9999999999939468
+        }
+      ],
+      "full_report": "artifacts/turbo/pipeline_float32.json"
+    }
+  },
+  "total_checks": 515,
+  "experimental_bfloat16": {
+    "status": "Observed drift exceeds the original 5% error limit; user accepted this drift. Full BF16 suite not completed.",
+    "failures": [
+      {
+        "label": "vision/stage25",
+        "max_abs": 102.0,
+        "max_relative": 0.06675392670157068,
+        "relative_l2": 0.05722222545087902,
+        "tolerance": 0.05
+      },
+      {
+        "label": "dit/bfloat16/case0/layer_41",
+        "max_abs": 26.0,
+        "max_relative": 0.050387596899224806,
+        "relative_l2": 0.05472048692382245,
+        "tolerance": 0.05
+      }
+    ]
+  },
+  "float16": {
+    "status": "FP16 outputs finite; some final image metrics exceed the unchanged 5% threshold. See failed_metrics.",
+    "checks": 610,
+    "passed_checks": 608,
+    "acceptance": "Equal shapes, finite outputs, max_abs/max_reference_abs <= 0.05 and relative L2 <= 0.05; FP32 VAE checks retain 0.001.",
+    "precision": "FP16 text/vision/DiT; FP32 norm reductions, DiT RoPE and SiLU; FP32 VAE and sampler state.",
+    "extra_activation_rescaling": false,
+    "residuals_promoted_to_fp32": false,
+    "additional_dit_case": "512x512 target, 256x384 and 384x256 references, 257 text tokens, timestep 1/64.",
+    "scope": "CUDA; four text/vision fixtures, four DiT fixtures per checkpoint, and the same 64x96 edit pipeline fixtures as FP32. Metal and longer production runs are not tested.",
+    "runs": {
+      "dev/text_float16": {
+        "checks": 96,
+        "passed_checks": 96,
+        "failed_metrics": [],
+        "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
+        "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+        "versions": {
+          "torch": "2.9.1",
+          "diffusers": "0.42.0.dev0",
+          "transformers": "5.20.1",
+          "huggingface_hub": "2.4.0",
+          "tokenizers": "0.23.3"
+        },
+        "max_absolute_error_across_all_taps": 10.51953125,
+        "max_relative_l2_across_all_taps": 0.00722874348184951,
+        "outputs": [
+          {
+            "label": "text/float16/case0/bundle_5",
+            "shape": [
+              17,
+              7680
+            ],
+            "max_abs": 0.06875419616699219,
+            "max_relative": 0.0014071049215375155,
+            "relative_l2": 0.0012936078712802487,
+            "cosine": 0.9999991633088642
+          },
+          {
+            "label": "text/float16/case1/bundle_5",
+            "shape": [
+              22,
+              7680
+            ],
+            "max_abs": 0.06297683715820312,
+            "max_relative": 0.0012893885795739574,
+            "relative_l2": 0.0011403025169058796,
+            "cosine": 0.9999993498566094
+          },
+          {
+            "label": "text/float16/case2/bundle_5",
+            "shape": [
+              34,
+              7680
+            ],
+            "max_abs": 0.18522071838378906,
+            "max_relative": 0.0037922110907559537,
+            "relative_l2": 0.004080034972853751,
+            "cosine": 0.9999916766281651
+          },
+          {
+            "label": "text/float16/case3/bundle_5",
+            "shape": [
+              49,
+              7680
+            ],
+            "max_abs": 0.32117652893066406,
+            "max_relative": 0.006575771899219479,
+            "relative_l2": 0.005916900756022308,
+            "cosine": 0.9999824952108297
+          }
+        ],
+        "full_report": "artifacts/dev/text_float16.json"
+      },
+      "dev/dit_float16": {
+        "checks": 208,
+        "passed_checks": 208,
+        "failed_metrics": [],
+        "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
+        "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+        "versions": {
+          "torch": "2.9.1",
+          "diffusers": "0.42.0.dev0",
+          "transformers": "5.20.1",
+          "huggingface_hub": "2.4.0",
+          "tokenizers": "0.23.3"
+        },
+        "max_absolute_error_across_all_taps": 4.04632568359375,
+        "max_relative_l2_across_all_taps": 0.010200123662541173,
+        "outputs": [
+          {
+            "label": "dit/float16/case0/output",
+            "shape": [
+              6,
+              128
+            ],
+            "max_abs": 0.030195116996765137,
+            "max_relative": 0.008254850415116692,
+            "relative_l2": 0.0068002035879201755,
+            "cosine": 0.9999773286427067
+          },
+          {
+            "label": "dit/float16/case1/output",
+            "shape": [
+              6,
+              128
+            ],
+            "max_abs": 0.03387695550918579,
+            "max_relative": 0.007785756031251681,
+            "relative_l2": 0.007640908927592139,
+            "cosine": 0.9999711738231504
+          },
+          {
+            "label": "dit/float16/case2/output",
+            "shape": [
+              24,
+              128
+            ],
+            "max_abs": 0.01427912712097168,
+            "max_relative": 0.0038074755345650258,
+            "relative_l2": 0.0040807974324783974,
+            "cosine": 0.9999916897839783
+          },
+          {
+            "label": "dit/float16/case3/output",
+            "shape": [
+              1024,
+              128
+            ],
+            "max_abs": 0.010985136032104492,
+            "max_relative": 0.002679673021150893,
+            "relative_l2": 0.0020882944764532975,
+            "cosine": 0.9999978195490095
+          }
+        ],
+        "full_report": "artifacts/dev/dit_float16.json"
+      },
+      "turbo/dit_float16": {
+        "checks": 208,
+        "passed_checks": 208,
+        "failed_metrics": [],
+        "model_revision": "9a24ee6810a782dd6aad4639fadcf48db0957ef4",
+        "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+        "versions": {
+          "torch": "2.9.1",
+          "diffusers": "0.42.0.dev0",
+          "transformers": "5.20.1",
+          "huggingface_hub": "2.4.0",
+          "tokenizers": "0.23.3"
+        },
+        "max_absolute_error_across_all_taps": 4.580127716064453,
+        "max_relative_l2_across_all_taps": 0.017348012364862685,
+        "outputs": [
+          {
+            "label": "dit/float16/case0/output",
+            "shape": [
+              6,
+              128
+            ],
+            "max_abs": 0.05571591854095459,
+            "max_relative": 0.017152441928998764,
+            "relative_l2": 0.0126491522076784,
+            "cosine": 0.9999285265356633
+          },
+          {
+            "label": "dit/float16/case1/output",
+            "shape": [
+              6,
+              128
+            ],
+            "max_abs": 0.05273100733757019,
+            "max_relative": 0.015361633775304393,
+            "relative_l2": 0.0145139369299054,
+            "cosine": 0.999894764000738
+          },
+          {
+            "label": "dit/float16/case2/output",
+            "shape": [
+              24,
+              128
+            ],
+            "max_abs": 0.018423736095428467,
+            "max_relative": 0.004633236545193434,
+            "relative_l2": 0.004034906227466458,
+            "cosine": 0.9999918605674877
+          },
+          {
+            "label": "dit/float16/case3/output",
+            "shape": [
+              1024,
+              128
+            ],
+            "max_abs": 0.010676860809326172,
+            "max_relative": 0.002686810485604607,
+            "relative_l2": 0.002133094220826683,
+            "cosine": 0.9999977261482108
+          }
+        ],
+        "full_report": "artifacts/turbo/dit_float16.json"
+      },
+      "dev/pipeline_float16": {
+        "checks": 59,
+        "passed_checks": 57,
+        "failed_metrics": [
+          {
+            "label": "pipeline/decoded",
+            "max_abs": 0.1019916832447052,
+            "max_relative": 0.08346706835627088,
+            "relative_l2": 0.030746949539116598,
+            "tolerance": 0.05
+          },
+          {
+            "label": "pipeline/pixels",
+            "max_abs": 0.050995826721191406,
+            "max_relative": 0.050995826721191406,
+            "relative_l2": 0.011182411524790313,
+            "tolerance": 0.05
+          }
+        ],
+        "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
+        "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+        "versions": {
+          "torch": "2.9.1",
+          "diffusers": "0.42.0.dev0",
+          "transformers": "5.20.1",
+          "huggingface_hub": "2.4.0",
+          "tokenizers": "0.23.3"
+        },
+        "max_absolute_error_across_all_taps": 10.3896484375,
+        "max_relative_l2_across_all_taps": 0.030746949539116598,
+        "outputs": [
+          {
+            "label": "text/float16/case2/bundle_5",
+            "shape": [
+              34,
+              7680
+            ],
+            "max_abs": 0.18522071838378906,
+            "max_relative": 0.0037922110907559537,
+            "relative_l2": 0.004080034972853751,
+            "cosine": 0.9999916766281651
+          },
+          {
+            "label": "text/float16/case4/bundle_5",
+            "shape": [
+              46,
+              7680
+            ],
+            "max_abs": 0.06297492980957031,
+            "max_relative": 0.0012893494277923707,
+            "relative_l2": 0.001281511573359938,
+            "cosine": 0.9999991789240532
+          },
+          {
+            "label": "pipeline/decoded",
+            "shape": [
+              1,
+              3,
+              64,
+              96
+            ],
+            "max_abs": 0.1019916832447052,
+            "max_relative": 0.08346706835627088,
+            "relative_l2": 0.030746949539116598,
+            "cosine": 0.999530886827728
+          },
+          {
+            "label": "pipeline/pixels",
+            "shape": [
+              1,
+              3,
+              64,
+              96
+            ],
+            "max_abs": 0.050995826721191406,
+            "max_relative": 0.050995826721191406,
+            "relative_l2": 0.011182411524790313,
+            "cosine": 0.9999507508932828
+          }
+        ],
+        "full_report": "artifacts/dev/pipeline_float16.json"
+      },
+      "turbo/pipeline_float16": {
+        "checks": 39,
+        "passed_checks": 39,
+        "failed_metrics": [],
+        "model_revision": "9a24ee6810a782dd6aad4639fadcf48db0957ef4",
+        "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+        "versions": {
+          "torch": "2.9.1",
+          "diffusers": "0.42.0.dev0",
+          "transformers": "5.20.1",
+          "huggingface_hub": "2.4.0",
+          "tokenizers": "0.23.3"
+        },
+        "max_absolute_error_across_all_taps": 10.3896484375,
+        "max_relative_l2_across_all_taps": 0.00722874348184951,
+        "outputs": [
+          {
+            "label": "text/float16/case2/bundle_5",
+            "shape": [
+              34,
+              7680
+            ],
+            "max_abs": 0.18522071838378906,
+            "max_relative": 0.0037922110907559537,
+            "relative_l2": 0.004080034972853751,
+            "cosine": 0.9999916766281651
+          },
+          {
+            "label": "pipeline/decoded",
+            "shape": [
+              1,
+              3,
+              64,
+              96
+            ],
+            "max_abs": 0.01596933603286743,
+            "max_relative": 0.00715396431533036,
+            "relative_l2": 0.0037506370089184916,
+            "cosine": 0.9999929912487789
+          },
+          {
+            "label": "pipeline/pixels",
+            "shape": [
+              1,
+              3,
+              64,
+              96
+            ],
+            "max_abs": 0.007984638214111328,
+            "max_relative": 0.007984638214111328,
+            "relative_l2": 0.0016890406204939804,
+            "cosine": 0.9999985903995379
+          }
+        ],
+        "full_report": "artifacts/turbo/pipeline_float16.json"
+      }
+    }
+  }
+}
