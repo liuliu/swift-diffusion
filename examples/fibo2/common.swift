@@ -8,6 +8,9 @@ struct FiboBinding {
   var heads = 0
   var isBias = false
   var parameter = false
+  // Optional output-channel slice, applied to checkpoint weights before loading.
+  var rowStart = 0
+  var rowCount = 0
 }
 
 // ccv's CPU Float -> BF16/FP16 tensor conversions truncate. Generated inputs
@@ -49,8 +52,4 @@ func fiboAttention<T: TensorNumeric>(
 
 func fiboRows(_ x: Model.IO, start: Int, count: Int, width: Int) -> Model.IO {
   x.reshaped([count, width], offset: [start, 0], strides: [width, 1]).contiguous()
-}
-
-func fiboColumns(_ x: Model.IO, start: Int, count: Int, rows: Int, width: Int) -> Model.IO {
-  x.reshaped([rows, count], offset: [0, start], strides: [width, 1]).contiguous()
 }

@@ -1,4 +1,4 @@
-"""Pinned upstream Fibo 2 / Qwen3-VL parity reference. No checkpoint export."""
+"""Pinned upstream Fibo 2 / Qwen3-VL parity reference and export validation."""
 import gc
 import importlib.metadata
 import json
@@ -24,6 +24,7 @@ assert VARIANT in ("dev", "turbo")
 MODEL_REVISION = {"dev": "72415bd021af33b2cbc63525683a114ff8ac294e",
                   "turbo": "9a24ee6810a782dd6aad4639fadcf48db0957ef4"}[VARIANT]
 DIFFUSERS_REVISION = "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f"
+DIT_LAYOUT = "draw_things_split_adaln_v2"
 ROOT = Path("/slow/Data") / ("Fibo-2.0-dev" if VARIANT == "dev" else "Fibo-2.0-edit-turbo")
 assert json.loads((ROOT / "DOWNLOAD_MANIFEST.json").read_text())["revision"] == MODEL_REVISION
 ARTIFACTS = HERE / "artifacts" / VARIANT
@@ -85,8 +86,10 @@ def vae_key(key):
     return key
 
 
-def weight(state, key, transform="identity", heads=0, vae=False):
+def weight(state, key, transform="identity", heads=0, vae=False, row_start=0, row_count=0):
     x = state[vae_key(key) if vae else key].float()
+    if row_count:
+        x = x.narrow(0, int(row_start), int(row_count))
     if transform == "qk":
         x = x.reshape(int(heads), 2, 64, -1).transpose(1, 2).reshape(x.shape)
     elif transform == "qk_norm":
@@ -124,6 +127,23 @@ def check_keys(state, keys, component):
     print(f"{component}: all {len(keys)} required tensors accounted for", flush=True)
 
 
+def check_dit_bindings(state, keys, starts, counts):
+    from collections import defaultdict
+    keys = list(map(str, keys))
+    check_keys(state, keys, "dit")
+    slices = defaultdict(list)
+    for key, start, count in zip(keys, starts, counts, strict=True):
+        slices[key].append((int(start), int(count)))
+    split_keys = {f"{prefix}.{i}.adaLN_modulation.0.{suffix}"
+                  for prefix, layers in (("noise_refiner", 2), ("layers", 44))
+                  for i in range(layers) for suffix in ("weight", "bias")}
+    for key, ranges in slices.items():
+        expected = [(i * 3584, 3584) for i in range(4)] if key in split_keys else [(0, 0)]
+        assert sorted(ranges) == expected, (key, ranges)
+    assert len(keys) == 1059 and len(slices) == 783
+    print("Verified 46 AdaLN projections split into four complete weight/bias slices each", flush=True)
+
+
 def metrics(label, actual, expected, tolerance=0.001):
     actual, expected = np.asarray(actual), np.asarray(expected)
     assert actual.shape == expected.shape, (label, actual.shape, expected.shape)
@@ -159,6 +179,7 @@ def finish(name, reference_dtype=None):
     if selected_case is not None:
         name += "_case" + selected_case
     report = dict(variant=VARIANT, selected_case=selected_case, passed=passed,
+                  dit_layout=DIT_LAYOUT,
                   compute_dtype=os.environ.get("FIBO_DTYPE", "float32"),
                   reference_dtype=reference_dtype or os.environ.get("FIBO_REFERENCE_DTYPE",
                       "float32" if os.environ.get("FIBO_DTYPE") == "float16" else os.environ.get("FIBO_DTYPE", "float32")),
@@ -170,6 +191,86 @@ def finish(name, reference_dtype=None):
     path.write_text(json.dumps(report, indent=2) + "\n")
     print("PARITY PASSED:" if passed else "PARITY FAILED:", path, flush=True)
     return passed
+
+
+def check_dit_store(path, written_names):
+    import math
+    import sqlite3
+    names = list(map(str, written_names))
+    state = State("transformer")
+    assert len(state.keys()) == 783
+    assert len(names) == len(set(names)) == 1059
+    expected = set()
+    def add(stem, count=1, bias=False):
+        expected.update(f"__dit__[t-{stem}-{i}-{parameter}]"
+                        for i in range(count) for parameter in range(2 if bias else 1))
+    for prefix, layers in (("", 44), ("noise_refiner_", 2)):
+        for stem in ("q", "k", "v", "o", "norm_q", "norm_k", "attention_norm2",
+                     "ffn_norm1", "ffn_norm2", "ffn_gate_proj", "ffn_up_proj", "ffn_down_proj"):
+            add(prefix + stem, layers)
+        add(prefix + ("attention_norm_1" if prefix else "attention_norm1"), layers)
+        for i in range(4):
+            add(prefix + f"ada_ln_{i}", layers, bias=True)
+    for stem in ("cross_q", "cross_k", "cross_v", "cross_o", "cross_norm_q", "cross_norm_k",
+                 "cross_attn_norm1", "cross_attn_norm2", "cross_attn_gate"):
+        add(stem, 5)
+    for stem in ("perceiver_cross_attn_norm", "perceiver_self_attn_norm", "perceiver_ffn_norm",
+                 "perceiver_ffn_gate_proj", "perceiver_ffn_up_proj", "perceiver_ffn_down_proj"):
+        add(stem, 2)
+    for prefix in ("perceiver", "perceiver_cross"):
+        for stem in ("q", "k", "v", "o", "norm_q", "norm_k"):
+            add(prefix + "_" + stem, 2)
+    for stem in ("t_embedder_0", "t_embedder_1", "x_embedder", "ada_ln_final", "linear_final"):
+        add(stem, bias=True)
+    for stem in ("perceiver_queries", "perceiver_norm_out"):
+        add(stem)
+    assert set(names) == expected, (sorted(expected - set(names)), sorted(set(names) - expected))
+    elements = 0
+    for filename in set(state.index.values()):
+        with safe_open(state.root / filename, framework="pt") as f:
+            elements += sum(math.prod(f.get_slice(key).get_shape()) for key in f.keys())
+    with sqlite3.connect(Path(str(path)).resolve().as_uri() + "?mode=ro", uri=True) as db:
+        rows = db.execute("SELECT name, datatype, length(data) FROM tensors").fetchall()
+        assert {row[0] for row in rows} == set(names)
+        assert len(rows) == len(names)
+        assert all(row[1] == 131072 for row in rows), "Checkpoint must contain only FP16 tensors"
+        for name, dim in db.execute("SELECT name,dim FROM tensors"):
+            if re.fullmatch(r"__dit__\[t-(noise_refiner_)?ada_ln_[0-3]-\d+-[01]\]", name):
+                shape = tuple(int(n) for n in np.frombuffer(dim, dtype=np.int32) if n)
+                assert shape == ((3584, 256) if name.endswith("-0]") else (3584,)), (name, shape)
+        data_bytes = sum(row[2] for row in rows)
+        assert data_bytes == elements * 2, (data_bytes, elements * 2)
+        assert db.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+    inventory = dict(tensors=len(names), dtype="float16", dit_layout=DIT_LAYOUT, parameters=elements,
+                     tensor_bytes=data_bytes, sqlite_quick_check="ok", names=sorted(names))
+    (ARTIFACTS / "dit_parameter_names.json").write_text(json.dumps(inventory, indent=2) + "\n")
+    print(f"Verified {len(names)} FP16 checkpoint tensors, {elements} parameters", flush=True)
+    return inventory
+
+
+def record_dit_export(path, inventory):
+    import hashlib
+    from datetime import datetime, timezone
+    path = Path(str(path)).resolve()
+    report = json.loads((ARTIFACTS / "export_dit_float16.json").read_text())
+    assert report["passed"] and len(report["results"]) == 209
+    assert report["results"][-1]["label"] == "checkpoint/dit/reload"
+    with path.open("rb") as f:
+        digest = hashlib.file_digest(f, "sha256").hexdigest()
+    manifest = dict(variant=VARIANT, component="dit", checkpoint=str(path),
+                    dit_layout=DIT_LAYOUT, source_tensors=783, split_adaln_blocks=46,
+                    model_revision=MODEL_REVISION, diffusers_revision=DIFFUSERS_REVISION,
+                    created_utc=datetime.now(timezone.utc).isoformat(), bytes=path.stat().st_size,
+                    sha256=digest, dtype="float16", store_key="dit",
+                    tensors=inventory["tensors"], parameters=inventory["parameters"],
+                    tensor_bytes=inventory["tensor_bytes"], sqlite_quick_check="ok",
+                    parity_checks=208, reload=report["results"][-1],
+                    scope="DiT only; text/vision encoder and VAE are separate components.",
+                    full_report=str((ARTIFACTS / "export_dit_float16.json").relative_to(HERE)))
+    encoded = json.dumps(manifest, indent=2) + "\n"
+    Path(str(path) + ".json").write_text(encoded)
+    (ARTIFACTS / "export_manifest.json").write_text(encoded)
+    print("Checkpoint SHA256:", digest, flush=True)
 
 
 def text_case(index):

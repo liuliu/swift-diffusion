@@ -17,10 +17,12 @@ sys.path.insert(0, directory)
 let reference = Python.import("reference")
 let device = Int(env["FIBO_DEVICE"] ?? "1")!
 let pythonDevice = Int(env["FIBO_REFERENCE_DEVICE"] ?? "0")!
-let precision = env["FIBO_DTYPE"] ?? "float32"
+let mode = CommandLine.arguments.dropFirst().first ?? "parity-vae"
+let precision = env["FIBO_DTYPE"] ?? (mode == "export-dit-f16" ? "float16" : "float32")
+// Keep Python's report metadata consistent with the export mode's default.
+if mode == "export-dit-f16" { Python.import("os").environ.__setitem__("FIBO_DTYPE", precision) }
 let referencePrecision =
   env["FIBO_REFERENCE_DTYPE"] ?? (precision == "float16" ? "float32" : precision)
-let mode = CommandLine.arguments.dropFirst().first ?? "parity-vae"
 if env["FIBO_VERBOSE"] == "1" { DynamicGraph.logLevel = .verbose }
 
 func cpu(_ x: PythonObject) -> Tensor<Float> { try! Tensor<Float>(numpy: x) }
@@ -29,7 +31,10 @@ func load<T: TensorNumeric>(
 ) {
   for (i, binding) in bindings.enumerated() {
     let value = Tensor<T>(
-      from: cpu(reference.weight(state, binding.key, binding.transform, binding.heads, vae)))
+      from: cpu(
+        reference.weight(
+          state, binding.key, binding.transform, binding.heads, vae, binding.rowStart,
+          binding.rowCount)))
     if binding.isBias {
       binding.model.bias.copy(from: value)
     } else if binding.parameter || binding.transform == "embedding" {
@@ -215,7 +220,7 @@ func runText<T: TensorNumeric>(_ type: T.Type) {
   if !Bool(reference.finish("text_\(precision)"))! { exit(1) }
 }
 
-func runDiT<T: TensorNumeric>(_ type: T.Type) {
+func runDiT<T: TensorNumeric>(_ type: T.Type, exportPath: String? = nil) {
   let state = reference.State("transformer")
   for index in 0..<(precision == "float16" ? 4 : 3) {
     if let selected = env["FIBO_CASE"], Int(selected) != index { continue }
@@ -254,7 +259,8 @@ func runDiT<T: TensorNumeric>(_ type: T.Type) {
         textLength: textLength, gistCount: gist, device: device)
       model.maxConcurrency = .limit(1)
       model.compile(inputs: inputs)
-      reference.check_keys(state, bindings.map { $0.key }, "dit")
+      reference.check_dit_bindings(
+        state, bindings.map { $0.key }, bindings.map { $0.rowStart }, bindings.map { $0.rowCount })
       load(type, bindings, state)
       let results = model(inputs: x, Array(inputs.dropFirst()))
       for (i, name) in names.enumerated() {
@@ -262,9 +268,67 @@ func runDiT<T: TensorNumeric>(_ type: T.Type) {
           "dit/\(precision)/case\(index)/\(name)", results[i].as(of: T.self),
           expected[name], tolerance: T.dataType == .Float32 ? 0.001 : 0.05)
       }
+      if index == 3, let exportPath {
+        // All four cases, including every layer, must pass before writing.
+        if !Bool(reference.finish("dit_\(precision)"))! { exit(1) }
+        reference.release()
+        exportDiTCheckpoint(
+          graph: graph, model: model, inputs: inputs,
+          expected: Tensor<Float>(from: results.last!.as(of: T.self).rawValue.toCPU()),
+          imageLength: imageLength, referenceLength: referenceLength,
+          textLength: textLength, gistCount: gist, path: exportPath)
+      }
     }
   }
-  if !Bool(reference.finish("dit_\(precision)"))! { exit(1) }
+  if exportPath == nil, !Bool(reference.finish("dit_\(precision)"))! { exit(1) }
+}
+
+func exportDiTCheckpoint(
+  graph: DynamicGraph, model: Model, inputs: [DynamicGraph.AnyTensor],
+  expected: Tensor<Float>, imageLength: Int, referenceLength: Int,
+  textLength: Int, gistCount: Int, path: String
+) {
+  let staging = path + ".partial"
+  var keys = [String]()
+  print("Writing FP16 DiT:", staging)
+  try! graph.openStore(staging) { store in
+    try! store.write("dit", model: model, strict: true) { name, tensor in
+      precondition(tensor.dataType == .Float16)
+      keys.append(name)
+      return .continue(name)
+    }
+  }.get()
+  let inventory = reference.check_dit_store(staging, keys)
+
+  // The PyTorch model has been released; reuse its GPU for a fresh reload.
+  let reloadGraph = DynamicGraph()
+  reloadGraph.maxConcurrency = .limit(1)
+  reloadGraph.withNoGrad {
+    precondition(inputs.count == 12)
+    let copied: [DynamicGraph.AnyTensor] = inputs.enumerated().map { index, input in
+      if index == 7 || index == 8 {
+        return reloadGraph.variable(input.as(of: Float.self).rawValue.toCPU().toGPU(pythonDevice))
+      } else if index >= 10 {
+        return reloadGraph.variable(input.as(of: Int32.self).rawValue.toCPU().toGPU(pythonDevice))
+      }
+      return reloadGraph.variable(input.as(of: Float16.self).rawValue.toCPU().toGPU(pythonDevice))
+    }
+    let (fresh, _, _) = FiboDiT(
+      Float16.self, imageLength: imageLength, referenceLength: referenceLength,
+      textLength: textLength, gistCount: gistCount, device: pythonDevice, diagnostic: false)
+    fresh.maxConcurrency = .limit(1)
+    fresh.compile(inputs: copied)
+    try! reloadGraph.openStore(staging, flags: .readOnly) { store in
+      try! store.read("dit", model: fresh, strict: true)
+    }.get()
+    let output = fresh(inputs: copied[0], Array(copied.dropFirst()))[0].as(of: Float16.self)
+    compare(
+      "checkpoint/dit/reload", output, expected.makeNumpyArray(), tolerance: 1e-6)
+  }
+  if !Bool(reference.finish("export_dit_float16"))! { exit(1) }
+  precondition(rename(staging, path) == 0, "Cannot finalize checkpoint: \(path)")
+  reference.record_dit_export(path, inventory)
+  print("FP16 DiT export complete:", path)
 }
 
 func packLatents(_ latents: [Tensor<Float>]) -> Tensor<Float> {
@@ -449,6 +513,19 @@ func runPipeline<T: TensorNumeric>(_ type: T.Type) {
 }
 
 switch mode {
+case "export-dit-f16":
+  precondition(precision == "float16" && referencePrecision == "float32")
+  precondition(env["FIBO_CASE"] == nil, "Export requires all four parity cases")
+  let variant = String(reference.VARIANT)!
+  let filename = variant == "dev" ? "fibo_2_dev_f16.ckpt" : "fibo_2_edit_turbo_f16.ckpt"
+  let path = env["FIBO_EXPORT_PATH"] ?? "/slow/Data/" + filename
+  precondition(
+    env["FIBO_REPLACE_CHECKPOINT"] == "1" || !FileManager.default.fileExists(atPath: path),
+    "Checkpoint already exists: \(path); use FIBO_REPLACE_CHECKPOINT=1 to replace after validation")
+  precondition(
+    !FileManager.default.fileExists(atPath: path + ".partial"),
+    "Incomplete checkpoint already exists: \(path).partial")
+  runDiT(Float16.self, exportPath: path)
 case "parity-vae": runVAE()
 case "parity-text":
   if precision == "float32" {
@@ -480,6 +557,6 @@ case "parity-pipeline":
   }
 default:
   fatalError(
-    "Usage: bash examples/fibo2/run.sh [parity-vae|parity-text|parity-dit|parity-pipeline]; export is disabled"
+    "Usage: bash examples/fibo2/run.sh [parity-vae|parity-text|parity-dit|parity-pipeline|export-dit-f16]"
   )
 }

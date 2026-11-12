@@ -37,6 +37,8 @@ for name, count in REQUIRED.items():
     assert report.get("selected_case") is None, (name, "partial run")
     assert len(rows) == count and all(r["passed"] for r in rows), name
     summary["runs"][name] = {
+        **({"dit_layout": report.get("dit_layout", "fused_adaln_v1")}
+           if "/dit_" in name or "/pipeline_" in name else {}),
         "model_revision": report["model_revision"],
         "diffusers_revision": report["diffusers_revision"],
         "versions": report["versions"],
@@ -84,6 +86,8 @@ if all((HERE / "artifacts" / (name + ".json")).exists() for name in FP16):
         assert len(rows) == count, name
         assert all("max_abs" in row for row in rows), (name, "nonfinite outputs")
         runs[name] = {
+            **({"dit_layout": report.get("dit_layout", "fused_adaln_v1")}
+               if "/dit_" in name or "/pipeline_" in name else {}),
             "checks": count,
             "passed_checks": sum(row["passed"] for row in rows),
             "failed_metrics": [
@@ -115,6 +119,18 @@ if all((HERE / "artifacts" / (name + ".json")).exists() for name in FP16):
         "scope": "CUDA; four text/vision fixtures, four DiT fixtures per checkpoint, and the same 64x96 edit pipeline fixtures as FP32. Metal and longer production runs are not tested.",
         "runs": runs,
     }
+exports = []
+for variant in ("dev", "turbo"):
+    manifest_path = HERE / "artifacts" / variant / "export_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+        checkpoint = Path(manifest["checkpoint"])
+        assert checkpoint.is_file() and checkpoint.stat().st_size == manifest["bytes"]
+        assert manifest["reload"]["passed"] and manifest["parity_checks"] == 208
+        exports.append(manifest)
+summary["checkpoint_exported"] = bool(exports)
+if exports:
+    summary["exports"] = exports
 output.write_text(json.dumps(summary, indent=2) + "\n")
 print(f"{summary['total_checks']} FP32 checks passed; {output}")
 if "float16" in summary:

@@ -1,6 +1,6 @@
 {
   "status": "FP32 parity passed",
-  "checkpoint_exported": false,
+  "checkpoint_exported": true,
   "ccv_revision": "329ab6c52085dff8e0de931824f2ee1b6d64b937",
   "s4nnc_revision": "5bb3fb70e0095290ce9cb0ac5090748af1d8e9a8",
   "protocol": {
@@ -211,6 +211,7 @@
       "full_report": "artifacts/dev/text_float32.json"
     },
     "dev/dit_float32": {
+      "dit_layout": "draw_things_split_adaln_v2",
       "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
       "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
       "versions": {
@@ -261,6 +262,7 @@
       "full_report": "artifacts/dev/dit_float32.json"
     },
     "turbo/dit_float32": {
+      "dit_layout": "draw_things_split_adaln_v2",
       "model_revision": "9a24ee6810a782dd6aad4639fadcf48db0957ef4",
       "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
       "versions": {
@@ -311,6 +313,7 @@
       "full_report": "artifacts/turbo/dit_float32.json"
     },
     "dev/pipeline_float32": {
+      "dit_layout": "draw_things_split_adaln_v2",
       "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
       "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
       "versions": {
@@ -389,6 +392,7 @@
       "full_report": "artifacts/dev/pipeline_float32.json"
     },
     "turbo/pipeline_float32": {
+      "dit_layout": "draw_things_split_adaln_v2",
       "model_revision": "9a24ee6810a782dd6aad4639fadcf48db0957ef4",
       "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
       "versions": {
@@ -551,6 +555,7 @@
         "full_report": "artifacts/dev/text_float16.json"
       },
       "dev/dit_float16": {
+        "dit_layout": "draw_things_split_adaln_v2",
         "checks": 208,
         "passed_checks": 208,
         "failed_metrics": [],
@@ -614,6 +619,7 @@
         "full_report": "artifacts/dev/dit_float16.json"
       },
       "turbo/dit_float16": {
+        "dit_layout": "draw_things_split_adaln_v2",
         "checks": 208,
         "passed_checks": 208,
         "failed_metrics": [],
@@ -677,6 +683,7 @@
         "full_report": "artifacts/turbo/dit_float16.json"
       },
       "dev/pipeline_float16": {
+        "dit_layout": "draw_things_split_adaln_v2",
         "checks": 59,
         "passed_checks": 57,
         "failed_metrics": [
@@ -759,6 +766,7 @@
         "full_report": "artifacts/dev/pipeline_float16.json"
       },
       "turbo/pipeline_float16": {
+        "dit_layout": "draw_things_split_adaln_v2",
         "checks": 39,
         "passed_checks": 39,
         "failed_metrics": [],
@@ -815,5 +823,117 @@
         "full_report": "artifacts/turbo/pipeline_float16.json"
       }
     }
-  }
+  },
+  "exports": [
+    {
+      "variant": "dev",
+      "component": "dit",
+      "checkpoint": "/slow/Data/fibo_2_dev_f16.ckpt",
+      "dit_layout": "draw_things_split_adaln_v2",
+      "source_tensors": 783,
+      "split_adaln_blocks": 46,
+      "model_revision": "72415bd021af33b2cbc63525683a114ff8ac294e",
+      "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+      "created_utc": "2026-11-10T23:58:49.174224+00:00",
+      "bytes": 16291246080,
+      "sha256": "f044a91c4fda9cdc9b383d06d959192870b2291d2413f5066f15619a1165e6ee",
+      "dtype": "float16",
+      "store_key": "dit",
+      "tensors": 1059,
+      "parameters": 8127342213,
+      "tensor_bytes": 16254684426,
+      "sqlite_quick_check": "ok",
+      "parity_checks": 208,
+      "reload": {
+        "label": "checkpoint/dit/reload",
+        "shape": [
+          1024,
+          128
+        ],
+        "max_abs": 0.0,
+        "max_relative": 0.0,
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "tolerance": 1e-06,
+        "actual_sample": [
+          -0.190673828125,
+          -1.3603515625,
+          -0.6923828125,
+          0.197509765625,
+          0.6494140625,
+          -0.03814697265625,
+          -0.1842041015625,
+          0.121826171875
+        ],
+        "reference_sample": [
+          -0.190673828125,
+          -1.3603515625,
+          -0.6923828125,
+          0.197509765625,
+          0.6494140625,
+          -0.03814697265625,
+          -0.1842041015625,
+          0.121826171875
+        ],
+        "passed": true
+      },
+      "scope": "DiT only; text/vision encoder and VAE are separate components.",
+      "full_report": "artifacts/dev/export_dit_float16.json"
+    },
+    {
+      "variant": "turbo",
+      "component": "dit",
+      "checkpoint": "/slow/Data/fibo_2_edit_turbo_f16.ckpt",
+      "dit_layout": "draw_things_split_adaln_v2",
+      "source_tensors": 783,
+      "split_adaln_blocks": 46,
+      "model_revision": "9a24ee6810a782dd6aad4639fadcf48db0957ef4",
+      "diffusers_revision": "d0b9b1b5a540e5f9df2f8ec236347bf9c5aa7d1f",
+      "created_utc": "2026-11-10T23:58:08.804773+00:00",
+      "bytes": 16291246080,
+      "sha256": "4f5ffea0dbc88400b016fb3af61514c3489a37788bbade7d1ee4799fd1e8931f",
+      "dtype": "float16",
+      "store_key": "dit",
+      "tensors": 1059,
+      "parameters": 8127342213,
+      "tensor_bytes": 16254684426,
+      "sqlite_quick_check": "ok",
+      "parity_checks": 208,
+      "reload": {
+        "label": "checkpoint/dit/reload",
+        "shape": [
+          1024,
+          128
+        ],
+        "max_abs": 0.0,
+        "max_relative": 0.0,
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "tolerance": 1e-06,
+        "actual_sample": [
+          -0.251708984375,
+          -1.263671875,
+          -0.6728515625,
+          0.101318359375,
+          0.564453125,
+          -0.09002685546875,
+          -0.1820068359375,
+          0.062408447265625
+        ],
+        "reference_sample": [
+          -0.251708984375,
+          -1.263671875,
+          -0.6728515625,
+          0.101318359375,
+          0.564453125,
+          -0.09002685546875,
+          -0.1820068359375,
+          0.062408447265625
+        ],
+        "passed": true
+      },
+      "scope": "DiT only; text/vision encoder and VAE are separate components.",
+      "full_report": "artifacts/turbo/export_dit_float16.json"
+    }
+  ]
 }
