@@ -104,6 +104,27 @@ enum H3ConditioningVideoEncoderConfig {
   static let normEpsilon: Float = 1e-6
 }
 
+// Shared decoder topology; the image VAE differs in width, depth, and patch geometry.
+struct H3VAEDecoderArchitecture {
+  let width: Int
+  let layers: Int
+  let heads: Int
+  let headDim = 64
+  let intermediateSize: Int
+  let rotarySize: Int
+  let registerTokens = 4
+  let spatialPatch = 16
+  let temporalPatch: Int
+  let normEpsilon: Float = 1e-5
+
+  static let video = H3VAEDecoderArchitecture(
+    width: 2_048, layers: 36, heads: 32, intermediateSize: 8_192,
+    rotarySize: 48, temporalPatch: 4)
+  static let image = H3VAEDecoderArchitecture(
+    width: 1_024, layers: 24, heads: 16, intermediateSize: 4_096,
+    rotarySize: 32, temporalPatch: 1)
+}
+
 enum H3Tag: Int32 {
   case video = 0
   case text = 1
@@ -555,7 +576,9 @@ if Bool(osPath.isdir(userSitePackages)) ?? false,
 }
 let systemDistPackages = "/usr/lib/python3/dist-packages"
 if !(Bool(sys.path.__contains__(systemDistPackages)) ?? false) {
-  movePythonPathToFront(systemDistPackages)
+  // Keep the fallback for system-only packages, but do not shadow the active
+  // Python environment's ABI-specific wheels (notably Pillow's _imaging).
+  sys.path.append(systemDistPackages)
 }
 
 let builtins = Python.import("builtins")
@@ -1116,15 +1139,15 @@ builtins.exec(
 
   VWIDTH, VHEADS, VHEAD_DIM, VFFN, VROTARY = 2048, 32, 64, 8192, 48
 
-  def video_permute_weight(weight):
-      weight = weight.view(VHEADS, VHEAD_DIM, weight.shape[-1])
-      leading = weight[:, :VROTARY].view(VHEADS, 2, VROTARY // 2, weight.shape[-1]).transpose(1, 2)
-      return torch.cat((leading.reshape(VHEADS, VROTARY, weight.shape[-1]), weight[:, VROTARY:]), dim=1)
+  def video_permute_weight(weight, heads=VHEADS, rotary=VROTARY):
+      weight = weight.view(heads, VHEAD_DIM, weight.shape[-1])
+      leading = weight[:, :rotary].view(heads, 2, rotary // 2, weight.shape[-1]).transpose(1, 2)
+      return torch.cat((leading.reshape(heads, rotary, weight.shape[-1]), weight[:, rotary:]), dim=1)
 
-  def video_permute_bias(bias):
-      bias = bias.view(VHEADS, VHEAD_DIM)
-      leading = bias[:, :VROTARY].view(VHEADS, 2, VROTARY // 2).transpose(1, 2)
-      return torch.cat((leading.reshape(VHEADS, VROTARY), bias[:, VROTARY:]), dim=1)
+  def video_permute_bias(bias, heads=VHEADS, rotary=VROTARY):
+      bias = bias.view(heads, VHEAD_DIM)
+      leading = bias[:, :rotary].view(heads, 2, rotary // 2).transpose(1, 2)
+      return torch.cat((leading.reshape(heads, rotary), bias[:, rotary:]), dim=1)
 
   def video_rotary_tensor(length):
       inv = 1.0 / (100.0 ** torch.arange(0, 1, 6 / VROTARY, dtype=torch.float32))
@@ -2066,8 +2089,9 @@ func H3TimestepEmbedding(timestepCount: Int) -> (Model, (PythonObject) -> Void) 
 func H3JointTransformer(
   textLength: Int, audioLength: Int, videoLength: Int, timestepCount: Int,
   layers: Int = H3Config.layers, includeHidden: Bool = false, useFloat16: Bool = false,
-  pddSteps: Int = 1, includeCompressionGates: Bool = false
+  pddSteps: Int = 1, includeCompressionGates: Bool = false, includeAudio: Bool = true
 ) -> (Model, (PythonObject) -> Void) {
+  precondition(includeAudio || audioLength == 0)
   let video = Input()
   let audio = Input()
   let text = Input()
@@ -2083,8 +2107,10 @@ func H3JointTransformer(
   // Production uses scaled FP16 input projections and restores their outputs to FP32.
   let videoInput = Dense(
     count: H3Config.hiddenSize, flags: useFloat16 ? [.Float16] : [], name: "proj_in")
-  let audioInput = Dense(
-    count: H3Config.hiddenSize, flags: useFloat16 ? [.Float16] : [], name: "audio_proj_in")
+  let audioInput =
+    includeAudio
+    ? Dense(count: H3Config.hiddenSize, flags: useFloat16 ? [.Float16] : [], name: "audio_proj_in")
+    : nil
   let textInput = Dense(
     count: H3Config.hiddenSize, flags: useFloat16 ? [.Float16] : [], name: "context_embedder")
   let inputProjectionScale: Float = useFloat16 ? 4 : 1
@@ -2094,17 +2120,22 @@ func H3JointTransformer(
   let textProjected = h3DebugActivation(
     useFloat16 ? inputProjectionScale * rawTextProjected.to(.Float32) : rawTextProjected,
     label: "token_refiner.text_projection")
-  let rawAudioProjected = audioInput(useFloat16 ? audio.to(.Float16) : audio)
   let rawVideoProjected = videoInput(useFloat16 ? video.to(.Float16) : video)
-  let audioProjected =
-    useFloat16 ? inputProjectionScale * rawAudioProjected.to(.Float32) : rawAudioProjected
   let videoProjected =
     useFloat16 ? inputProjectionScale * rawVideoProjected.to(.Float32) : rawVideoProjected
   let textRows = refiner(useFloat16 ? textProjected.to(.Float32) : textProjected)
-  let audioRows = h3DebugActivation(audioProjected, label: "dit.audio_input")
   let videoRows = h3DebugActivation(videoProjected, label: "dit.video_input")
-  var out = h3DebugActivation(
-    Functional.concat(axis: 1, textRows, audioRows, videoRows), label: "dit.input")
+  let packedRows: Model.IO
+  if let audioInput {
+    let rawAudioProjected = audioInput(useFloat16 ? audio.to(.Float16) : audio)
+    let audioProjected =
+      useFloat16 ? inputProjectionScale * rawAudioProjected.to(.Float32) : rawAudioProjected
+    let audioRows = h3DebugActivation(audioProjected, label: "dit.audio_input")
+    packedRows = Functional.concat(axis: 1, textRows, audioRows, videoRows)
+  } else {
+    packedRows = Functional.concat(axis: 1, textRows, videoRows)
+  }
+  var out = h3DebugActivation(packedRows, label: "dit.input")
   let activatedTemb = h3DebugActivation(temb.swish().to(.Float32), label: "dit.temb_activated")
   var readers = [(PythonObject) -> Void]()
   var compressionOutputs = [Model.IO]()
@@ -2135,10 +2166,6 @@ func H3JointTransformer(
   let scale = Matmul()(timestepSelection.to(.Float32), outputScale(activatedTemb))
     .reshaped([1, sequenceLength, H3Config.hiddenSize])
   out = h3DebugActivation(outputNorm(out) .* (1 + scale) + shift, label: "dit.norm_out")
-  let audioOutRows = out.reshaped(
-    [1, audioLength, H3Config.hiddenSize], offset: [0, textLength, 0],
-    strides: [sequenceLength * H3Config.hiddenSize, H3Config.hiddenSize, 1]
-  ).contiguous().to(.Float32)
   let videoOutRows = out.reshaped(
     [1, videoLength, H3Config.hiddenSize], offset: [0, textLength + audioLength, 0],
     strides: [sequenceLength * H3Config.hiddenSize, H3Config.hiddenSize, 1]
@@ -2146,7 +2173,9 @@ func H3JointTransformer(
   // FastH3 Omni stores full, head-major PDD projections, not Comfy's base+delta
   // representation. Preserve source row order and the existing projection names.
   let videoOutput = Dense(count: H3Config.videoPatchSize * pddSteps, name: "proj_out")
-  let audioOutput = Dense(count: H3Config.audioChannels * pddSteps, name: "audio_proj_out")
+  let audioOutput =
+    includeAudio
+    ? Dense(count: H3Config.audioChannels * pddSteps, name: "audio_proj_out") : nil
 
   let reader: (PythonObject) -> Void = { state in
     timeEmbeddingReader(state)
@@ -2154,16 +2183,20 @@ func H3JointTransformer(
       copyFloat16Dense(
         videoInput, state: state, weight: "proj_in.weight", bias: "proj_in.bias",
         scale: 1 / inputProjectionScale)
-      copyFloat16Dense(
-        audioInput, state: state, weight: "audio_proj_in.weight", bias: "audio_proj_in.bias",
-        scale: 1 / inputProjectionScale)
+      if let audioInput {
+        copyFloat16Dense(
+          audioInput, state: state, weight: "audio_proj_in.weight", bias: "audio_proj_in.bias",
+          scale: 1 / inputProjectionScale)
+      }
       copyFloat16Dense(
         textInput, state: state, weight: "context_embedder.weight", bias: "context_embedder.bias",
         scale: 1 / inputProjectionScale)
     } else {
       copyFloatDense(videoInput, state: state, weight: "proj_in.weight", bias: "proj_in.bias")
-      copyFloatDense(
-        audioInput, state: state, weight: "audio_proj_in.weight", bias: "audio_proj_in.bias")
+      if let audioInput {
+        copyFloatDense(
+          audioInput, state: state, weight: "audio_proj_in.weight", bias: "audio_proj_in.bias")
+      }
       copyFloatDense(
         textInput, state: state, weight: "context_embedder.weight", bias: "context_embedder.bias")
     }
@@ -2180,18 +2213,28 @@ func H3JointTransformer(
       weight: normWeight[H3Config.hiddenSize..<(2 * H3Config.hiddenSize), ...],
       bias: normBias[H3Config.hiddenSize..<(2 * H3Config.hiddenSize)])
     copyFloatDense(videoOutput, state: state, weight: "proj_out.weight", bias: "proj_out.bias")
-    copyFloatDense(
-      audioOutput, state: state, weight: "audio_proj_out.weight", bias: "audio_proj_out.bias")
+    if let audioOutput {
+      copyFloatDense(
+        audioOutput, state: state, weight: "audio_proj_out.weight", bias: "audio_proj_out.bias")
+    }
   }
   let projectedVideo = h3DebugActivation(videoOutput(videoOutRows), label: "dit.video_output")
-  let projectedAudio = h3DebugActivation(audioOutput(audioOutRows), label: "dit.audio_output")
-  let outputs: [Model.IO] =
-    includeHidden
-    ? [projectedVideo, projectedAudio, preNorm!, out.to(.Float32)]
-    : [projectedVideo, projectedAudio]
+  var outputs: [Model.IO] = [projectedVideo]
+  if let audioOutput {
+    let audioOutRows = out.reshaped(
+      [1, audioLength, H3Config.hiddenSize], offset: [0, textLength, 0],
+      strides: [sequenceLength * H3Config.hiddenSize, H3Config.hiddenSize, 1]
+    ).contiguous().to(.Float32)
+    outputs.append(h3DebugActivation(audioOutput(audioOutRows), label: "dit.audio_output"))
+  }
+  if includeHidden { outputs += [preNorm!, out.to(.Float32)] }
+  let inputs: [Model.IO] =
+    includeAudio
+    ? [video, audio, text, rot, adalnSelection, timestepSelection, timestepFrequencies]
+    : [video, text, rot, adalnSelection, timestepSelection, timestepFrequencies]
   return (
     Model(
-      [video, audio, text, rot, adalnSelection, timestepSelection, timestepFrequencies],
+      inputs,
       outputs + compressionOutputs),
     reader
   )
@@ -2208,29 +2251,41 @@ func copyFloatNorm(
 
 func copyVideoDecoderDense(
   _ dense: Model, state: PythonObject, weight key: String, bias biasKey: String,
-  permuteQK: Bool = false
+  permuteQK: Bool = false, configuration: H3VAEDecoderArchitecture = .video,
+  useFloat16: Bool = true
 ) {
   var weight = state[key]
   var bias = state[biasKey]
   if permuteQK {
-    weight = h3Reference.video_permute_weight(weight)
-    bias = h3Reference.video_permute_bias(bias)
+    weight = h3Reference.video_permute_weight(weight, configuration.heads, configuration.rotarySize)
+    bias = h3Reference.video_permute_bias(bias, configuration.heads, configuration.rotarySize)
   }
   let weightCPU = weight.to(torch.float).cpu().numpy()
   let biasCPU = bias.to(torch.float).cpu().numpy()
-  dense.weight.copy(from: Tensor<VideoFloat>(from: try! Tensor<Float>(numpy: weightCPU)))
-  dense.bias.copy(from: Tensor<VideoFloat>(from: try! Tensor<Float>(numpy: biasCPU)))
+  if useFloat16 {
+    dense.weight.copy(from: Tensor<VideoFloat>(from: try! Tensor<Float>(numpy: weightCPU)))
+    dense.bias.copy(from: Tensor<VideoFloat>(from: try! Tensor<Float>(numpy: biasCPU)))
+  } else {
+    dense.weight.copy(from: try! Tensor<Float>(numpy: weightCPU))
+    dense.bias.copy(from: try! Tensor<Float>(numpy: biasCPU))
+  }
   dense.weight.to(.unifiedMemory)
   dense.bias.to(.unifiedMemory)
 }
 
 func copyVideoDecoderDenseTensor(
-  _ dense: Model, weight sourceWeight: PythonObject, bias sourceBias: PythonObject
+  _ dense: Model, weight sourceWeight: PythonObject, bias sourceBias: PythonObject,
+  useFloat16: Bool = true
 ) {
   let weightCPU = sourceWeight.to(torch.float).cpu().numpy()
   let biasCPU = sourceBias.to(torch.float).cpu().numpy()
-  dense.weight.copy(from: Tensor<VideoFloat>(from: try! Tensor<Float>(numpy: weightCPU)))
-  dense.bias.copy(from: Tensor<VideoFloat>(from: try! Tensor<Float>(numpy: biasCPU)))
+  if useFloat16 {
+    dense.weight.copy(from: Tensor<VideoFloat>(from: try! Tensor<Float>(numpy: weightCPU)))
+    dense.bias.copy(from: Tensor<VideoFloat>(from: try! Tensor<Float>(numpy: biasCPU)))
+  } else {
+    dense.weight.copy(from: try! Tensor<Float>(numpy: weightCPU))
+    dense.bias.copy(from: try! Tensor<Float>(numpy: biasCPU))
+  }
   dense.weight.to(.unifiedMemory)
   dense.bias.to(.unifiedMemory)
 }
@@ -2601,73 +2656,91 @@ func H3ConditioningAudioEncoder(inputLength: Int, includeHidden: Bool = false)
   )
 }
 
-func H3VideoDecoderAttention(prefix: String, sequenceLength: Int) -> (Model, (PythonObject) -> Void)
-{
+func H3VideoDecoderAttention(
+  prefix: String, sequenceLength: Int, configuration: H3VAEDecoderArchitecture = .video,
+  useFloat16: Bool = true
+) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let rot = Input()
-  let q = Dense(count: H3VideoDecoderConfig.width, name: "to_q")
-  let k = Dense(count: H3VideoDecoderConfig.width, name: "to_k")
-  let v = Dense(count: H3VideoDecoderConfig.width, name: "to_v")
+  let q = Dense(count: configuration.width, name: "to_q")
+  let k = Dense(count: configuration.width, name: "to_k")
+  let v = Dense(count: configuration.width, name: "to_v")
   let qNorm = RMSNorm(
-    epsilon: H3VideoDecoderConfig.normEpsilon, axis: [3], elementwiseAffine: false)
+    epsilon: configuration.normEpsilon, axis: [3], elementwiseAffine: false)
   let kNorm = RMSNorm(
-    epsilon: H3VideoDecoderConfig.normEpsilon, axis: [3], elementwiseAffine: false)
+    epsilon: configuration.normEpsilon, axis: [3], elementwiseAffine: false)
   var queries = q(x).reshaped(
     .NHWC(
-      1, sequenceLength, H3VideoDecoderConfig.heads, H3VideoDecoderConfig.headDim))
+      1, sequenceLength, configuration.heads, configuration.headDim))
   var keys = k(x).reshaped(
     .NHWC(
-      1, sequenceLength, H3VideoDecoderConfig.heads, H3VideoDecoderConfig.headDim))
+      1, sequenceLength, configuration.heads, configuration.headDim))
   let values = v(x).reshaped(
     .NHWC(
-      1, sequenceLength, H3VideoDecoderConfig.heads, H3VideoDecoderConfig.headDim))
-  queries = Functional.cmul(left: qNorm(queries.to(.Float32)).to(.Float16), right: rot)
-  keys = Functional.cmul(left: kNorm(keys.to(.Float32)).to(.Float16), right: rot)
-  let attention = ScaledDotProductAttention(
-    scale: 1 / Float(H3VideoDecoderConfig.headDim).squareRoot(), flags: [.Float16])
-  let attended = attention(queries, keys, values).reshaped([
-    sequenceLength, H3VideoDecoderConfig.width,
-  ])
-  let output = Dense(count: H3VideoDecoderConfig.width, name: "to_out")
+      1, sequenceLength, configuration.heads, configuration.headDim))
+  queries = Functional.cmul(
+    left: qNorm(queries.to(.Float32)).to(useFloat16 ? .Float16 : .Float32), right: rot)
+  keys = Functional.cmul(
+    left: kNorm(keys.to(.Float32)).to(useFloat16 ? .Float16 : .Float32), right: rot)
+  let attentionOutput: Model.IO
+  if useFloat16 {
+    let attention = ScaledDotProductAttention(
+      scale: 1 / Float(configuration.headDim).squareRoot(), flags: [.Float16])
+    attentionOutput = attention(queries, keys, values)
+  } else {
+    let scores =
+      Matmul(transposeB: (2, 3))(
+        queries.transposed(1, 2), keys.transposed(1, 2))
+      * (1 / Float(configuration.headDim).squareRoot())
+    let probabilities = scores.reshaped([configuration.heads * sequenceLength, sequenceLength])
+      .softmax().reshaped([1, configuration.heads, sequenceLength, sequenceLength])
+    attentionOutput = Matmul()(probabilities, values.transposed(1, 2)).transposed(1, 2)
+  }
+  let attended = attentionOutput.reshaped([sequenceLength, configuration.width])
+  let output = Dense(count: configuration.width, name: "to_out")
   let reader: (PythonObject) -> Void = { state in
     copyVideoDecoderDense(
       q, state: state, weight: "\(prefix).to_q.weight", bias: "\(prefix).to_q.bias",
-      permuteQK: true)
+      permuteQK: true, configuration: configuration, useFloat16: useFloat16)
     copyVideoDecoderDense(
       k, state: state, weight: "\(prefix).to_k.weight", bias: "\(prefix).to_k.bias",
-      permuteQK: true)
+      permuteQK: true, configuration: configuration, useFloat16: useFloat16)
     copyVideoDecoderDense(
-      v, state: state, weight: "\(prefix).to_v.weight", bias: "\(prefix).to_v.bias")
+      v, state: state, weight: "\(prefix).to_v.weight", bias: "\(prefix).to_v.bias",
+      useFloat16: useFloat16)
     copyVideoDecoderDense(
       output, state: state, weight: "\(prefix).to_out.0.weight",
-      bias: "\(prefix).to_out.0.bias")
+      bias: "\(prefix).to_out.0.bias", useFloat16: useFloat16)
   }
   return (Model([x, rot], [output(attended)]), reader)
 }
 
 func H3VideoDecoderBlock(
-  prefix: String, sequenceLength: Int, deviceID: Int
+  prefix: String, sequenceLength: Int, deviceID: Int,
+  configuration: H3VAEDecoderArchitecture = .video, useFloat16: Bool = true
 ) -> (Model, (PythonObject) -> Void) {
   let x = Input()
   let rot = Input()
   let norm1 = RMSNorm(
-    epsilon: H3VideoDecoderConfig.normEpsilon, axis: [2], name: "norm1")
+    epsilon: configuration.normEpsilon, axis: [2], name: "norm1")
   let (attention, attentionReader) = H3VideoDecoderAttention(
-    prefix: "\(prefix).attn", sequenceLength: sequenceLength)
+    prefix: "\(prefix).attn", sequenceLength: sequenceLength,
+    configuration: configuration, useFloat16: useFloat16)
   let scale1 = Parameter<Float>(
-    .GPU(deviceID), .HWC(1, 1, H3VideoDecoderConfig.width), name: "scale1")
+    .GPU(deviceID), .HWC(1, 1, configuration.width), name: "scale1")
   var out =
     x.to(.Float32)
-    + attention(norm1(x.to(.Float32)).to(.Float16), rot).to(.Float32) .* scale1
+    + attention(norm1(x.to(.Float32)).to(useFloat16 ? .Float16 : .Float32), rot).to(.Float32)
+    .* scale1
   let residual = out
   let norm2 = RMSNorm(
-    epsilon: H3VideoDecoderConfig.normEpsilon, axis: [2], name: "norm2")
-  let up = Dense(count: H3VideoDecoderConfig.intermediateSize, name: "ff_up")
-  let gate = Dense(count: H3VideoDecoderConfig.intermediateSize, name: "ff_gate")
-  let down = Dense(count: H3VideoDecoderConfig.width, name: "ff_down")
-  let normed = norm2(out.to(.Float32)).to(.Float16)
+    epsilon: configuration.normEpsilon, axis: [2], name: "norm2")
+  let up = Dense(count: configuration.intermediateSize, name: "ff_up")
+  let gate = Dense(count: configuration.intermediateSize, name: "ff_gate")
+  let down = Dense(count: configuration.width, name: "ff_down")
+  let normed = norm2(out.to(.Float32)).to(useFloat16 ? .Float16 : .Float32)
   let scale2 = Parameter<Float>(
-    .GPU(deviceID), .HWC(1, 1, H3VideoDecoderConfig.width), name: "scale2")
+    .GPU(deviceID), .HWC(1, 1, configuration.width), name: "scale2")
   out = residual + down(up(normed) .* gate(normed).swish()).to(.Float32) .* scale2
   let reader: (PythonObject) -> Void = { state in
     copyFloatNorm(norm1, state: state, "\(prefix).norm1.weight")
@@ -2676,23 +2749,25 @@ func H3VideoDecoderBlock(
     let combinedWeight = state["\(prefix).ff.net.0.proj.weight"]
     let combinedBias = state["\(prefix).ff.net.0.proj.bias"]
     copyVideoDecoderDenseTensor(
-      up, weight: combinedWeight[..<H3VideoDecoderConfig.intermediateSize, ...],
-      bias: combinedBias[..<H3VideoDecoderConfig.intermediateSize])
+      up, weight: combinedWeight[..<configuration.intermediateSize, ...],
+      bias: combinedBias[..<configuration.intermediateSize], useFloat16: useFloat16)
     copyVideoDecoderDenseTensor(
       gate,
       weight: combinedWeight[
-        H3VideoDecoderConfig.intermediateSize..<(2 * H3VideoDecoderConfig.intermediateSize), ...],
+        configuration.intermediateSize..<(2 * configuration.intermediateSize), ...],
       bias: combinedBias[
-        H3VideoDecoderConfig.intermediateSize..<(2 * H3VideoDecoderConfig.intermediateSize)])
+        configuration.intermediateSize..<(2 * configuration.intermediateSize)],
+      useFloat16: useFloat16)
     copyVideoDecoderDense(
-      down, state: state, weight: "\(prefix).ff.net.2.weight", bias: "\(prefix).ff.net.2.bias")
+      down, state: state, weight: "\(prefix).ff.net.2.weight", bias: "\(prefix).ff.net.2.bias",
+      useFloat16: useFloat16)
     scale1.weight.copy(
       from: tensorFromPython(state["\(prefix).scale1"])
-        .reshaped(.HWC(1, 1, H3VideoDecoderConfig.width)))
+        .reshaped(.HWC(1, 1, configuration.width)))
     scale1.weight.to(.unifiedMemory)
     scale2.weight.copy(
       from: tensorFromPython(state["\(prefix).scale2"])
-        .reshaped(.HWC(1, 1, H3VideoDecoderConfig.width)))
+        .reshaped(.HWC(1, 1, configuration.width)))
     scale2.weight.to(.unifiedMemory)
   }
   return (Model([x, rot], [out]), reader)
@@ -2700,47 +2775,48 @@ func H3VideoDecoderBlock(
 
 func H3VideoDecoder(
   numPatches: Int, deviceID: Int, layers: Int = H3VideoDecoderConfig.layers,
-  includeHidden: Bool = false
+  includeHidden: Bool = false, configuration: H3VAEDecoderArchitecture = .video,
+  useFloat16: Bool = true
 ) -> (Model, (PythonObject) -> Void) {
   let latentTokens = Input()
   let rot = Input()
   let zeroToken = Input()
   let postQuant = Dense(count: H3Config.videoChannels, name: "post_quant_conv")
-  let input = Dense(count: H3VideoDecoderConfig.width, name: "decoder_proj_in")
+  let input = Dense(count: configuration.width, name: "decoder_proj_in")
   var out = input(postQuant(latentTokens)).to(.Float32)
   let registers = Parameter<Float>(
-    .GPU(deviceID), .HWC(1, H3VideoDecoderConfig.registerTokens, H3VideoDecoderConfig.width),
+    .GPU(deviceID), .HWC(1, configuration.registerTokens, configuration.width),
     name: "register_tokens")
   out = Functional.concat(axis: 1, out, registers, zeroToken)
-  let sequenceLength = numPatches + H3VideoDecoderConfig.registerTokens + 1
+  let sequenceLength = numPatches + configuration.registerTokens + 1
   var readers = [(PythonObject) -> Void]()
   for layer in 0..<layers {
     let (block, reader) = H3VideoDecoderBlock(
       prefix: "decoder.transformer_blocks.\(layer)", sequenceLength: sequenceLength,
-      deviceID: deviceID)
+      deviceID: deviceID, configuration: configuration, useFloat16: useFloat16)
     out = block(out, rot)
     readers.append(reader)
   }
   let hidden = out
   let norm = LayerNorm(
-    epsilon: H3VideoDecoderConfig.normEpsilon, axis: [2], name: "decoder_norm_out")
-  out = norm(out.to(.Float32)).to(.Float16)
+    epsilon: configuration.normEpsilon, axis: [2], name: "decoder_norm_out")
+  out = norm(out.to(.Float32)).to(useFloat16 ? .Float16 : .Float32)
   let output = Dense(
-    count: 3 * H3VideoDecoderConfig.temporalPatch * H3VideoDecoderConfig.spatialPatch
-      * H3VideoDecoderConfig.spatialPatch,
+    count: 3 * configuration.temporalPatch * configuration.spatialPatch
+      * configuration.spatialPatch,
     name: "decoder_proj_out")
   out = output(out).reshaped(
     [
       1, numPatches,
-      3 * H3VideoDecoderConfig.temporalPatch
-        * H3VideoDecoderConfig.spatialPatch * H3VideoDecoderConfig.spatialPatch,
+      3 * configuration.temporalPatch
+        * configuration.spatialPatch * configuration.spatialPatch,
     ],
     offset: [0, 0, 0],
     strides: [
-      sequenceLength * 3 * H3VideoDecoderConfig.temporalPatch
-        * H3VideoDecoderConfig.spatialPatch * H3VideoDecoderConfig.spatialPatch,
-      3 * H3VideoDecoderConfig.temporalPatch * H3VideoDecoderConfig.spatialPatch
-        * H3VideoDecoderConfig.spatialPatch, 1,
+      sequenceLength * 3 * configuration.temporalPatch
+        * configuration.spatialPatch * configuration.spatialPatch,
+      3 * configuration.temporalPatch * configuration.spatialPatch
+        * configuration.spatialPatch, 1,
     ]
   ).contiguous()
   let reader: (PythonObject) -> Void = { state in
@@ -2748,13 +2824,14 @@ func H3VideoDecoder(
       postQuant,
       weight: state["post_quant_conv.weight"].view(
         H3Config.videoChannels, H3Config.videoChannels),
-      bias: state["post_quant_conv.bias"])
+      bias: state["post_quant_conv.bias"], useFloat16: useFloat16)
     copyVideoDecoderDense(
-      input, state: state, weight: "decoder.proj_in.weight", bias: "decoder.proj_in.bias")
+      input, state: state, weight: "decoder.proj_in.weight", bias: "decoder.proj_in.bias",
+      useFloat16: useFloat16)
     let registerValue = tensorFromPython(state["decoder.register_tokens"])
     registers.weight.copy(
       from: registerValue.reshaped(
-        .HWC(1, H3VideoDecoderConfig.registerTokens, H3VideoDecoderConfig.width)))
+        .HWC(1, configuration.registerTokens, configuration.width)))
     registers.weight.to(.unifiedMemory)
     for reader in readers { reader(state) }
     copyFloatNorm(norm, state: state, "decoder.norm_out.weight")
@@ -2762,7 +2839,8 @@ func H3VideoDecoder(
     norm.bias.copy(from: try! Tensor<Float>(numpy: normBias))
     norm.bias.to(.unifiedMemory)
     copyVideoDecoderDense(
-      output, state: state, weight: "decoder.proj_out.weight", bias: "decoder.proj_out.bias")
+      output, state: state, weight: "decoder.proj_out.weight", bias: "decoder.proj_out.bias",
+      useFloat16: useFloat16)
   }
   return (Model([latentTokens, rot, zeroToken], includeHidden ? [out, hidden] : [out]), reader)
 }
@@ -4169,6 +4247,18 @@ case "export-fasth3-omni":
   runFastH3OmniParity(export: true)
 case "parity-pika-h3-flex":
   runPikaH3FlexParity()
+case "parity-h3-image-vae":
+  runH3ImageVAEParity()
+case "export-h3-image-vae":
+  runH3ImageVAEParity(export: true)
+case "parity-h3-image-dit":
+  runH3ImageDiTParity()
+case "export-h3-image-dit":
+  runH3ImageDiTParity(export: true)
+case "parity-h3-image-dit-f16":
+  runH3ImageDiTParity(float16Storage: true)
+case "export-h3-image-dit-f16":
+  runH3ImageDiTParity(export: true, float16Storage: true)
 case "export-pika-h3-flex-f16":
   runPikaH3FlexParity(export: true)
 case "export-video-decoder":

@@ -1346,12 +1346,14 @@ swift_binary(
     srcs = [
         "minimax_h3/qwen_vision.swift",
         "minimax_h3_converter/fasth3_omni.swift",
+        "minimax_h3_converter/h3_image.swift",
         "minimax_h3_converter/main.swift",
         "minimax_h3_converter/pika_h3_flex.swift",
         "minimax_h3_converter/qwen_vision_parity.swift",
     ],
     data = [
         "minimax_h3_assets/fasth3_omni_reference.py",
+        "minimax_h3_assets/h3_image_reference.py",
         "minimax_h3_assets/pika_h3_reference.py",
         "minimax_h3_assets/qwen_vision_reference.py",
     ],
